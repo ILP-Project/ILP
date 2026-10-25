@@ -36,7 +36,7 @@ pub fn do_get(
         "all" => do_chapters(plugin, &storage, config, site_id, id, force_update, true)?,
         _ => {
             return Err(anyhow!(
-                "无效的获取类型: {kind}（可选 chapter/cover/author/all）"
+                "无效的获取类型: {kind}（可选 chapter/cover/author/title/all）"
             ))
         }
     }
@@ -324,23 +324,26 @@ fn persist(
 /// 非终端（管道、重定向）不阻塞等输入，改为把结果全部打印出来。
 pub fn do_search(
     plugins: &mut [PluginInstance],
-    _config: &Config,
+    config: &Config,
     keyword: &str,
     site_id: &str,
 ) -> Result<()> {
     let plugin = find_plugin(plugins, site_id)?;
+    let sleep_ms = config.sleep_time.saturating_mul(1000);
 
     if !std::io::stdin().is_terminal() {
-        return search_dump_all(plugin, keyword);
+        return search_dump_all(plugin, keyword, sleep_ms);
     }
 
     // 用栈保存已访问的页：栈顶是当前页，出栈即回上一页。
     let mut stack: Vec<ilp_types::SearchPage> = Vec::new();
+    let mut last_req: Option<std::time::Instant> = None;
 
     loop {
         if stack.is_empty() {
             // 首页：cursor 为空。
             stack.push(plugin.search(keyword, "")?);
+            last_req = Some(std::time::Instant::now());
         }
         let Some(current) = stack.last().cloned() else {
             return Ok(());
@@ -355,9 +358,19 @@ pub fn do_search(
                     println!("已经是最后一页。");
                     continue;
                 }
+                // 搜索走插件的同步 http-fetch，绕过了宿主的并发限速器，
+                // 所以这里要自己维持页间间隔，否则连翻会被静默限流。
+                throttle(last_req, sleep_ms);
                 let next = plugin.search(keyword, &current.cursor)?;
+                last_req = Some(std::time::Instant::now());
                 if next.results.is_empty() {
-                    println!("没有更多结果了。");
+                    // 服务端限流时会 has_more=true 却给空页。这时说"没有更多"
+                    // 是在骗人——结果确实还有，只是这次没拿到。
+                    if next.has_more {
+                        println!("服务端返回了空页（可能被限流），稍后按 n 重试。");
+                    } else {
+                        println!("没有更多结果了。");
+                    }
                     continue;
                 }
                 stack.push(next);
@@ -430,21 +443,90 @@ fn read_line(prompt: &str) -> Result<String> {
     Ok(buf)
 }
 
+/// 两次请求之间补足最小间隔。
+fn throttle(last: Option<std::time::Instant>, sleep_ms: u64) {
+    if sleep_ms == 0 {
+        return;
+    }
+    if let Some(prev) = last {
+        let gap = std::time::Duration::from_millis(sleep_ms);
+        let elapsed = prev.elapsed();
+        if elapsed < gap {
+            std::thread::sleep(gap - elapsed);
+        }
+    }
+}
+
 /// 非交互场景：沿游标翻到服务端说没有为止，并设上限防死循环。
-fn search_dump_all(plugin: &mut PluginInstance, keyword: &str) -> Result<()> {
+///
+/// 服务端在限流时会给出 has_more=true 的空页。这种情况不能当作"结果没了"
+/// ——那会把一次限流伪装成正常结束（实测同一关键词会在 49 和 148 条之间跳动）。
+/// 空页先重试几次，仍然不行就以 partial 收尾，让调用方知道结果不完整。
+/// 一页结果的处置。抽成纯函数是为了能把"空页不等于结束"这条规则钉死在
+/// 单元测试里——服务端限流时正是靠它避免把不完整的结果当成正常收尾。
+#[derive(Debug, PartialEq, Eq)]
+enum PageStep {
+    /// 没有更多了，正常结束
+    Done,
+    /// 继续翻，带上下一个游标
+    Next(String),
+    /// 还有更多但这次没拿到：重试同一游标
+    Retry,
+    /// 重试次数用尽，结果不完整
+    GiveUp,
+}
+
+fn page_step(page: &ilp_types::SearchPage, empty_retries: u32, max_empty_retries: u32) -> PageStep {
+    if !page.has_more {
+        return PageStep::Done;
+    }
+    if page.results.is_empty() || page.cursor.is_empty() {
+        return if empty_retries >= max_empty_retries {
+            PageStep::GiveUp
+        } else {
+            PageStep::Retry
+        };
+    }
+    PageStep::Next(page.cursor.clone())
+}
+
+fn search_dump_all(plugin: &mut PluginInstance, keyword: &str, sleep_ms: u64) -> Result<()> {
     const MAX_PAGES: usize = 50;
+    const MAX_EMPTY_RETRIES: u32 = 3;
     let mut cursor = String::new();
-    for _ in 0..MAX_PAGES {
+    let mut pages = 0usize;
+    let mut empty_retries = 0u32;
+    let mut last: Option<std::time::Instant> = None;
+
+    loop {
+        if pages >= MAX_PAGES {
+            return Err(anyhow::Error::new(crate::exit::PartialFailure(format!(
+                "搜索「{keyword}」超过 {MAX_PAGES} 页上限，结果可能不完整"
+            ))));
+        }
+        pages += 1;
+        throttle(last, sleep_ms);
         let page = plugin.search(keyword, &cursor)?;
+        last = Some(std::time::Instant::now());
+
         for r in &page.results {
             println!("{} - {} - {}", r.id, r.title, r.author);
         }
-        if !page.has_more || page.results.is_empty() || page.cursor.is_empty() {
-            break;
+
+        match page_step(&page, empty_retries, MAX_EMPTY_RETRIES) {
+            PageStep::Done => return Ok(()),
+            PageStep::Next(next) => {
+                empty_retries = 0;
+                cursor = next;
+            }
+            PageStep::Retry => empty_retries += 1,
+            PageStep::GiveUp => {
+                return Err(anyhow::Error::new(crate::exit::PartialFailure(format!(
+                    "搜索「{keyword}」在翻页时被服务端限流，结果不完整"
+                ))));
+            }
         }
-        cursor = page.cursor;
     }
-    Ok(())
 }
 
 fn find_plugin<'a>(
@@ -498,7 +580,9 @@ mod tests {
     use crate::exit;
 
     use super::next_page;
+    use super::page_step;
     use super::PageCmd;
+    use super::PageStep;
 
     #[test]
     fn next_page_keys() {
@@ -507,6 +591,58 @@ mod tests {
         assert_eq!(next_page("  N  "), PageCmd::Next);
         assert_eq!(next_page("p"), PageCmd::Prev);
         assert_eq!(next_page("Q"), PageCmd::Quit);
+    }
+
+    fn page(results: &[(&str, &str)], cursor: &str, has_more: bool) -> ilp_types::SearchPage {
+        ilp_types::SearchPage {
+            results: results
+                .iter()
+                .map(|(id, title)| ilp_types::SearchResult {
+                    id: id.to_string(),
+                    title: title.to_string(),
+                    author: String::new(),
+                    cover_url: String::new(),
+                    description: String::new(),
+                })
+                .collect(),
+            cursor: cursor.to_string(),
+            has_more,
+        }
+    }
+
+    #[test]
+    fn empty_page_with_more_is_not_treated_as_end() {
+        // 这是实测到的服务端行为：限流时 has_more=true 却给空 data。
+        // 当成"没有更多"会把一次限流伪装成正常结束。
+        let p = page(&[], "cur", true);
+        assert_eq!(page_step(&p, 0, 3), PageStep::Retry);
+        assert_eq!(page_step(&p, 1, 3), PageStep::Retry);
+        assert_eq!(page_step(&p, 2, 3), PageStep::Retry);
+        assert_eq!(page_step(&p, 3, 3), PageStep::GiveUp);
+    }
+
+    #[test]
+    fn empty_page_without_more_is_end() {
+        assert_eq!(page_step(&page(&[], "cur", false), 0, 3), PageStep::Done);
+    }
+
+    #[test]
+    fn page_with_results_advances_by_cursor() {
+        let p = page(&[("1", "a")], "next-cur", true);
+        assert_eq!(page_step(&p, 0, 3), PageStep::Next("next-cur".to_string()));
+    }
+
+    #[test]
+    fn page_without_cursor_retries_even_with_results() {
+        // 有结果却没游标：翻不了下一页，按限流处理而不是误报结束。
+        let p = page(&[("1", "a")], "", true);
+        assert_eq!(page_step(&p, 0, 3), PageStep::Retry);
+    }
+
+    #[test]
+    fn last_page_with_results_is_done() {
+        let p = page(&[("1", "a")], "cur", false);
+        assert_eq!(page_step(&p, 0, 3), PageStep::Done);
     }
 
     #[test]
