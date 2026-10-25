@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ilp-types",
+    "crates/ilp-host",
+    "plugins/fanqie",
+]
+default-members = [
+    "crates/ilp-types",
+    "crates/ilp-host",
+]
+
+[profile.release]
+opt-level = "s"
+lto = true
