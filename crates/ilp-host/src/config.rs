@@ -179,6 +179,11 @@ impl Config {
     pub fn disabled_plugins_dir(&self) -> PathBuf {
         self.plugins_dir().join("disabled")
     }
+
+    /// 插件私有 KV 存储的根目录，与 engine 里注入的 storage 路径保持一致。
+    pub fn plugins_data_dir(&self) -> PathBuf {
+        Path::new(&self.data_folder).join("plugins")
+    }
 }
 
 #[cfg(test)]

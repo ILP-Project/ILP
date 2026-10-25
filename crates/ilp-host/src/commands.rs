@@ -457,6 +457,42 @@ fn find_plugin<'a>(
         .ok_or_else(|| anyhow!("未找到 site_id 为 {site_id} 的已加载插件"))
 }
 
+/// `ilp version`：打印宿主版本，并尽力列出每个已加载插件的元数据。
+///
+/// 单个插件加载失败不影响其余插件的展示——原版一个坏插件会拖垮整个启动。
+pub fn do_version(config: &Config) -> Result<()> {
+    println!("ilp {}", env!("CARGO_PKG_VERSION"));
+
+    let plugins = match crate::engine::load_plugins(config) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("插件加载失败: {e:#}");
+            return Ok(());
+        }
+    };
+    if plugins.is_empty() {
+        println!("没有已加载的插件");
+        return Ok(());
+    }
+    println!("已加载插件:");
+    for p in &plugins {
+        let m = &p.metadata;
+        println!(
+            "  {} v{} (site: {} / {}) {}",
+            m.plugin_name,
+            m.version,
+            m.site_id,
+            m.site_domain,
+            if m.plugin_id.is_empty() {
+                ""
+            } else {
+                &m.plugin_id
+            }
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::exit;

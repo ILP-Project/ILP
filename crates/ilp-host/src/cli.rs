@@ -35,6 +35,8 @@ pub enum Command {
         #[command(subcommand)]
         sub: PluginCommand,
     },
+    /// 显示版本与已加载插件信息
+    Version,
 }
 
 #[derive(Subcommand)]
