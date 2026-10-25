@@ -1,0 +1,21 @@
+[package]
+name = "ilp-host"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ilp"
+path = "src/main.rs"
+
+[dependencies]
+ilp-types = { path = "../ilp-types" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+wasmtime = "48"
+wasmtime-wasi = { version = "48", default-features = false, features = ["p1"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"

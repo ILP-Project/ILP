@@ -1,0 +1,6 @@
+/target
+/cache.db
+/config.json
+/data
+/plugins/*.wasm
+result
