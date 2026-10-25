@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Engine, Store};
@@ -27,8 +28,6 @@ pub struct HostState {
     storage_dir: PathBuf,
     /// 内存里的 KV，落盘前先命中这里
     cache: HashMap<String, Vec<u8>>,
-    /// 单调时间戳基点
-    started: std::time::Instant,
 }
 
 impl HostState {
@@ -39,7 +38,6 @@ impl HostState {
             plugin_name,
             storage_dir,
             cache: HashMap::new(),
-            started: std::time::Instant::now(),
         }
     }
 }
@@ -68,8 +66,13 @@ impl HostTrait for HostState {
         level_to_tracing(level, &self.plugin_name, &message);
     }
 
+    /// 返回 UTC epoch 毫秒。签名与设备上报都要真实墙钟时间，
+    /// 单调计时器（进程启动后的 elapsed）会让服务端判定客户端异常。
     fn now_ms(&mut self) -> u64 {
-        self.started.elapsed().as_millis() as u64
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
     }
 
     fn http_fetch(

@@ -91,7 +91,7 @@ interface host {
   /// 写日志。level: 0=error 1=warn 2=info 3=debug 4=trace
   log: func(level: u8, message: string);
 
-  /// 宿主签发的单调递增毫秒时间戳（插件沙箱里没有系统时钟）。
+  /// 当前 UTC epoch 毫秒（插件沙箱里没有系统时钟）。
   now-ms: func() -> u64;
 
   /// 同步 HTTP。用于目录/搜索/元数据这类一次性请求：插件发起，
