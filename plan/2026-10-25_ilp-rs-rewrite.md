@@ -40,8 +40,8 @@
 |---|---|---|
 | 目录 | `fanqienovel.com/api/reader/directory/detail?bookId=<id>` | ✅ **免签名**，98.5 KB，351 章 |
 | 书籍元数据 | `/page/<book_id>` HTML | ✅ h1 标题 + `"author":"…"` + 封面 |
-| 免费章正文 | `/reader/<item_id>` HTML | ✅ 完整（第1章 4344 字） |
-| 锁定章正文 | 同上 | ⚠️ **仅 173 字截断**（第51章起 `isChapterLock:true`） |
+| 免费章正文 | `/reader/<item_id>` HTML | ⚠️ **2026-10-25 起整站风控**：返回 6383 字节「验证码中间页」，换 UA/加 Referer/降并发均无效 |
+| 锁定章正文 | 同上 | ⚠️ 同上，且原本第51章起就只给 173 字截断 |
 | 搜索 | `reading.snssdk.com/reading/bookapi/search/tab/v` | ✅ 411 KB，需签名 |
 | 单章正文 | `reading.snssdk.com/reading/reader/full/v` | ✅ 需签名 + AES 解密 |
 | 批量正文 | `reading.snssdk.com/reading/reader/batch_full/v` | ✅ 30 章/批，858 KB，0.3 s |
@@ -74,6 +74,10 @@
 ```
 
 **实测结果**：第 121 章网页只给 173 字 → APP 通道拿到 **20,725 字**；30 章批 617,675 字全解。
+
+**结论（2026-10-25 更新）**：网页阅读页已被风控整体封掉（返回验证码中间页），
+`curl` 与宿主请求均如此，与并发/UA/Referer 无关。**APP 网关是唯一可用的正文通道**，
+因此提交 ⑩ 不是优化项而是必需项。目录 API 与书籍页仍免签名可用。
 
 ### 1.3 限流规律（实测）
 

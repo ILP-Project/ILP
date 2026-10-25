@@ -28,8 +28,8 @@ pub fn do_get(
             let title = plugin.title()?;
             let url = plugin.cover_url()?;
             let bytes = crate::http::get_bytes(&url)?;
-            storage.save_cover(&title, &bytes)?;
-            println!("封面已保存: {}", storage.cover_path(&title).display());
+            let path = storage.save_cover(&title, &bytes)?;
+            println!("封面已保存: {}", path.display());
         }
         "chapter" => do_chapters(plugin, &storage, config, site_id, id, force_update, false)?,
         "all" => do_chapters(plugin, &storage, config, site_id, id, force_update, true)?,
@@ -80,12 +80,9 @@ fn do_chapters(
         }
     };
 
-    if with_cover {
-        let path = storage.cover_path(&book.title);
-        if !path.exists() {
-            let bytes = crate::http::get_bytes(&book.cover_url)?;
-            storage.save_cover(&book.title, &bytes)?;
-        }
+    if with_cover && storage.existing_cover(&book.title).is_none() {
+        let bytes = crate::http::get_bytes(&book.cover_url)?;
+        storage.save_cover(&book.title, &bytes)?;
     }
 
     fetch_all(plugin, storage, config, &book)

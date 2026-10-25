@@ -72,6 +72,20 @@ impl HostTrait for HostState {
         self.started.elapsed().as_millis() as u64
     }
 
+    fn http_fetch(
+        &mut self,
+        request: ilp::plugin::host::HttpRequest,
+    ) -> Result<ilp::plugin::host::HttpResponse, String> {
+        let req = ilp::plugin::types::HttpRequest {
+            method: request.method,
+            url: request.url,
+            headers: request.headers,
+            body: request.body,
+        };
+        let resp = crate::http::send(&req).map_err(|e| format!("{e:#}"))?;
+        Ok(resp)
+    }
+
     fn storage_get(&mut self, key: String) -> Option<Vec<u8>> {
         if let Some(v) = self.cache.get(&key) {
             return Some(v.clone());

@@ -7,21 +7,6 @@
 ///   共用同一套 ABI，并发策略也不用在每个插件里重写一遍。
 package ilp:plugin@0.1.0;
 
-/// 宿主提供给插件的能力。
-interface host {
-  /// 写日志。level: 0=error 1=warn 2=info 3=debug 4=trace
-  log: func(level: u8, message: string);
-
-  /// 宿主签发的单调递增毫秒时间戳（插件沙箱里没有系统时钟）。
-  now-ms: func() -> u64;
-
-  /// 插件私有 KV。宿主按插件名隔离，实际落盘路径由宿主决定，
-  /// 插件只见到 key，不可能路径穿越。
-  storage-get: func(key: string) -> option<list<u8>>;
-  storage-set: func(key: string, value: list<u8>) -> result<_, string>;
-  storage-delete: func(key: string) -> result<_, string>;
-}
-
 /// 插件与宿主之间传递的数据类型。
 interface types {
   /// 章节目录条目。
@@ -97,6 +82,28 @@ interface types {
     offset: u32,
     has-more: bool,
   }
+}
+
+/// 宿主提供给插件的能力。
+interface host {
+  use types.{http-request, http-response};
+
+  /// 写日志。level: 0=error 1=warn 2=info 3=debug 4=trace
+  log: func(level: u8, message: string);
+
+  /// 宿主签发的单调递增毫秒时间戳（插件沙箱里没有系统时钟）。
+  now-ms: func() -> u64;
+
+  /// 同步 HTTP。用于目录/搜索/元数据这类一次性请求：插件发起，
+  /// 宿主统一处理代理、超时、UA。
+  /// 正文不走这里——正文量大，走下面 plugin 接口的两阶段抓取。
+  http-fetch: func(request: http-request) -> result<http-response, string>;
+
+  /// 插件私有 KV。宿主按插件名隔离，实际落盘路径由宿主决定，
+  /// 插件只见到 key，不可能路径穿越。
+  storage-get: func(key: string) -> option<list<u8>>;
+  storage-set: func(key: string, value: list<u8>) -> result<_, string>;
+  storage-delete: func(key: string) -> result<_, string>;
 }
 
 /// 插件必须实现的接口。

@@ -68,11 +68,13 @@ fn default_covers_folder() -> String {
 fn default_plugins_folder() -> String {
     "plugins".into()
 }
+/// 单 worker 起步。实测并发一高就被番茄风控回验证码中间页，
+/// 全书一次全废；宁慢勿废。
 fn default_max_workers() -> usize {
-    7
+    1
 }
 fn default_sleep_time() -> u64 {
-    5
+    3
 }
 fn default_log_level() -> String {
     "info".into()
@@ -187,7 +189,7 @@ mod tests {
     fn missing_fields_fall_back_to_defaults() {
         let cfg: Config = serde_json::from_str(r#"{"max_workers": 3}"#).unwrap();
         assert_eq!(cfg.max_workers, 3);
-        assert_eq!(cfg.sleep_time, 5);
+        assert_eq!(cfg.sleep_time, default_sleep_time());
         assert_eq!(cfg.log_level, "info");
         assert!(cfg.no_proxy.contains(&"i.snssdk.com".to_string()));
     }
