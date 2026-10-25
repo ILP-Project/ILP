@@ -104,9 +104,25 @@ impl Storage {
             .join(format!("{}.txt", sanitize(chapter_title)))
     }
 
-    pub fn cover_path(&self, book_title: &str) -> PathBuf {
+    /// 封面扩展名按魔数判定：番茄返回的是 JPEG，原版一律存 .png 会得到
+    /// 扩展名与内容不符的文件。
+    pub fn cover_path_for(&self, book_title: &str, data: &[u8]) -> PathBuf {
+        let ext = sniff_ext(data);
         self.covers_dir
-            .join(format!("{}.png", sanitize(book_title)))
+            .join(format!("{}.{ext}", sanitize(book_title)))
+    }
+
+    /// 已有封面（任意扩展名）就返回它的路径。
+    pub fn existing_cover(&self, book_title: &str) -> Option<PathBuf> {
+        for ext in ["jpg", "png", "webp", "gif"] {
+            let p = self
+                .covers_dir
+                .join(format!("{}.{ext}", sanitize(book_title)));
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        None
     }
 
     pub fn is_chapter_downloaded(&self, book_title: &str, chapter_title: &str) -> bool {
@@ -123,13 +139,27 @@ impl Storage {
         Ok(())
     }
 
-    pub fn save_cover(&self, book_title: &str, data: &[u8]) -> Result<()> {
-        let path = self.cover_path(book_title);
+    pub fn save_cover(&self, book_title: &str, data: &[u8]) -> Result<PathBuf> {
+        let path = self.cover_path_for(book_title, data);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         std::fs::write(&path, data)?;
-        Ok(())
+        Ok(path)
+    }
+}
+
+fn sniff_ext(data: &[u8]) -> &'static str {
+    if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "jpg"
+    } else if data.starts_with(b"\x89PNG") {
+        "png"
+    } else if data.len() > 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        "webp"
+    } else if data.starts_with(b"GIF8") {
+        "gif"
+    } else {
+        "bin"
     }
 }
 
