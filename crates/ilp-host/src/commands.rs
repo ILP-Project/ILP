@@ -28,7 +28,7 @@ pub fn do_get(
             let title = plugin.title()?;
             let url = plugin.cover_url()?;
             let bytes = crate::http::get_bytes(&url)?;
-            let path = storage.save_cover(&title, &bytes)?;
+            let path = storage.save_cover(&title, id, &bytes)?;
             println!("封面已保存: {}", path.display());
         }
         "chapter" => do_chapters(plugin, &storage, config, site_id, id, force_update, false)?,
@@ -80,25 +80,29 @@ fn do_chapters(
         }
     };
 
-    if with_cover && storage.existing_cover(&book.title).is_none() {
+    if with_cover && storage.existing_cover(&book.title, book_id).is_none() {
         let bytes = crate::http::get_bytes(&book.cover_url)?;
-        storage.save_cover(&book.title, &bytes)?;
+        storage.save_cover(&book.title, book_id, &bytes)?;
     }
 
-    fetch_all(plugin, storage, config, &book)
+    fetch_all(plugin, storage, config, site_id, book_id, &book)
 }
 
 fn fetch_all(
     plugin: &mut PluginInstance,
     storage: &Storage,
     config: &Config,
+    site_id: &str,
+    book_id: &str,
     book: &Book,
 ) -> Result<()> {
-    let todo: Vec<_> = book
+    // 序号来自目录里的原始位置，与是否已下载无关，这样文件名顺序稳定。
+    let todo: Vec<(usize, ilp_types::ChapterEntry)> = book
         .chapters
         .iter()
-        .filter(|c| !storage.is_chapter_downloaded(&book.title, &c.title))
-        .cloned()
+        .enumerate()
+        .filter(|(_, c)| !storage.is_chapter_downloaded(site_id, book_id, &c.id))
+        .map(|(i, c)| (i + 1, c.clone()))
         .collect();
 
     if todo.is_empty() {
@@ -111,7 +115,7 @@ fn fetch_all(
     let mut failed = 0usize;
 
     for chunk in todo.chunks(BATCH_SIZE) {
-        let ids: Vec<String> = chunk.iter().map(|c| c.id.clone()).collect();
+        let ids: Vec<String> = chunk.iter().map(|(_, c)| c.id.clone()).collect();
         let tasks = match plugin.plan_fetch(&ids) {
             Ok(t) => t,
             Err(e) => {
@@ -130,26 +134,60 @@ fn fetch_all(
         for (task, resp) in tasks.iter().zip(responses) {
             let Ok(resp) = resp else {
                 tracing::warn!("请求失败: {}", task.request.url);
-                retry_missing(plugin, storage, config, book, chunk, &mut done, &mut failed);
+                retry_missing(
+                    plugin,
+                    storage,
+                    config,
+                    site_id,
+                    book_id,
+                    book,
+                    chunk,
+                    &mut done,
+                    &mut failed,
+                );
                 continue;
             };
             let got = match plugin.consume_fetch(&task.id, resp) {
                 Ok(items) => items,
                 Err(e) => {
                     tracing::warn!("解析响应失败 {}: {e:#}", task.request.url);
-                    retry_missing(plugin, storage, config, book, chunk, &mut done, &mut failed);
+                    retry_missing(
+                        plugin,
+                        storage,
+                        config,
+                        site_id,
+                        book_id,
+                        book,
+                        chunk,
+                        &mut done,
+                        &mut failed,
+                    );
                     continue;
                 }
             };
             let landed: std::collections::HashSet<String> =
                 got.iter().map(|i| i.id.clone()).collect();
             for item in &got {
-                persist(storage, book, item, &mut done, &mut failed);
+                let seq = chunk
+                    .iter()
+                    .find(|(_, c)| c.id == item.id)
+                    .map(|(s, _)| *s)
+                    .unwrap_or(0);
+                persist(
+                    storage,
+                    site_id,
+                    book_id,
+                    book,
+                    seq,
+                    item,
+                    &mut done,
+                    &mut failed,
+                );
             }
             // 服务端限速时批量接口会少返回若干章，必须单独补齐。
-            let missing: Vec<_> = chunk
+            let missing: Vec<(usize, ilp_types::ChapterEntry)> = chunk
                 .iter()
-                .filter(|c| !landed.contains(&c.id))
+                .filter(|(_, c)| !landed.contains(&c.id))
                 .cloned()
                 .collect();
             if !missing.is_empty() {
@@ -158,6 +196,8 @@ fn fetch_all(
                     plugin,
                     storage,
                     config,
+                    site_id,
+                    book_id,
                     book,
                     &missing,
                     &mut done,
@@ -169,29 +209,40 @@ fn fetch_all(
 
     println!("完成: 成功 {done} 章，失败 {failed} 章");
     if failed > 0 {
+        // 顺带把历史失败也列出来：之前跑到一半失败的章，这次可能根本没进入待办。
+        match storage.failed_chapter_ids(site_id, book_id) {
+            Ok(ids) if !ids.is_empty() => {
+                tracing::warn!("库内累计失败章 {} 个，重跑同一命令会重试", ids.len());
+            }
+            _ => {}
+        }
         anyhow::bail!("有 {failed} 章下载失败");
     }
     Ok(())
 }
 
 /// 逐章补抓：批接口少返回时退回单章请求，间隔 sleep_time 避开限速。
+#[allow(clippy::too_many_arguments)]
 fn retry_missing(
     plugin: &mut PluginInstance,
     storage: &Storage,
     config: &Config,
+    site_id: &str,
+    book_id: &str,
     book: &Book,
-    chapters: &[ilp_types::ChapterEntry],
+    chapters: &[(usize, ilp_types::ChapterEntry)],
     done: &mut usize,
     failed: &mut usize,
 ) {
     let sleep_ms = config.sleep_time * 1000;
-    for ch in chapters {
+    for (seq, ch) in chapters {
         std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
         let ids = vec![ch.id.clone()];
         let tasks = match plugin.plan_fetch(&ids) {
             Ok(t) if !t.is_empty() => t,
             _ => {
                 tracing::warn!("单章重试计划失败: {}", ch.title);
+                mark_failed(storage, site_id, book_id, &ch.id);
                 *failed += 1;
                 continue;
             }
@@ -203,37 +254,58 @@ fn retry_missing(
             Some(Ok(resp)) => match plugin.consume_fetch(&tasks[0].id, resp) {
                 Ok(items) if !items.is_empty() => {
                     for item in &items {
-                        persist(storage, book, item, done, failed);
+                        persist(storage, site_id, book_id, book, *seq, item, done, failed);
                     }
                 }
                 _ => {
                     tracing::warn!("单章重试仍失败: {}", ch.title);
+                    mark_failed(storage, site_id, book_id, &ch.id);
                     *failed += 1;
                 }
             },
             _ => {
                 tracing::warn!("单章重试请求失败: {}", ch.title);
+                mark_failed(storage, site_id, book_id, &ch.id);
                 *failed += 1;
             }
         }
     }
 }
 
+fn mark_failed(storage: &Storage, site_id: &str, book_id: &str, chapter_id: &str) {
+    if let Err(e) = storage.mark_chapter_failed(site_id, book_id, chapter_id) {
+        tracing::warn!("记录失败状态出错: {e:#}");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn persist(
     storage: &Storage,
+    site_id: &str,
+    book_id: &str,
     book: &Book,
+    seq: usize,
     item: &ChapterContent,
     done: &mut usize,
     failed: &mut usize,
 ) {
     let full = format!("{}\n{}\n---\n{}", item.title, book.author, item.text);
-    match storage.save_chapter(&book.title, &item.title, &full) {
-        Ok(()) => {
+    match storage.save_chapter(
+        site_id,
+        &book.title,
+        book_id,
+        seq,
+        &item.id,
+        &item.title,
+        &full,
+    ) {
+        Ok(_) => {
             *done += 1;
             println!("已下载: {} - {}", book.title, item.title);
         }
         Err(e) => {
             tracing::warn!("写入失败: {} - {}: {e:#}", book.title, item.title);
+            mark_failed(storage, site_id, book_id, &item.id);
             *failed += 1;
         }
     }
