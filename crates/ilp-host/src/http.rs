@@ -284,6 +284,213 @@ mod tests {
         assert!(fetch_requests(&[], 4, 0).is_empty());
     }
 
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("测试用 runtime")
+    }
+
+    /// 只把"起服务 + 挂 mock"放进 runtime。
+    ///
+    /// 被测试的 `send_with_retry` / `fetch_requests` 用的是阻塞 reqwest，
+    /// 它自己会建一个内部 tokio runtime，绝不能在 `block_on` 的异步上下文里
+    /// 调用，否则 reqwest 建 Client 时就会 panic（"Cannot drop a runtime in
+    /// a context where blocking is not allowed"）。所以请求一律在 runtime
+    /// 之外发。
+    fn start_server(
+        rt: &tokio::runtime::Runtime,
+        mocks: impl FnOnce(
+            wiremock::MockServer,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = wiremock::MockServer>>>,
+    ) -> wiremock::MockServer {
+        let server = rt.block_on(wiremock::MockServer::start());
+        rt.block_on(mocks(server))
+    }
+
+    fn get_req(url: &str) -> HttpRequest {
+        HttpRequest {
+            method: "GET".to_string(),
+            url: url.to_string(),
+            headers: Vec::new(),
+            body: None,
+        }
+    }
+
+    #[test]
+    fn wiremock_5xx_is_retried_then_succeeds() {
+        let rt = rt();
+        let server = start_server(&rt, |server| {
+            Box::pin(async move {
+                // 前两次 503，第三次 200：正好用掉 MAX_RETRIES 的两次重试。
+                wiremock::Mock::given(wiremock::matchers::method("GET"))
+                    .and(wiremock::matchers::path("/retry"))
+                    .respond_with(wiremock::ResponseTemplate::new(503))
+                    .up_to_n_times(2)
+                    .mount(&server)
+                    .await;
+                wiremock::Mock::given(wiremock::matchers::method("GET"))
+                    .and(wiremock::matchers::path("/retry"))
+                    .respond_with(
+                        wiremock::ResponseTemplate::new(200).set_body_string("ok-after-retry"),
+                    )
+                    .mount(&server)
+                    .await;
+                server
+            })
+        });
+
+        let url = format!("{}/retry", server.uri());
+        let resp = send_with_retry(&get_req(&url)).expect("重试后应成功");
+        assert_eq!(resp.status, 200);
+        assert_eq!(String::from_utf8_lossy(&resp.body), "ok-after-retry");
+
+        let calls = rt
+            .block_on(server.received_requests())
+            .expect("应有记录")
+            .len();
+        assert_eq!(calls, 3, "两次重试后第三次成功");
+        drop(server);
+        drop(rt);
+    }
+
+    #[test]
+    fn wiremock_4xx_is_not_retried() {
+        let rt = rt();
+        let server = start_server(&rt, |server| {
+            Box::pin(async move {
+                wiremock::Mock::given(wiremock::matchers::method("GET"))
+                    .and(wiremock::matchers::path("/missing"))
+                    .respond_with(wiremock::ResponseTemplate::new(404))
+                    .mount(&server)
+                    .await;
+                server
+            })
+        });
+
+        let url = format!("{}/missing", server.uri());
+        let err = send_with_retry(&get_req(&url)).expect_err("404 应失败");
+        assert!(
+            format!("{err:#}").contains("404"),
+            "错误里应有状态码: {err:#}"
+        );
+
+        // 关键：4xx 只发一次，不能因为分类错误白白重试三次。
+        let calls = rt
+            .block_on(server.received_requests())
+            .expect("应有记录")
+            .len();
+        assert_eq!(calls, 1, "4xx 不该重试");
+        drop(server);
+        drop(rt);
+    }
+
+    #[test]
+    fn wiremock_persistent_5xx_gives_up_after_retries() {
+        let rt = rt();
+        let server = start_server(&rt, |server| {
+            Box::pin(async move {
+                wiremock::Mock::given(wiremock::matchers::method("GET"))
+                    .and(wiremock::matchers::path("/down"))
+                    .respond_with(wiremock::ResponseTemplate::new(500))
+                    .mount(&server)
+                    .await;
+                server
+            })
+        });
+
+        let url = format!("{}/down", server.uri());
+        let err = send_with_retry(&get_req(&url)).expect_err("应最终失败");
+        assert!(
+            format!("{err:#}").contains("500"),
+            "错误里应有状态码: {err:#}"
+        );
+
+        let calls = rt
+            .block_on(server.received_requests())
+            .expect("应有记录")
+            .len();
+        assert_eq!(calls as u32, MAX_RETRIES + 1, "首次 + 全部重试");
+        drop(server);
+        drop(rt);
+    }
+
+    #[test]
+    fn wiremock_fetch_requests_keeps_input_order() {
+        let rt = rt();
+        let server = start_server(&rt, |server| {
+            Box::pin(async move {
+                for i in 0..5u32 {
+                    wiremock::Mock::given(wiremock::matchers::method("GET"))
+                        .and(wiremock::matchers::path(format!("/p{i}")))
+                        .respond_with(
+                            wiremock::ResponseTemplate::new(200)
+                                .set_body_string(format!("body{i}")),
+                        )
+                        .mount(&server)
+                        .await;
+                }
+                server
+            })
+        });
+
+        let reqs: Vec<HttpRequest> = (0..5u32)
+            .map(|i| get_req(&format!("{}/p{i}", server.uri())))
+            .collect();
+        let refs: Vec<&HttpRequest> = reqs.iter().collect();
+        let results = fetch_requests(&refs, 3, 0);
+
+        assert_eq!(results.len(), 5);
+        for (i, r) in results.iter().enumerate() {
+            let resp = r.as_ref().expect("应成功");
+            assert_eq!(resp.status, 200);
+            // 乱序返回也必须按输入顺序归位，否则章节会串号。
+            assert_eq!(String::from_utf8_lossy(&resp.body), format!("body{i}"));
+        }
+        drop(server);
+        drop(rt);
+    }
+
+    #[test]
+    fn wiremock_post_body_and_headers_round_trip() {
+        let rt = rt();
+        let server = start_server(&rt, |server| {
+            Box::pin(async move {
+                wiremock::Mock::given(wiremock::matchers::method("POST"))
+                    .and(wiremock::matchers::path("/echo"))
+                    .and(wiremock::matchers::header("x-test", "yes"))
+                    .and(wiremock::matchers::body_string("payload"))
+                    .respond_with(
+                        wiremock::ResponseTemplate::new(201).insert_header("x-back", "done"),
+                    )
+                    .mount(&server)
+                    .await;
+                server
+            })
+        });
+
+        let req = HttpRequest {
+            method: "POST".to_string(),
+            url: format!("{}/echo", server.uri()),
+            headers: vec![HttpHeader {
+                name: "x-test".to_string(),
+                value: "yes".to_string(),
+            }],
+            body: Some(b"payload".to_vec()),
+        };
+        let resp = send_with_retry(&req).expect("应成功");
+        assert_eq!(resp.status, 201);
+        assert!(
+            resp.headers
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case("x-back") && h.value == "done"),
+            "响应头应回传"
+        );
+        drop(server);
+        drop(rt);
+    }
+
     #[test]
     fn retry_classification() {
         // 5xx / 429 / 408 是瞬时问题，值得重试

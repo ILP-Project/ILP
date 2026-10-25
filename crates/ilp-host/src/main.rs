@@ -8,6 +8,9 @@ mod logging;
 mod plugin_manager;
 mod storage;
 
+#[cfg(test)]
+mod e2e_tests;
+
 fn main() -> std::process::ExitCode {
     match run() {
         Ok(()) => std::process::ExitCode::from(exit::SUCCESS as u8),
