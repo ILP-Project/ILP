@@ -130,19 +130,39 @@ fn fetch_all(
         for (task, resp) in tasks.iter().zip(responses) {
             let Ok(resp) = resp else {
                 tracing::warn!("请求失败: {}", task.request.url);
-                failed += 1;
+                retry_missing(plugin, storage, config, book, chunk, &mut done, &mut failed);
                 continue;
             };
-            match plugin.consume_fetch(&task.id, resp) {
-                Ok(items) => {
-                    for item in items {
-                        persist(storage, book, &item, &mut done, &mut failed);
-                    }
-                }
+            let got = match plugin.consume_fetch(&task.id, resp) {
+                Ok(items) => items,
                 Err(e) => {
                     tracing::warn!("解析响应失败 {}: {e:#}", task.request.url);
-                    failed += 1;
+                    retry_missing(plugin, storage, config, book, chunk, &mut done, &mut failed);
+                    continue;
                 }
+            };
+            let landed: std::collections::HashSet<String> =
+                got.iter().map(|i| i.id.clone()).collect();
+            for item in &got {
+                persist(storage, book, item, &mut done, &mut failed);
+            }
+            // 服务端限速时批量接口会少返回若干章，必须单独补齐。
+            let missing: Vec<_> = chunk
+                .iter()
+                .filter(|c| !landed.contains(&c.id))
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                tracing::info!("本批缺 {} 章，逐章重试", missing.len());
+                retry_missing(
+                    plugin,
+                    storage,
+                    config,
+                    book,
+                    &missing,
+                    &mut done,
+                    &mut failed,
+                );
             }
         }
     }
@@ -152,6 +172,51 @@ fn fetch_all(
         anyhow::bail!("有 {failed} 章下载失败");
     }
     Ok(())
+}
+
+/// 逐章补抓：批接口少返回时退回单章请求，间隔 sleep_time 避开限速。
+fn retry_missing(
+    plugin: &mut PluginInstance,
+    storage: &Storage,
+    config: &Config,
+    book: &Book,
+    chapters: &[ilp_types::ChapterEntry],
+    done: &mut usize,
+    failed: &mut usize,
+) {
+    let sleep_ms = config.sleep_time * 1000;
+    for ch in chapters {
+        std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+        let ids = vec![ch.id.clone()];
+        let tasks = match plugin.plan_fetch(&ids) {
+            Ok(t) if !t.is_empty() => t,
+            _ => {
+                tracing::warn!("单章重试计划失败: {}", ch.title);
+                *failed += 1;
+                continue;
+            }
+        };
+        let requests: Vec<&crate::engine::wit_types::HttpRequest> =
+            tasks.iter().map(|t| &t.request).collect();
+        let responses = crate::http::fetch_requests(&requests, 1, 0);
+        match responses.into_iter().next() {
+            Some(Ok(resp)) => match plugin.consume_fetch(&tasks[0].id, resp) {
+                Ok(items) if !items.is_empty() => {
+                    for item in &items {
+                        persist(storage, book, item, done, failed);
+                    }
+                }
+                _ => {
+                    tracing::warn!("单章重试仍失败: {}", ch.title);
+                    *failed += 1;
+                }
+            },
+            _ => {
+                tracing::warn!("单章重试请求失败: {}", ch.title);
+                *failed += 1;
+            }
+        }
+    }
 }
 
 fn persist(
