@@ -7,7 +7,9 @@
 //! 常量来自公开的客户端实现，算法按 NSA 规范与 GB/T 32905-2016 独立实现。
 
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
-use aes::{Aes128, Aes256};
+use aes::Aes128;
+#[cfg(test)]
+use aes::Aes256;
 
 use crate::sm3::sm3;
 use crate::spn::{le_words, pkcs7_pad, simon_encrypt, simon_expand, speck_encrypt, speck_expand};
@@ -303,6 +305,9 @@ pub fn aes128_cbc_encrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>,
 }
 
 /// AES-256-CBC 加密并补 PKCS#7 填充。
+///
+/// 协议只用到 AES-128，这一对 256 位版本仅用于自测填充实现是否对称。
+#[cfg(test)]
 pub fn aes256_cbc_encrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
     let mut buf = vec![0u8; data.len() + 16];
     buf[..data.len()].copy_from_slice(data);
@@ -314,7 +319,8 @@ pub fn aes256_cbc_encrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>,
     Ok(out.to_vec())
 }
 
-/// AES-256-CBC 解密并去 PKCS#7 填充。
+/// AES-256-CBC 解密并去 PKCS#7 填充。仅自测用，见上。
+#[cfg(test)]
 pub fn aes256_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
     if key.len() != 32 || iv.len() != 16 || data.is_empty() || data.len() % 16 != 0 {
         return Err("AES 参数长度不合法".to_string());

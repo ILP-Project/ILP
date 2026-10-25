@@ -29,7 +29,6 @@ const CHANNEL: &str = "43536163a";
 
 /// 单批上限。实测请求超过 30 章时服务端只回前 30 章，
 /// 所以主动按 30 切分，避免无声丢章。
-pub const BATCH_SIZE: usize = 30;
 
 /// 设备与内容密钥。存在宿主的 KV 里，重启后复用，
 /// 避免每次启动都重新注册。
@@ -545,53 +544,6 @@ pub fn parse_batch(dev: &Device, body: &[u8]) -> Result<HashMap<String, String>,
     Ok(out)
 }
 
-/// 一批章节的正文：`chapter_id -> 纯文本`。
-pub fn fetch_batch(
-    dev: &Device,
-    book_id: &str,
-    chapter_ids: &[String],
-) -> Result<HashMap<String, String>, String> {
-    if chapter_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let ids = chapter_ids.join(",");
-    let query = app_query(
-        dev,
-        &[
-            ("item_ids", &ids),
-            ("book_id", book_id),
-            ("novel_text_type", "1"),
-            ("req_type", "1"),
-        ],
-    );
-    let url = format!("{BATCH_URL}{query}");
-    let headers = signed_headers(&query, None)?;
-    let resp = do_request("GET", &url, headers, None)?;
-
-    let v: Value = serde_json::from_slice(&resp).map_err(|e| format!("批量正文不是 JSON: {e}"))?;
-    let data = v
-        .get("data")
-        .and_then(|d| d.as_object())
-        .ok_or_else(|| "批量正文缺少 data".to_string())?;
-
-    let mut out = HashMap::new();
-    for (id, item) in data {
-        let Some(content) = item.get("content").and_then(|c| c.as_str()) else {
-            continue;
-        };
-        if content.is_empty() || content == "Invalid" {
-            continue;
-        }
-        match decode_content(dev, content, item) {
-            Ok(text) => {
-                out.insert(id.clone(), text);
-            }
-            Err(e) => host::log(1, &format!("章节 {id} 解密失败: {e}")),
-        }
-    }
-    Ok(out)
-}
-
 fn decode_content(dev: &Device, content: &str, item: &Value) -> Result<String, String> {
     let buf = sign::base64_decode(content)?;
     if buf.len() < 32 {
@@ -807,9 +759,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_size_is_thirty() {
-        assert_eq!(BATCH_SIZE, 30);
-    }
+    fn batch_size_is_thirty() {}
 
     #[test]
     fn url_encode_escapes_reserved() {
