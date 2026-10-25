@@ -4,9 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::cli::PluginCommand;
-
-const PLUGINS_DIR: &str = "plugins";
-const DISABLED_DIR: &str = "plugins/disabled";
+use crate::config::Config;
 
 #[derive(Deserialize)]
 struct PluginJson {
@@ -14,19 +12,19 @@ struct PluginJson {
     url: String,
 }
 
-pub fn run(cmd: PluginCommand) -> Result<()> {
+pub fn run(config: &Config, cmd: PluginCommand) -> Result<()> {
     match cmd {
-        PluginCommand::List => list(),
-        PluginCommand::Install { source } => install(&source),
-        PluginCommand::Uninstall { name } => uninstall(&name),
-        PluginCommand::Enable { name } => enable(&name),
-        PluginCommand::Disable { name } => disable(&name),
+        PluginCommand::List => list(config),
+        PluginCommand::Install { source } => install(config, &source),
+        PluginCommand::Uninstall { name } => uninstall(config, &name),
+        PluginCommand::Enable { name } => enable(config, &name),
+        PluginCommand::Disable { name } => disable(config, &name),
     }
 }
 
-fn list() -> Result<()> {
-    let enabled = list_wasm(PLUGINS_DIR);
-    let disabled = list_wasm(DISABLED_DIR);
+fn list(config: &Config) -> Result<()> {
+    let enabled = list_wasm(&config.plugins_dir());
+    let disabled = list_wasm(&config.disabled_plugins_dir());
     println!("已启用插件:");
     for name in &enabled {
         println!("  {name}");
@@ -38,7 +36,7 @@ fn list() -> Result<()> {
     Ok(())
 }
 
-fn list_wasm(dir: &str) -> Vec<String> {
+fn list_wasm(dir: &Path) -> Vec<String> {
     let mut names = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -53,7 +51,7 @@ fn list_wasm(dir: &str) -> Vec<String> {
     names
 }
 
-fn install(source: &str) -> Result<()> {
+fn install(config: &Config, source: &str) -> Result<()> {
     let (owner, repo) = source
         .split_once('/')
         .ok_or_else(|| anyhow!("source 应为 owner/repo 格式"))?;
@@ -65,21 +63,22 @@ fn install(source: &str) -> Result<()> {
     if bytes.is_empty() {
         return Err(anyhow!("下载产物为空: {}", pj.url));
     }
-    fs::create_dir_all(PLUGINS_DIR)?;
-    let dest = format!("{PLUGINS_DIR}/{}.wasm", pj.name);
+    let dir = config.plugins_dir();
+    fs::create_dir_all(&dir)?;
+    let dest = dir.join(format!("{}.wasm", pj.name));
     fs::write(&dest, bytes)?;
-    println!("已安装插件 {} 到 {dest}", pj.name);
+    println!("已安装插件 {} 到 {}", pj.name, dest.display());
     Ok(())
 }
 
-fn uninstall(name: &str) -> Result<()> {
-    let enabled = format!("{PLUGINS_DIR}/{name}.wasm");
-    let disabled = format!("{DISABLED_DIR}/{name}.wasm");
-    if Path::new(&enabled).exists() {
+fn uninstall(config: &Config, name: &str) -> Result<()> {
+    let enabled = config.plugins_dir().join(format!("{name}.wasm"));
+    let disabled = config.disabled_plugins_dir().join(format!("{name}.wasm"));
+    if enabled.exists() {
         fs::remove_file(&enabled)?;
         println!("已卸载插件 {name}");
         Ok(())
-    } else if Path::new(&disabled).exists() {
+    } else if disabled.exists() {
         fs::remove_file(&disabled)?;
         println!("已卸载插件 {name}");
         Ok(())
@@ -88,11 +87,11 @@ fn uninstall(name: &str) -> Result<()> {
     }
 }
 
-fn enable(name: &str) -> Result<()> {
-    let disabled = format!("{DISABLED_DIR}/{name}.wasm");
-    let enabled = format!("{PLUGINS_DIR}/{name}.wasm");
-    if Path::new(&disabled).exists() {
-        fs::create_dir_all(PLUGINS_DIR)?;
+fn enable(config: &Config, name: &str) -> Result<()> {
+    let disabled = config.disabled_plugins_dir().join(format!("{name}.wasm"));
+    let enabled = config.plugins_dir().join(format!("{name}.wasm"));
+    if disabled.exists() {
+        fs::create_dir_all(config.plugins_dir())?;
         fs::rename(&disabled, &enabled)?;
         println!("已启用插件 {name}");
         Ok(())
@@ -101,11 +100,11 @@ fn enable(name: &str) -> Result<()> {
     }
 }
 
-fn disable(name: &str) -> Result<()> {
-    let enabled = format!("{PLUGINS_DIR}/{name}.wasm");
-    let disabled = format!("{DISABLED_DIR}/{name}.wasm");
-    if Path::new(&enabled).exists() {
-        fs::create_dir_all(DISABLED_DIR)?;
+fn disable(config: &Config, name: &str) -> Result<()> {
+    let enabled = config.plugins_dir().join(format!("{name}.wasm"));
+    let disabled = config.disabled_plugins_dir().join(format!("{name}.wasm"));
+    if enabled.exists() {
+        fs::create_dir_all(config.disabled_plugins_dir())?;
         fs::rename(&enabled, &disabled)?;
         println!("已禁用插件 {name}");
         Ok(())

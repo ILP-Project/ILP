@@ -124,9 +124,9 @@ impl PluginInstance {
     }
 }
 
-pub fn load_plugins() -> Result<Vec<PluginInstance>> {
+pub fn load_plugins(config: &crate::config::Config) -> Result<Vec<PluginInstance>> {
     let mut out = Vec::new();
-    let entries = match std::fs::read_dir("plugins") {
+    let entries = match std::fs::read_dir(config.plugins_dir()) {
         Ok(e) => e,
         Err(_) => return Ok(out),
     };
