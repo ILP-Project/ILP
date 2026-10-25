@@ -9,7 +9,7 @@ use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxView, WasiView};
 
 wasmtime::component::bindgen!({
     world: "novel-plugin",
-    path: "../../wit",
+    path: "../ilp-plugin-wit/wit",
 });
 
 use ilp::plugin::host::Host as HostTrait;

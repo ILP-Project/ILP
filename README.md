@@ -15,7 +15,7 @@
 - 网络请求、限速、并发、重试、章节落盘全部收敛到宿主，插件只负责"这个站点的协议长什么样"。
 - 产物跨平台，`plugin.json` 里按 OS 分发的 URL 映射可以退化成单一产物地址。
 
-宿主暴露给插件的能力只有四个（见 `wit/plugin.wit`）：
+宿主暴露给插件的能力只有四个（见 `crates/ilp-plugin-wit/wit/plugin.wit`）：
 
 | 接口 | 用途 |
 |---|---|
@@ -35,14 +35,22 @@
 ```bash
 rustup target add wasm32-wasip2
 cargo build --release                      # 宿主：target/release/ilp
-cargo build --target wasm32-wasip2 --release -p ilp-plugin-fanqie
-cp target/wasm32-wasip2/release/ilp_plugin_fanqie.wasm plugins/fanqie.wasm
+```
+
+插件已拆到独立仓库：宿主只提供 ABI（`crates/ilp-plugin-wit`），
+站点插件在 `ILP-Project/plugin-<site>` 里构建：
+
+```bash
+git clone https://github.com/ILP-Project/plugin-fanqie
+cd plugin-fanqie
+cargo build --target wasm32-wasip2 --release
+cp target/wasm32-wasip2/release/ilp_plugin_fanqie.wasm <宿主目录>/plugins/fanqie.wasm
 ```
 
 依赖都是 crates.io 上的常规库；`rusqlite` 用 `bundled` 特性自带 SQLite，不需要系统预装。
 
-> 插件 crate 是 `cdylib`，**不能**为宿主目标编译（`cargo build -p ilp-plugin-fanqie` 会在
-> 链接阶段失败）。它已从 `default-members` 里排除，所以裸 `cargo build` 不会碰到它。
+> 插件 crate 是 `cdylib`，**不能**为宿主目标编译（会卡在链接阶段），必须显式指定
+> wasm 目标。宿主仓库不再包含插件源码。
 
 ## 使用
 
@@ -80,8 +88,10 @@ data/
 |---|---|
 | `crates/ilp-types` | 宿主与插件共享的 serde 类型 |
 | `crates/ilp-host` | 宿主二进制 `ilp`：CLI、配置、存储、HTTP、wasmtime 加载器、插件管理 |
-| `plugins/fanqie` | 番茄小说插件（WASM） |
-| `wit/plugin.wit` | 插件 ABI 定义 |
+| `crates/ilp-plugin-wit` | 插件 ABI 定义（`wit/plugin.wit`），宿主与插件共享的唯一来源 |
+
+站点插件不在本仓库：一站点一仓库（`plugin-<site>`），产物经 GitHub Pages
+静态 registry 分发，详见 `plan/2026-10-26_plugin-distribution.md`。
 
 ## 已知限制
 
