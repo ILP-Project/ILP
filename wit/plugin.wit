@@ -1,0 +1,137 @@
+/// ILP 插件接口。
+///
+/// 设计要点：
+/// - 插件是沙箱，不能自己发 HTTP、读写文件、用 SQLite；这些全部经 host 注入。
+/// - 正文抓取分两阶段：插件产出抓取计划，宿主执行（并发/限速/重试全在宿主），
+///   再把响应交回插件解析。这样 30 章/批的批量接口和 1 章/请求的网页接口
+///   共用同一套 ABI，并发策略也不用在每个插件里重写一遍。
+package ilp:plugin@0.1.0;
+
+/// 宿主提供给插件的能力。
+interface host {
+  /// 写日志。level: 0=error 1=warn 2=info 3=debug 4=trace
+  log: func(level: u8, message: string);
+
+  /// 宿主签发的单调递增毫秒时间戳（插件沙箱里没有系统时钟）。
+  now-ms: func() -> u64;
+
+  /// 插件私有 KV。宿主按插件名隔离，实际落盘路径由宿主决定，
+  /// 插件只见到 key，不可能路径穿越。
+  storage-get: func(key: string) -> option<list<u8>>;
+  storage-set: func(key: string, value: list<u8>) -> result<_, string>;
+  storage-delete: func(key: string) -> result<_, string>;
+}
+
+/// 插件与宿主之间传递的数据类型。
+interface types {
+  /// 章节目录条目。
+  record chapter-entry {
+    id: string,
+    title: string,
+    /// 阅读页地址
+    url: string,
+    /// 内容获取地址（网页型插件即正文页；批量型插件可留空）
+    fetch-url: string,
+    /// 更新时间（Unix 秒）
+    update-time: s64,
+  }
+
+  /// 搜索结果条目。
+  record search-result {
+    id: string,
+    title: string,
+    author: string,
+    /// 封面地址，可能为空
+    cover-url: string,
+    /// 简介摘要
+    description: string,
+  }
+
+  record plugin-metadata {
+    site-name: string,
+    site-id: string,
+    site-domain: string,
+    plugin-name: string,
+    plugin-id: string,
+    version: string,
+  }
+
+  record http-header {
+    name: string,
+    value: string,
+  }
+
+  /// 宿主代发的请求。
+  record http-request {
+    method: string,
+    url: string,
+    headers: list<http-header>,
+    body: option<list<u8>>,
+  }
+
+  /// 宿主回传的响应。
+  record http-response {
+    status: u16,
+    headers: list<http-header>,
+    body: list<u8>,
+  }
+
+  /// 一个抓取任务。id 用于把响应与请求对应回去。
+  record fetch-task {
+    id: string,
+    request: http-request,
+  }
+
+  /// 解析产物：一章的正文。
+  record chapter-content {
+    id: string,
+    title: string,
+    /// 已渲染成纯文本的正文
+    text: string,
+  }
+
+  /// 分页信息随搜索结果一起给，供 CLI 翻页。
+  record search-page {
+    results: list<search-result>,
+    /// 本页之前的累计数量，供交互式翻页定位
+    offset: u32,
+    has-more: bool,
+  }
+}
+
+/// 插件必须实现的接口。
+interface plugin {
+  use types.{
+    chapter-content, chapter-entry, fetch-task, http-response, plugin-metadata,
+    search-page,
+  };
+
+  /// 元数据，加载时调用一次。
+  metadata: func() -> plugin-metadata;
+
+  /// 绑定小说并预热（可能触发一次目录抓取）。
+  init: func(book-id: string, force-update: bool) -> result<_, string>;
+
+  title: func() -> result<string, string>;
+  author: func() -> result<string, string>;
+  cover-url: func() -> result<string, string>;
+  description: func() -> result<string, string>;
+
+  /// 章节目录。
+  catalog: func(force-update: bool) -> result<list<chapter-entry>, string>;
+
+  search: func(keyword: string, offset: u32) -> result<search-page, string>;
+
+  /// 第一阶段：给定章节 id，产出要发的请求。
+  /// 批量站点一次返回一个任务覆盖多章，网页站点每章一个任务。
+  plan-fetch: func(chapter-ids: list<string>) -> result<list<fetch-task>, string>;
+
+  /// 第二阶段：把响应交回来，插件解密/解析成正文。
+  /// 返回空列表表示该任务失败（宿主记 failed 继续下一批）。
+  consume-fetch: func(task-id: string, response: http-response) -> result<list<chapter-content>, string>;
+}
+
+world novel-plugin {
+  import host;
+  export plugin;
+}

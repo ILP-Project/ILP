@@ -1,273 +1,340 @@
-use anyhow::{anyhow, Context, Result};
-use ilp_types::{ChapterEntry, PluginMetadata, SearchResult};
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
-use wasmtime::{Caller, Engine, Instance, Linker, Memory, Module, Store, TypedFunc};
-use wasmtime_wasi::p1::{self, WasiP1Ctx};
-use wasmtime_wasi::WasiCtxBuilder;
+use std::path::{Path, PathBuf};
 
-use crate::http;
+use wasmtime::component::{Component, Linker};
+use wasmtime::{Engine, Store};
+use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxView, WasiView};
 
-type HttpCache = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+wasmtime::component::bindgen!({
+    world: "novel-plugin",
+    path: "../../wit",
+});
 
-static HTTP_CACHE: OnceLock<HttpCache> = OnceLock::new();
+use ilp::plugin::host::Host as HostTrait;
+use ilp::plugin::types::{FetchTask, HttpResponse};
 
-fn http_cache() -> &'static HttpCache {
-    HTTP_CACHE.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+pub use ilp::plugin::types as wit_types;
+
+use ilp_types::{ChapterContent, ChapterEntry, PluginMetadata, SearchResult};
+
+/// 宿主给插件的全部能力对应的状态。
+pub struct HostState {
+    ctx: WasiCtx,
+    table: ResourceTable,
+    /// 插件名，用于隔离 storage 命名空间
+    plugin_name: String,
+    storage_dir: PathBuf,
+    /// 内存里的 KV，落盘前先命中这里
+    cache: HashMap<String, Vec<u8>>,
+    /// 单调时间戳基点
+    started: std::time::Instant,
 }
 
-pub struct PluginInstance {
-    pub site_id: String,
-    store: Store<WasiP1Ctx>,
-    instance: Instance,
-}
-
-fn unpack(packed: i64) -> (i32, i32) {
-    ((packed >> 32) as i32, (packed & 0xFFFF_FFFF) as i32)
-}
-
-impl PluginInstance {
-    pub fn load(path: &Path) -> Result<Self> {
-        let engine = Engine::default();
-        let module = Module::from_file(&engine, path)?;
-        let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
-        p1::add_to_linker_sync(&mut linker, |cx: &mut WasiP1Ctx| cx)?;
-        define_host_funcs(&mut linker)?;
-        let wasi_ctx = WasiCtxBuilder::new().inherit_stdio().build_p1();
-        let mut store = Store::new(&engine, wasi_ctx);
-        let instance = linker.instantiate(&mut store, &module)?;
-
-        let metadata = Self::get_metadata(&mut store, &instance)?;
-        let site_id = metadata.site_id.clone();
-
-        Ok(Self {
-            site_id,
-            store,
-            instance,
-        })
-    }
-
-    fn get_metadata(store: &mut Store<WasiP1Ctx>, instance: &Instance) -> Result<PluginMetadata> {
-        let f: TypedFunc<(), i64> = instance.get_typed_func(&mut *store, "ilp_get_metadata")?;
-        let packed = f.call(&mut *store, ())?;
-        let s = read_packed_string(store, instance, packed)?;
-        serde_json::from_str(&s).context("解析插件元数据失败")
-    }
-
-    pub fn init(&mut self, id: &str, force_update: bool) -> Result<()> {
-        let (ptr, len) = write_guest(&mut self.store, &self.instance, id.as_bytes())?;
-        let f: TypedFunc<(i32, i32, i32), i32> =
-            self.instance.get_typed_func(&mut self.store, "ilp_init")?;
-        f.call(&mut self.store, (ptr, len, force_update as i32))?;
-        if ptr != 0 {
-            free_guest(&mut self.store, &self.instance, ptr, len);
+impl HostState {
+    fn new(plugin_name: String, storage_dir: PathBuf) -> Self {
+        Self {
+            ctx: WasiCtx::builder().build(),
+            table: ResourceTable::new(),
+            plugin_name,
+            storage_dir,
+            cache: HashMap::new(),
+            started: std::time::Instant::now(),
         }
+    }
+}
+
+impl WasiView for HostState {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.ctx,
+            table: &mut self.table,
+        }
+    }
+}
+
+fn level_to_tracing(level: u8, plugin: &str, msg: &str) {
+    match level {
+        0 => tracing::error!(target: "plugin", "[{plugin}] {msg}"),
+        1 => tracing::warn!(target: "plugin", "[{plugin}] {msg}"),
+        2 => tracing::info!(target: "plugin", "[{plugin}] {msg}"),
+        3 => tracing::debug!(target: "plugin", "[{plugin}] {msg}"),
+        _ => tracing::trace!(target: "plugin", "[{plugin}] {msg}"),
+    }
+}
+
+impl HostTrait for HostState {
+    fn log(&mut self, level: u8, message: String) {
+        level_to_tracing(level, &self.plugin_name, &message);
+    }
+
+    fn now_ms(&mut self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    fn storage_get(&mut self, key: String) -> Option<Vec<u8>> {
+        if let Some(v) = self.cache.get(&key) {
+            return Some(v.clone());
+        }
+        // key 只允许简单标识符，防止穿越到 storage 目录之外
+        if !is_safe_key(&key) {
+            tracing::warn!("插件 {} 请求了非法 storage key: {key}", self.plugin_name);
+            return None;
+        }
+        let path = self.storage_dir.join(&key);
+        let v = std::fs::read(path).ok()?;
+        self.cache.insert(key, v.clone());
+        Some(v)
+    }
+
+    fn storage_set(&mut self, key: String, value: Vec<u8>) -> Result<(), String> {
+        if !is_safe_key(&key) {
+            return Err(format!("非法 storage key: {key}"));
+        }
+        std::fs::create_dir_all(&self.storage_dir).map_err(|e| e.to_string())?;
+        atomic_write(&self.storage_dir.join(&key), &value).map_err(|e| e.to_string())?;
+        self.cache.insert(key, value);
         Ok(())
     }
 
-    fn call_string(&mut self, name: &str) -> Result<String> {
-        let f: TypedFunc<(), i64> = self.instance.get_typed_func(&mut self.store, name)?;
-        let packed = f.call(&mut self.store, ())?;
-        read_packed_string(&mut self.store, &self.instance, packed)
-    }
-
-    pub fn get_title(&mut self) -> Result<String> {
-        self.call_string("ilp_get_title")
-    }
-
-    pub fn get_author(&mut self) -> Result<String> {
-        self.call_string("ilp_get_author")
-    }
-
-    pub fn get_cover(&mut self) -> Result<String> {
-        self.call_string("ilp_get_cover")
-    }
-
-    pub fn get_content(&mut self, force: bool) -> Result<Vec<ChapterEntry>> {
-        let f: TypedFunc<i32, i64> = self
-            .instance
-            .get_typed_func(&mut self.store, "ilp_get_content")?;
-        let packed = f.call(&mut self.store, force as i32)?;
-        let s = read_packed_string(&mut self.store, &self.instance, packed)?;
-        serde_json::from_str(&s).context("解析章节列表失败")
-    }
-
-    pub fn search(&mut self, keyword: &str) -> Result<Vec<SearchResult>> {
-        let (ptr, len) = write_guest(&mut self.store, &self.instance, keyword.as_bytes())?;
-        let f: TypedFunc<(i32, i32), i64> = self
-            .instance
-            .get_typed_func(&mut self.store, "ilp_search")?;
-        let packed = f.call(&mut self.store, (ptr, len))?;
-        if ptr != 0 {
-            free_guest(&mut self.store, &self.instance, ptr, len);
+    fn storage_delete(&mut self, key: String) -> Result<(), String> {
+        if !is_safe_key(&key) {
+            return Err(format!("非法 storage key: {key}"));
         }
-        let s = read_packed_string(&mut self.store, &self.instance, packed)?;
-        serde_json::from_str(&s).context("解析搜索结果失败")
-    }
-
-    pub fn parse_chapter(&mut self, title: &str, content: &str) -> Result<String> {
-        let input = ilp_types::ParseInput {
-            title: title.to_string(),
-            content: content.to_string(),
-        };
-        let json = serde_json::to_string(&input)?;
-        let (ptr, len) = write_guest(&mut self.store, &self.instance, json.as_bytes())?;
-        let f: TypedFunc<(i32, i32), i64> = self
-            .instance
-            .get_typed_func(&mut self.store, "ilp_parse_chapter")?;
-        let packed = f.call(&mut self.store, (ptr, len))?;
-        if ptr != 0 {
-            free_guest(&mut self.store, &self.instance, ptr, len);
+        self.cache.remove(&key);
+        let path = self.storage_dir.join(&key);
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.to_string()),
         }
-        read_packed_string(&mut self.store, &self.instance, packed)
     }
 }
 
+impl ilp::plugin::types::Host for HostState {}
+
+fn is_safe_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 128
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !key.starts_with('.')
+        && !key.contains("..")
+}
+
+fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// 已加载的插件。
+pub struct PluginInstance {
+    pub metadata: PluginMetadata,
+    store: Store<HostState>,
+    bindings: NovelPlugin,
+}
+
+impl PluginInstance {
+    pub fn load(path: &Path, storage_root: &Path) -> Result<Self> {
+        let engine = Engine::default();
+        let component = Component::from_file(&engine, path)
+            .map_err(|e| anyhow!("读取组件失败 {}: {e}", path.display()))?;
+
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("plugin")
+            .to_string();
+
+        let mut linker: Linker<HostState> = Linker::new(&engine);
+        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
+            .map_err(|e| anyhow!("注册 WASI p2 失败: {e}"))?;
+        NovelPlugin::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
+            &mut linker,
+            |s: &mut HostState| s,
+        )?;
+
+        let state = HostState::new(name.clone(), storage_root.join(&name));
+        let mut store = Store::new(&engine, state);
+        let bindings = NovelPlugin::instantiate(&mut store, &component, &linker)
+            .map_err(|e| anyhow!("实例化插件失败 {}: {e}", path.display()))?;
+
+        let raw = bindings
+            .ilp_plugin_plugin()
+            .call_metadata(&mut store)
+            .map_err(|e| anyhow!("调用插件 metadata 失败: {e}"))?;
+        let metadata = PluginMetadata {
+            site_name: raw.site_name,
+            site_id: raw.site_id,
+            site_domain: raw.site_domain,
+            plugin_name: raw.plugin_name,
+            plugin_id: raw.plugin_id,
+            version: raw.version,
+        };
+
+        Ok(Self {
+            metadata,
+            store,
+            bindings,
+        })
+    }
+
+    pub fn site_id(&self) -> &str {
+        &self.metadata.site_id
+    }
+
+    pub fn init(&mut self, book_id: &str, force_update: bool) -> Result<()> {
+        let g = self.bindings.ilp_plugin_plugin();
+        g.call_init(&mut self.store, book_id, force_update)
+            .map_err(|e| anyhow!("plugin::{e}"))?
+            .map_err(|e| anyhow!("plugin::{e}"))
+    }
+
+    pub fn title(&mut self) -> Result<String> {
+        let g = self.bindings.ilp_plugin_plugin();
+        g.call_title(&mut self.store)
+            .map_err(|e| anyhow!("plugin::{e}"))?
+            .map_err(|e| anyhow!("plugin::{e}"))
+    }
+
+    pub fn author(&mut self) -> Result<String> {
+        let g = self.bindings.ilp_plugin_plugin();
+        g.call_author(&mut self.store)
+            .map_err(|e| anyhow!("plugin::{e}"))?
+            .map_err(|e| anyhow!("plugin::{e}"))
+    }
+
+    pub fn cover_url(&mut self) -> Result<String> {
+        let g = self.bindings.ilp_plugin_plugin();
+        g.call_cover_url(&mut self.store)
+            .map_err(|e| anyhow!("plugin::{e}"))?
+            .map_err(|e| anyhow!("plugin::{e}"))
+    }
+
+    pub fn description(&mut self) -> Result<String> {
+        let g = self.bindings.ilp_plugin_plugin();
+        g.call_description(&mut self.store)
+            .map_err(|e| anyhow!("plugin::{e}"))?
+            .map_err(|e| anyhow!("plugin::{e}"))
+    }
+
+    pub fn catalog(&mut self, force: bool) -> Result<Vec<ChapterEntry>> {
+        let g = self.bindings.ilp_plugin_plugin();
+        let raw = g
+            .call_catalog(&mut self.store, force)
+            .map_err(|e| anyhow!("plugin::{e}"))?
+            .map_err(|e| anyhow!("plugin::{e}"))?;
+        Ok(raw.into_iter().map(convert_entry).collect())
+    }
+
+    pub fn search(&mut self, keyword: &str, offset: u32) -> Result<Vec<SearchResult>> {
+        let g = self.bindings.ilp_plugin_plugin();
+        let raw = g
+            .call_search(&mut self.store, keyword, offset)
+            .map_err(|e| anyhow!("plugin::{e}"))?
+            .map_err(|e| anyhow!("plugin::{e}"))?;
+        Ok(raw
+            .results
+            .into_iter()
+            .map(|r| SearchResult {
+                id: r.id,
+                title: r.title,
+                author: r.author,
+                cover_url: r.cover_url,
+                description: r.description,
+            })
+            .collect())
+    }
+
+    pub fn plan_fetch(&mut self, ids: &[String]) -> Result<Vec<FetchTask>> {
+        let g = self.bindings.ilp_plugin_plugin();
+        g.call_plan_fetch(&mut self.store, ids)
+            .map_err(|e| anyhow!("plugin::{e}"))?
+            .map_err(|e| anyhow!("plugin::{e}"))
+    }
+
+    pub fn consume_fetch(
+        &mut self,
+        task_id: &str,
+        resp: HttpResponse,
+    ) -> Result<Vec<ChapterContent>> {
+        let g = self.bindings.ilp_plugin_plugin();
+        let raw = g
+            .call_consume_fetch(&mut self.store, task_id, &resp)
+            .map_err(|e| anyhow!("plugin::{e}"))?
+            .map_err(|e| anyhow!("plugin::{e}"))?;
+        Ok(raw
+            .into_iter()
+            .map(|c| ChapterContent {
+                id: c.id,
+                title: c.title,
+                text: c.text,
+            })
+            .collect())
+    }
+}
+
+fn convert_entry(e: ilp::plugin::types::ChapterEntry) -> ChapterEntry {
+    ChapterEntry {
+        id: e.id,
+        title: e.title,
+        url: e.url,
+        fetch_url: e.fetch_url,
+        update_time: e.update_time,
+    }
+}
+
+/// 加载目录下所有插件，单个失败只告警不中断。
 pub fn load_plugins(config: &crate::config::Config) -> Result<Vec<PluginInstance>> {
-    let mut out = Vec::new();
-    let entries = match std::fs::read_dir(config.plugins_dir()) {
+    let dir = config.plugins_dir();
+    let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
-        Err(_) => return Ok(out),
+        Err(_) => return Ok(Vec::new()),
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("wasm") {
-            match PluginInstance::load(&path) {
-                Ok(p) => out.push(p),
-                Err(e) => tracing::warn!("加载插件 {} 失败: {:#}", path.display(), e),
-            }
+
+    let storage_root = Path::new(&config.data_folder).join("plugins");
+    let mut out = Vec::new();
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("wasm"))
+        .collect();
+    paths.sort();
+
+    for path in paths {
+        match PluginInstance::load(&path, &storage_root) {
+            Ok(p) => out.push(p),
+            Err(e) => tracing::warn!("加载插件 {} 失败: {e:#}", path.display()),
         }
     }
     Ok(out)
 }
 
-fn read_packed_string(
-    store: &mut Store<WasiP1Ctx>,
-    instance: &Instance,
-    packed: i64,
-) -> Result<String> {
-    if packed <= 0 {
-        return Ok(String::new());
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_keys_reject_traversal() {
+        assert!(is_safe_key("device"));
+        assert!(is_safe_key("device_v1.json"));
+        assert!(!is_safe_key(""));
+        assert!(!is_safe_key("../escape"));
+        assert!(!is_safe_key("a/b"));
+        assert!(!is_safe_key(".hidden"));
+        assert!(!is_safe_key("a..b"));
     }
-    let (ptr, len) = unpack(packed);
-    let mem = instance
-        .get_memory(&mut *store, "memory")
-        .ok_or_else(|| anyhow!("插件未导出 memory"))?;
-    let mut buf = vec![0u8; len as usize];
-    mem.read(&mut *store, ptr as usize, &mut buf)?;
-    free_guest(store, instance, ptr, len);
-    Ok(String::from_utf8_lossy(&buf).into_owned())
-}
 
-fn free_guest(store: &mut Store<WasiP1Ctx>, instance: &Instance, ptr: i32, len: i32) {
-    if ptr == 0 || len <= 0 {
-        return;
+    #[test]
+    fn atomic_write_replaces_content() {
+        let dir = std::env::temp_dir().join("ilp_engine_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("k");
+        atomic_write(&p, b"first").unwrap();
+        atomic_write(&p, b"second").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"second");
+        let _ = std::fs::remove_dir_all(&dir);
     }
-    if let Ok(f) = instance.get_typed_func::<(i32, i32), ()>(&mut *store, "ilp_free") {
-        let _ = f.call(&mut *store, (ptr, len));
-    }
-}
-
-fn write_guest(
-    store: &mut Store<WasiP1Ctx>,
-    instance: &Instance,
-    data: &[u8],
-) -> Result<(i32, i32)> {
-    if data.is_empty() {
-        return Ok((0, 0));
-    }
-    let alloc: TypedFunc<i32, i32> = instance.get_typed_func(&mut *store, "ilp_alloc")?;
-    let ptr = alloc.call(&mut *store, data.len() as i32)?;
-    let mem = instance
-        .get_memory(&mut *store, "memory")
-        .ok_or_else(|| anyhow!("插件未导出 memory"))?;
-    mem.write(&mut *store, ptr as usize, data)?;
-    Ok((ptr, data.len() as i32))
-}
-
-fn read_caller_str(
-    mem: &Memory,
-    caller: &mut Caller<'_, WasiP1Ctx>,
-    ptr: i32,
-    len: i32,
-) -> Option<String> {
-    if len <= 0 || ptr < 0 {
-        return Some(String::new());
-    }
-    let mut buf = vec![0u8; len as usize];
-    mem.read(&mut *caller, ptr as usize, &mut buf).ok()?;
-    Some(String::from_utf8_lossy(&buf).into_owned())
-}
-
-fn define_host_funcs(linker: &mut Linker<WasiP1Ctx>) -> Result<()> {
-    linker.func_wrap(
-        "ilp",
-        "ilp_http_get_size",
-        |mut caller: Caller<'_, WasiP1Ctx>, url_ptr: i32, url_len: i32| -> i64 {
-            let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
-                return -1;
-            };
-            let Some(url) = read_caller_str(&mem, &mut caller, url_ptr, url_len) else {
-                return -1;
-            };
-            match http::get_bytes(&url) {
-                Ok(bytes) => {
-                    let len = bytes.len() as i64;
-                    http_cache().lock().unwrap().insert(url, bytes);
-                    len
-                }
-                Err(_) => -1,
-            }
-        },
-    )?;
-
-    linker.func_wrap(
-        "ilp",
-        "ilp_http_get",
-        |mut caller: Caller<'_, WasiP1Ctx>,
-         url_ptr: i32,
-         url_len: i32,
-         buf_ptr: i32,
-         buf_len: i32|
-         -> i64 {
-            let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
-                return -1;
-            };
-            let Some(url) = read_caller_str(&mem, &mut caller, url_ptr, url_len) else {
-                return -1;
-            };
-            let cache = http_cache().lock().unwrap();
-            let Some(bytes) = cache.get(&url) else {
-                return -1;
-            };
-            let n = bytes.len().min(buf_len as usize);
-            if mem
-                .write(&mut caller, buf_ptr as usize, &bytes[..n])
-                .is_err()
-            {
-                return -1;
-            }
-            n as i64
-        },
-    )?;
-
-    linker.func_wrap(
-        "ilp",
-        "ilp_log",
-        |mut caller: Caller<'_, WasiP1Ctx>, level: i32, ptr: i32, len: i32| {
-            let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
-                return;
-            };
-            let msg = read_caller_str(&mem, &mut caller, ptr, len).unwrap_or_default();
-            match level {
-                0 => tracing::error!("{}", msg),
-                1 => tracing::warn!("{}", msg),
-                2 => tracing::info!("{}", msg),
-                _ => tracing::debug!("{}", msg),
-            }
-        },
-    )?;
-
-    Ok(())
 }

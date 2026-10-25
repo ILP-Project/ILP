@@ -23,7 +23,17 @@ pub struct ChapterEntry {
 pub struct SearchResult {
     pub id: String,
     pub title: String,
-    pub url: String,
+    pub author: String,
+    pub cover_url: String,
+    pub description: String,
+}
+
+/// 插件解析出的一章正文。
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ChapterContent {
+    pub id: String,
+    pub title: String,
+    pub text: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
