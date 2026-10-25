@@ -100,7 +100,7 @@ fn fetch_all(
 
     let urls: Vec<String> = todo.iter().map(|c| c.fetch_url.clone()).collect();
     let sleep_ms = config.sleep_time * 1000;
-    let results = crate::http::fetch_many(&urls, config.max_workers, sleep_ms);
+    let results = crate::http::fetch_many(&urls, config.effective_max_workers(), sleep_ms);
 
     for (c, res) in todo.iter().zip(results) {
         match res {
@@ -119,7 +119,12 @@ fn fetch_all(
     Ok(())
 }
 
-pub fn do_search(plugins: &mut [PluginInstance], keyword: &str, site_id: &str) -> Result<()> {
+pub fn do_search(
+    plugins: &mut [PluginInstance],
+    _config: &Config,
+    keyword: &str,
+    site_id: &str,
+) -> Result<()> {
     let plugin = find_plugin(plugins, site_id)?;
     let results = plugin.search(keyword)?;
     if results.is_empty() {
