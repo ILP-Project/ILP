@@ -216,7 +216,9 @@ fn fetch_all(
             }
             _ => {}
         }
-        anyhow::bail!("有 {failed} 章下载失败");
+        return Err(anyhow::Error::new(crate::exit::PartialFailure(format!(
+            "有 {failed} 章下载失败"
+        ))));
     }
     Ok(())
 }
@@ -337,4 +339,16 @@ fn find_plugin<'a>(
         .iter_mut()
         .find(|p| p.site_id() == site_id)
         .ok_or_else(|| anyhow!("未找到 site_id 为 {site_id} 的已加载插件"))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::exit;
+
+    #[test]
+    fn partial_failure_exit_code_is_one() {
+        let err = anyhow::Error::new(exit::PartialFailure("有 2 章下载失败".to_string()));
+        assert_eq!(exit::code_for(&err), exit::PARTIAL);
+        assert_eq!(exit::code_for(&anyhow::anyhow!("致命")), exit::FATAL);
+    }
 }

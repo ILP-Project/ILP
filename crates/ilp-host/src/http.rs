@@ -13,6 +13,12 @@ const USER_AGENT: &str =
 
 const TIMEOUT_SECS: u64 = 30;
 
+/// 每个请求最多再试几次（不含首次）。网络抖动与瞬时 5xx 都能靠它自愈。
+const MAX_RETRIES: u32 = 2;
+
+/// 退避基数：第 n 次重试等 BASE * 2^n 毫秒。
+const RETRY_BASE_MS: u64 = 500;
+
 /// 全局客户端：代理与 UA 只解析一次，避免每个请求都建连接池。
 static CLIENT: OnceLock<Client> = OnceLock::new();
 static INIT: OnceLock<()> = OnceLock::new();
@@ -141,7 +147,57 @@ pub fn send(request: &HttpRequest) -> Result<HttpResponse> {
     })
 }
 
+/// 一次请求是否值得重试。
+///
+/// 4xx（除 408/429）是我们发错了，重试没有意义；
+/// 网络错误、超时、5xx、429 都是瞬时问题，值得再试。
+fn is_retryable(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}");
+    if let Some(code) = text.split("HTTP 状态码 ").nth(1).and_then(|rest| {
+        // 状态码后面紧跟冒号，所以只取连续数字。
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse::<u16>().ok()
+    }) {
+        return code >= 500 || code == 408 || code == 429;
+    }
+    // 没有状态码说明请求没走通（连接失败、超时、读响应中断）。
+    true
+}
+
+/// 发送并重试。退避是 BASE * 2^attempt，最后一次失败原样返回。
+fn send_with_retry(request: &HttpRequest) -> Result<HttpResponse> {
+    let mut last: Option<anyhow::Error> = None;
+    for attempt in 0..=MAX_RETRIES {
+        if attempt > 0 {
+            let backoff = RETRY_BASE_MS * (1u64 << (attempt - 1));
+            thread::sleep(Duration::from_millis(backoff));
+        }
+        match send(request) {
+            Ok(resp) if resp.status < 400 => return Ok(resp),
+            Ok(resp) => {
+                let err = anyhow!("HTTP 状态码 {}: {}", resp.status, request.url);
+                if !is_retryable(&err) {
+                    return Err(err);
+                }
+                last = Some(err);
+            }
+            Err(e) => {
+                if !is_retryable(&e) {
+                    return Err(e);
+                }
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow!("请求失败: {}", request.url)))
+}
+
 /// 并发执行一批请求，保持与输入同序。
+///
+/// 并发度由 `max_workers` 决定，`sleep_ms` 是同一 worker 上相邻两次
+/// 请求的起始间隔。限速在"取下一个任务之前"完成，所以排队中并不会
+/// 白白占用并发名额——这正是原版把 sleep 放在任务完成后导致吞吐塌陷的
+/// 反向修正。
 pub fn fetch_requests(
     requests: &[&HttpRequest],
     max_workers: usize,
@@ -184,7 +240,7 @@ pub fn fetch_requests(
                         }
                     }
                 }
-                let res = send(&owned[idx]);
+                let res = send_with_retry(&owned[idx]);
                 last = Some(Instant::now());
                 results.lock().unwrap()[idx] = Some(res);
             }
@@ -226,5 +282,18 @@ mod tests {
     #[test]
     fn empty_request_list_returns_empty() {
         assert!(fetch_requests(&[], 4, 0).is_empty());
+    }
+
+    #[test]
+    fn retry_classification() {
+        // 5xx / 429 / 408 是瞬时问题，值得重试
+        assert!(is_retryable(&anyhow!("HTTP 状态码 503: u")));
+        assert!(is_retryable(&anyhow!("HTTP 状态码 429: u")));
+        assert!(is_retryable(&anyhow!("HTTP 状态码 408: u")));
+        // 没有状态码说明连接就没走通
+        assert!(is_retryable(&anyhow!("请求失败: u")));
+        // 4xx 是请求本身有问题，重试无用
+        assert!(!is_retryable(&anyhow!("HTTP 状态码 404: u")));
+        assert!(!is_retryable(&anyhow!("HTTP 状态码 401: u")));
     }
 }
