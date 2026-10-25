@@ -2,14 +2,23 @@ mod cli;
 mod commands;
 mod config;
 mod engine;
+mod exit;
 mod http;
 mod logging;
 mod plugin_manager;
 mod storage;
 
-use anyhow::Result;
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::from(exit::SUCCESS as u8),
+        Err(e) => {
+            eprintln!("错误: {e:#}");
+            std::process::ExitCode::from(exit::code_for(&e) as u8)
+        }
+    }
+}
 
-fn main() -> Result<()> {
+fn run() -> anyhow::Result<()> {
     let command = cli::parse();
     let config = config::Config::load("config.json")?;
     let _log_guard = logging::init(&config)?;
