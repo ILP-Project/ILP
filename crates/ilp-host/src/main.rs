@@ -48,5 +48,6 @@ fn run() -> anyhow::Result<()> {
             let mut plugins = engine::load_plugins(&config)?;
             commands::do_search(&mut plugins, &config, &keyword, &site_id)
         }
+        cli::Command::Version => commands::do_version(&config),
     }
 }
