@@ -246,23 +246,28 @@ impl PluginInstance {
         Ok(raw.into_iter().map(convert_entry).collect())
     }
 
-    pub fn search(&mut self, keyword: &str, offset: u32) -> Result<Vec<SearchResult>> {
+    /// `cursor` 为空表示取第一页，否则原样传上一页返回的游标。
+    pub fn search(&mut self, keyword: &str, cursor: &str) -> Result<ilp_types::SearchPage> {
         let g = self.bindings.ilp_plugin_plugin();
         let raw = g
-            .call_search(&mut self.store, keyword, offset)
+            .call_search(&mut self.store, keyword, cursor)
             .map_err(|e| anyhow!("plugin::{e}"))?
             .map_err(|e| anyhow!("plugin::{e}"))?;
-        Ok(raw
-            .results
-            .into_iter()
-            .map(|r| SearchResult {
-                id: r.id,
-                title: r.title,
-                author: r.author,
-                cover_url: r.cover_url,
-                description: r.description,
-            })
-            .collect())
+        Ok(ilp_types::SearchPage {
+            cursor: raw.cursor,
+            has_more: raw.has_more,
+            results: raw
+                .results
+                .into_iter()
+                .map(|r| SearchResult {
+                    id: r.id,
+                    title: r.title,
+                    author: r.author,
+                    cover_url: r.cover_url,
+                    description: r.description,
+                })
+                .collect(),
+        })
     }
 
     pub fn plan_fetch(&mut self, ids: &[String]) -> Result<Vec<FetchTask>> {

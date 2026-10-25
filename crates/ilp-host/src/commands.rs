@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::engine::PluginInstance;
 use crate::storage::{Book, Storage};
 use ilp_types::ChapterContent;
+use std::io::IsTerminal;
 
 /// 一批最多塞多少章给 plan_fetch。
 /// 批量站点用它摊薄请求数，网页站点自己会一章一任务。
@@ -313,6 +314,14 @@ fn persist(
     }
 }
 
+/// 搜索结果分页浏览。
+///
+/// 番茄的搜索接口是游标式的：offset 会被服务端直接忽略，只有把上一页返回
+/// 的 cursor（passback + search_id）原样带回去才能翻到下一页。因此这里不提供
+/// "跳到第 N 页" —— 游标模型下要么做不到，要么得偷偷连发 N-1 个请求。
+///
+/// 交互键：n 或直接回车下一页、p 上一页、q 退出。上一页走缓存不重新请求。
+/// 非终端（管道、重定向）不阻塞等输入，改为把结果全部打印出来。
 pub fn do_search(
     plugins: &mut [PluginInstance],
     _config: &Config,
@@ -320,13 +329,120 @@ pub fn do_search(
     site_id: &str,
 ) -> Result<()> {
     let plugin = find_plugin(plugins, site_id)?;
-    let page = plugin.search(keyword, 0)?;
-    if page.is_empty() {
-        println!("无搜索结果");
-    } else {
-        for r in page {
+
+    if !std::io::stdin().is_terminal() {
+        return search_dump_all(plugin, keyword);
+    }
+
+    // 用栈保存已访问的页：栈顶是当前页，出栈即回上一页。
+    let mut stack: Vec<ilp_types::SearchPage> = Vec::new();
+
+    loop {
+        if stack.is_empty() {
+            // 首页：cursor 为空。
+            stack.push(plugin.search(keyword, "")?);
+        }
+        let Some(current) = stack.last().cloned() else {
+            return Ok(());
+        };
+        print_search_page(stack.len(), &current);
+
+        let input = read_line("· n 下一页 / p 上一页 / q 退出 > ")?;
+        match next_page(&input) {
+            PageCmd::Quit => return Ok(()),
+            PageCmd::Next => {
+                if !current.has_more {
+                    println!("已经是最后一页。");
+                    continue;
+                }
+                let next = plugin.search(keyword, &current.cursor)?;
+                if next.results.is_empty() {
+                    println!("没有更多结果了。");
+                    continue;
+                }
+                stack.push(next);
+            }
+            PageCmd::Prev => {
+                if stack.len() <= 1 {
+                    println!("已经是第一页。");
+                    continue;
+                }
+                stack.pop();
+            }
+            PageCmd::Note(msg) => println!("{msg}"),
+        }
+    }
+}
+
+/// 翻页指令。
+#[derive(Debug, PartialEq, Eq)]
+enum PageCmd {
+    Quit,
+    Next,
+    Prev,
+    /// 无法翻页时给用户的提示
+    Note(&'static str),
+}
+
+/// 纯函数：只有 下一页 / 上一页 / 退出 三种有效指令。
+fn next_page(input: &str) -> PageCmd {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "q" => PageCmd::Quit,
+        "" | "n" => PageCmd::Next,
+        "p" => PageCmd::Prev,
+        _ => PageCmd::Note("无法识别。可用: n 下一页 / p 上一页 / q 退出"),
+    }
+}
+
+fn print_search_page(page_no: usize, data: &ilp_types::SearchPage) {
+    println!(
+        "\n=== 第 {} 页（{} 条）{} ===",
+        page_no,
+        data.results.len(),
+        if data.has_more {
+            " · 还有更多"
+        } else {
+            " · 已到末页"
+        }
+    );
+    for r in &data.results {
+        println!("{} - {} - {}", r.id, r.title, r.author);
+        if !r.description.is_empty() {
+            println!("    {}", truncate(&r.description, 60));
+        }
+    }
+}
+
+fn truncate(s: &str, max_chars: usize) -> String {
+    let mut out: String = s.chars().take(max_chars).collect();
+    if s.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
+}
+
+fn read_line(prompt: &str) -> Result<String> {
+    use std::io::Write;
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    let mut buf = String::new();
+    std::io::stdin().read_line(&mut buf)?;
+    Ok(buf)
+}
+
+/// 非交互场景：沿游标翻到服务端说没有为止，并设上限防死循环。
+fn search_dump_all(plugin: &mut PluginInstance, keyword: &str) -> Result<()> {
+    const MAX_PAGES: usize = 50;
+    let mut cursor = String::new();
+    for _ in 0..MAX_PAGES {
+        let page = plugin.search(keyword, &cursor)?;
+        for r in &page.results {
             println!("{} - {} - {}", r.id, r.title, r.author);
         }
+        if !page.has_more || page.results.is_empty() || page.cursor.is_empty() {
+            break;
+        }
+        cursor = page.cursor;
     }
     Ok(())
 }
@@ -344,6 +460,25 @@ fn find_plugin<'a>(
 #[cfg(test)]
 mod tests {
     use crate::exit;
+
+    use super::next_page;
+    use super::PageCmd;
+
+    #[test]
+    fn next_page_keys() {
+        assert_eq!(next_page("n"), PageCmd::Next);
+        assert_eq!(next_page(""), PageCmd::Next);
+        assert_eq!(next_page("  N  "), PageCmd::Next);
+        assert_eq!(next_page("p"), PageCmd::Prev);
+        assert_eq!(next_page("Q"), PageCmd::Quit);
+    }
+
+    #[test]
+    fn unknown_key_is_rejected_with_hint() {
+        // 数字跳页在游标模型下不成立，必须明确拒绝而不是静默忽略。
+        assert!(matches!(next_page("5"), PageCmd::Note(_)));
+        assert!(matches!(next_page("abc"), PageCmd::Note(_)));
+    }
 
     #[test]
     fn partial_failure_exit_code_is_one() {

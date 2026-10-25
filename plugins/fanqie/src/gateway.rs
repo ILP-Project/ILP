@@ -16,6 +16,12 @@ const REGISTER_KEY_URL: &str = "https://reading.snssdk.com/reading/crypt/registe
 const BATCH_URL: &str = "https://reading.snssdk.com/reading/reader/batch_full/v?";
 const SEARCH_URL: &str = "https://reading.snssdk.com/reading/bookapi/search/tab/v?";
 
+/// search_tabs 里书籍 tab 的 tab_type。
+const SEARCH_TAB_BOOKS: u64 = 3;
+
+/// 每页条数。太小会翻很多页，太大服务端会截断。
+pub const SEARCH_PAGE_SIZE: usize = 10;
+
 const APP_UA: &str = "com.dragon.read";
 const VERSION_CODE: &str = "70132";
 const VERSION_NAME: &str = "7.0.1.32";
@@ -602,51 +608,74 @@ fn decode_content(dev: &Device, content: &str, item: &Value) -> Result<String, S
     Ok(String::from_utf8_lossy(&plain).to_string())
 }
 
-/// 搜索结果的正文口径统一成 ilp-types 的 SearchResult 字段。
+/// 搜索结果口径统一成 ilp-types 的 SearchResult 字段。
+///
+/// 真实响应结构与早期假设完全不同：书籍列表不在 `data.search_tab_data`，
+/// 而是顶层 `search_tabs` 数组里 `tab_type == 3`（书籍）的那个 tab。
+/// 分页也由该 tab 自己的 `has_more` / `next_offset` 决定，宿主无从推算，
+/// 必须原样带回。
 pub fn search(
     dev: &Device,
     keyword: &str,
-    offset: usize,
+    cursor: &SearchCursor,
     count: usize,
-) -> Result<Vec<SearchItem>, String> {
-    let offset_s = offset.to_string();
+) -> Result<(Vec<SearchItem>, bool, SearchCursor), String> {
     let count_s = count.to_string();
-    let query = app_query(
-        dev,
-        &[
-            ("query", keyword),
-            ("offset", &offset_s),
-            ("count", &count_s),
-            ("tab_type", "3"),
-        ],
-    );
+    let mut extra: Vec<(&str, &str)> = vec![
+        ("query", keyword),
+        ("offset", "0"),
+        ("count", &count_s),
+        ("tab_type", "3"),
+    ];
+    if !cursor.passback.is_empty() {
+        extra.push(("passback", &cursor.passback));
+    }
+    if !cursor.search_id.is_empty() {
+        extra.push(("search_id", &cursor.search_id));
+    }
+    let query = app_query(dev, &extra);
     let url = format!("{SEARCH_URL}{query}");
     let headers = signed_headers(&query, None)?;
     let resp = do_request("GET", &url, headers, None)?;
-    let v: Value = serde_json::from_slice(&resp).map_err(|e| format!("搜索响应不是 JSON: {e}"))?;
+    if resp.is_empty() {
+        return Err(format!("搜索返回空响应: {keyword}"));
+    }
+    let v: Value = serde_json::from_slice(&resp)
+        .map_err(|e| format!("搜索响应不是 JSON（{} 字节）: {e}", resp.len()))?;
+
+    let book_tab = v
+        .get("search_tabs")
+        .and_then(|t| t.as_array())
+        .and_then(|tabs| {
+            tabs.iter()
+                .find(|t| t.get("tab_type").and_then(|x| x.as_u64()) == Some(SEARCH_TAB_BOOKS))
+        })
+        .ok_or_else(|| "搜索响应缺少书籍 tab".to_string())?;
+
+    let has_more = book_tab
+        .get("has_more")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
 
     let mut out = Vec::new();
-    if let Some(items) = v
-        .get("data")
-        .and_then(|d| d.get("search_tab_data"))
-        .and_then(|s| s.get("data"))
-        .and_then(|d| d.as_array())
-    {
+    if let Some(items) = book_tab.get("data").and_then(|d| d.as_array()) {
         for it in items {
-            let id = it
-                .get("book_id")
-                .and_then(|x| x.as_str())
-                .unwrap_or_default()
-                .to_string();
-            if id.is_empty() {
-                continue;
-            }
+            // book_data 是数组，正文在第一个元素里。
+            let bd = it
+                .get("book_data")
+                .and_then(|b| b.as_array())
+                .and_then(|b| b.first())
+                .unwrap_or(it);
             let s = |k: &str| {
-                it.get(k)
+                bd.get(k)
                     .and_then(|x| x.as_str())
                     .unwrap_or_default()
                     .to_string()
             };
+            let id = s("book_id");
+            if id.is_empty() {
+                continue;
+            }
             out.push(SearchItem {
                 id,
                 title: s("book_name"),
@@ -656,7 +685,48 @@ pub fn search(
             });
         }
     }
-    Ok(out)
+    // 下一页的游标来自本页响应：passback 与 search_id 必须成对回传。
+    let next = SearchCursor {
+        passback: book_tab
+            .get("passback")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        search_id: book_tab
+            .get("search_id")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    };
+    Ok((out, has_more, next))
+}
+
+/// 搜索翻页游标。服务端忽略 offset，只认 passback + search_id。
+#[derive(Debug, Clone, Default)]
+pub struct SearchCursor {
+    pub passback: String,
+    pub search_id: String,
+}
+
+impl SearchCursor {
+    /// 序列化成单个字符串塞进 WIT 的 cursor 字段。
+    pub fn encode(&self) -> String {
+        if self.passback.is_empty() && self.search_id.is_empty() {
+            String::new()
+        } else {
+            format!("{}\u{1}{}", self.passback, self.search_id)
+        }
+    }
+
+    pub fn decode(s: &str) -> Self {
+        match s.split_once('\u{1}') {
+            Some((p, i)) => Self {
+                passback: p.to_string(),
+                search_id: i.to_string(),
+            },
+            None => Self::default(),
+        }
+    }
 }
 
 pub struct SearchItem {

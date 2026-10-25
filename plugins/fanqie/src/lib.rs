@@ -22,7 +22,7 @@ use exports::ilp::plugin::plugin::{
     ChapterContent, ChapterEntry, FetchTask, Guest, PluginMetadata, SearchPage,
 };
 use ilp::plugin::host;
-use ilp::plugin::types::{HttpRequest, HttpResponse};
+use ilp::plugin::types::{HttpRequest, HttpResponse, SearchResult};
 
 const CATALOG_API: &str = "https://fanqienovel.com/api/reader/directory/detail?bookId=";
 const PAGE_API: &str = "https://fanqienovel.com/page/";
@@ -327,18 +327,27 @@ impl Guest for Fanqie {
         Ok(out)
     }
 
-    fn search(keyword: String, offset: u32) -> Result<SearchPage, String> {
-        let _ = (keyword, offset);
+    fn search(keyword: String, cursor: String) -> Result<SearchPage, String> {
+        let dev = gateway::ensure_device(false)?;
+        let cur = gateway::SearchCursor::decode(&cursor);
+        let (items, has_more, next) =
+            gateway::search(&dev, &keyword, &cur, gateway::SEARCH_PAGE_SIZE)?;
         Ok(SearchPage {
-            results: vec![],
-            offset: 0,
-            has_more: false,
+            results: items
+                .into_iter()
+                .map(|i| SearchResult {
+                    id: i.id,
+                    title: i.title,
+                    author: i.author,
+                    cover_url: i.cover_url,
+                    description: i.description,
+                })
+                .collect(),
+            cursor: next.encode(),
+            has_more,
         })
     }
 
-    /// 一批章节打成一个网关请求。宿主按 30 章一批调用，
-    /// 所以这里通常只返回一个任务——351 章就是 12 次请求，
-    /// 而不是 351 次。
     fn plan_fetch(chapter_ids: Vec<String>) -> Result<Vec<FetchTask>, String> {
         if chapter_ids.is_empty() {
             return Ok(Vec::new());
