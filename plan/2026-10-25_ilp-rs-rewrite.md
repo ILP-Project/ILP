@@ -90,6 +90,10 @@
 | 设备上报字段可按需精简 | `ipv6_list` 缺失即被拒（仍返回 200，`device_id` 为 0） |
 | `now_ms` 用单调时钟即可 | 必须是 UTC epoch 毫秒，否则设备注册被判定异常 |
 
+搜索侧另有一处与早期假设不符：书籍列表不在 `data.search_tab_data`，
+而在顶层 `search_tabs` 数组里 `tab_type == 3` 的那个 tab，条目正文在
+`book_data[0]`，分页凭据是该 tab 自己的 `passback`/`search_id`。
+
 另外发现服务端在触发限流时会**静默少返回章节**：`batch_full/v` 一批 30 章只回 29 章
 而不报错，早期实现把缺章算作成功，产出带洞的书。现已改为检测缺失并逐章单章重试。
 
@@ -185,8 +189,14 @@ fetch    = Ok("guest got: host-fetched(https://example.com/x)")
 - 退出码 0/1/2
 
 ### ⑧ search 分页交互
-- `n`/`p`/数字/`q`，修正原版 `page++` 双重递增 bug
-- 非 TTY 自动全量打印
+- `n`/`p`/`q`，修正原版 `page++` 双重递增 bug
+- 非 TTY 自动沿游标全量打印
+- **更正**：计划原写「数字跳转到任意页」，实测番茄搜索是**游标分页**——
+  只传 `offset` 会被服务端忽略（`offset=10` 仍返回第 1 页同样 10 条），
+  必须把上一页的 `passback` + `search_id` 原样回传才会翻到下一页。
+  因此数字跳页在这种模型下要么做不到、要么得偷偷连发 N-1 个请求，
+  已按用户决定改为**纯游标模型**：只有 下一页 / 上一页（走缓存）/ 退出。
+  WIT 的 `search(keyword, cursor)` 与 `search-page.cursor` 同步调整。
 
 ### ⑨ plugin 子命令加固 + `version`
 - `list` / `install` / `uninstall` / `enable` / `disable`

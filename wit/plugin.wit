@@ -75,11 +75,15 @@ interface types {
     text: string,
   }
 
-  /// 分页信息随搜索结果一起给，供 CLI 翻页。
+  /// 一页搜索结果。
+  ///
+  /// 分页是游标式的，不是 offset 式的：番茄的搜索接口会直接忽略 offset
+  /// 参数，必须把上一页返回的 cursor 原样带回去才能翻到下一页。
+  /// 宿主因此只能"下一页/上一页"，无法跳到任意页。
   record search-page {
     results: list<search-result>,
-    /// 本页之前的累计数量，供交互式翻页定位
-    offset: u32,
+    /// 下一页游标；has-more 为 false 时无意义
+    cursor: string,
     has-more: bool,
   }
 }
@@ -127,7 +131,8 @@ interface plugin {
   /// 章节目录。
   catalog: func(force-update: bool) -> result<list<chapter-entry>, string>;
 
-  search: func(keyword: string, offset: u32) -> result<search-page, string>;
+  /// 搜索。cursor 为空表示取第一页，否则原样传入上一页返回的 cursor。
+  search: func(keyword: string, cursor: string) -> result<search-page, string>;
 
   /// 第一阶段：给定章节 id，产出要发的请求。
   /// 批量站点一次返回一个任务覆盖多章，网页站点每章一个任务。

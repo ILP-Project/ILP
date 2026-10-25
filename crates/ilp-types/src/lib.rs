@@ -28,6 +28,20 @@ pub struct SearchResult {
     pub description: String,
 }
 
+/// 一页搜索结果。
+///
+/// 分页是游标式的：只有插件知道服务端下一页的游标（番茄用的是
+/// passback + search_id，且会忽略 offset），宿主无法自己推算，
+/// 所以游标必须和结果一起往返。
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SearchPage {
+    pub results: Vec<SearchResult>,
+    /// 下一页游标；`has_more` 为 false 时无意义
+    pub cursor: String,
+    /// 服务端声明是否还有下一页
+    pub has_more: bool,
+}
+
 /// 插件解析出的一章正文。
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChapterContent {
