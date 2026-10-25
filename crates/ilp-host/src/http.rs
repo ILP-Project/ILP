@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use reqwest::blocking::{Client, ClientBuilder};
-use reqwest::{NoProxy, Proxy};
+use reqwest::{Method, NoProxy, Proxy};
+
+use crate::engine::wit_types::{HttpHeader, HttpRequest, HttpResponse};
 use std::sync::OnceLock;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -100,20 +102,60 @@ pub fn get_bytes(url: &str) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
-type FetchResults = Arc<Mutex<Vec<Option<Result<Vec<u8>>>>>>;
+/// 把插件给的请求发给对端，返回 WIT 形状的响应。
+pub fn send(request: &HttpRequest) -> Result<HttpResponse> {
+    let method = Method::from_bytes(request.method.as_bytes())
+        .map_err(|_| anyhow!("非法 HTTP 方法: {}", request.method))?;
+    let mut req = client()
+        .request(method, &request.url)
+        .timeout(Duration::from_secs(TIMEOUT_SECS));
 
-/// 有界 worker + 任务间限速。
-///
-/// 限速在取下一个任务**之前**执行：原版把 sleep 放在任务完成后，导致
-/// 休眠期间仍占着并发槽，实际吞吐远低于 max_workers。
-pub fn fetch_many(urls: &[String], max_workers: usize, sleep_ms: u64) -> Vec<Result<Vec<u8>>> {
-    let n = urls.len();
+    for h in &request.headers {
+        req = req.header(&h.name, &h.value);
+    }
+    if let Some(body) = &request.body {
+        req = req.body(body.clone());
+    }
+
+    let resp = req
+        .send()
+        .with_context(|| format!("请求失败: {}", request.url))?;
+    let status = resp.status().as_u16();
+    let headers: Vec<HttpHeader> = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| HttpHeader {
+            name: k.as_str().to_string(),
+            value: v.to_str().unwrap_or_default().to_string(),
+        })
+        .collect();
+    let body = resp
+        .bytes()
+        .with_context(|| format!("读取响应失败: {}", request.url))?
+        .to_vec();
+
+    Ok(HttpResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+/// 并发执行一批请求，保持与输入同序。
+pub fn fetch_requests(
+    requests: &[&HttpRequest],
+    max_workers: usize,
+    sleep_ms: u64,
+) -> Vec<Result<HttpResponse>> {
+    let n = requests.len();
     if n == 0 {
         return Vec::new();
     }
 
-    let urls = Arc::new(urls.to_vec());
-    let results: FetchResults = Arc::new(Mutex::new((0..n).map(|_| None).collect()));
+    let owned: Vec<HttpRequest> = requests.iter().map(|r| (*r).clone()).collect();
+    let owned = Arc::new(owned);
+    let results: Arc<Mutex<Vec<Option<Result<HttpResponse>>>>> =
+        Arc::new(Mutex::new((0..n).map(|_| None).collect()));
     let (tx, rx) = mpsc::channel::<usize>();
     let rx = Arc::new(Mutex::new(rx));
 
@@ -122,7 +164,7 @@ pub fn fetch_many(urls: &[String], max_workers: usize, sleep_ms: u64) -> Vec<Res
     for _ in 0..worker_count {
         let rx = Arc::clone(&rx);
         let results = Arc::clone(&results);
-        let urls = Arc::clone(&urls);
+        let owned = Arc::clone(&owned);
         handles.push(thread::spawn(move || {
             let mut last: Option<Instant> = None;
             loop {
@@ -142,7 +184,7 @@ pub fn fetch_many(urls: &[String], max_workers: usize, sleep_ms: u64) -> Vec<Res
                         }
                     }
                 }
-                let res = get_bytes(&urls[idx]);
+                let res = send(&owned[idx]);
                 last = Some(Instant::now());
                 results.lock().unwrap()[idx] = Some(res);
             }
@@ -182,7 +224,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_url_list_returns_empty() {
-        assert!(fetch_many(&[], 4, 0).is_empty());
+    fn empty_request_list_returns_empty() {
+        assert!(fetch_requests(&[], 4, 0).is_empty());
     }
 }

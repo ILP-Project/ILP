@@ -12,7 +12,7 @@
 | 1 | **Rust 重写** | 用户明确要求 |
 | 2 | **范围** | 功能对齐一次做完，不分期交付保底版本 |
 | 3 | **插件 ABI** | wit-bindgen 组件模型，目标 `wasm32-wasip2`，宿主用 `wasmtime::component::Linker` |
-| 4 | **取数模型** | 混合：目录/搜索/详情=同步重入；正文=两阶段（插件报 `fetch_url`，宿主并发取回后交回 `parse_chapter`） |
+| 4 | **取数模型** | 两阶段：`plan_fetch(ids)` 产出 `fetch-task{id, http-request}`，宿主执行（并发/限速/重试），`consume_fetch(task-id, response)` 解析。批量站点 30 章/任务，网页站点 1 章/任务，同一套 ABI |
 | 5 | **存储布局** | `data/novels/<sanitized-title>_<book_id>/<seq>_<sanitized-chapter>.txt` + SQLite `chapters(site_id, book_id, chapter_id, path, status, bytes, mtime)` |
 | 6 | **`-f/--force_update`** | 只刷新元数据；另设 `--redownload` 重下正文 |
 | 7 | **`search` 分页** | `n`/空=下一页，`p`=上一页，数字=跳转（带边界检查），`q`=退出；stdin 非 TTY 时自动全量打印 |
@@ -23,7 +23,7 @@
 | 12 | **测试** | 三层，不用真实网络：单元、wiremock HTTP、wasmtime 端到端 |
 | 13 | **字体解密** | 静态码表（非轮廓匹配），`0xe3e8..0xe55b` 共 372 码点，`?` 为空位 |
 | 14 | **APP 通道** | 全量实现：设备注册 + argus/ladon 签名 + registerkey + AES 正文解密 |
-| 15 | **WASM 边界** | 宿主只提供 `http`/`log`/`storage`；密码学全在插件内（纯 Rust crate 可编进 wasm） |
+| 15 | **WASM 边界** | 宿主只提供 `http`/`log`/`storage`；`storage` 是纯 KV，按插件名命名空间隔离（`data/plugins/<name>/<key>`），插件只见 key，不可能路径穿越；密码学全在插件内 |
 | 16 | **许可** | 照公开规范独立实现（SM3 国标 / Simon-Speck NSA 规范 / RustCrypto AES），只取常量与码表，不移植 GPLv3 的 TS 代码 |
 | 17 | **代理** | 读环境变量 + `no_proxy` 豁免名单（`i.snssdk.com` 必须直连） |
 | 18 | **限流** | 1 worker + 30 章/批 + 间隔 3 秒；服务端只回部分时自动降批重试 |
