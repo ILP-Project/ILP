@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PluginMetadata {
+    /// 插件编译依据的 ABI 版本，加载时与宿主支持的版本比对。
+    pub abi_version: String,
     pub site_name: String,
     pub site_id: String,
     pub site_domain: String,

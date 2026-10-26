@@ -38,14 +38,16 @@ cargo build --release                      # 宿主：target/release/ilp
 ```
 
 插件已拆到独立仓库：宿主只提供 ABI（`crates/ilp-plugin-wit`），
-站点插件在 `ILP-Project/plugin-<site>` 里构建：
+站点插件统一在 `ILP-Project/plugins` 里构建：
 
 ```bash
-git clone https://github.com/ILP-Project/plugin-fanqie
-cd plugin-fanqie
+git clone https://github.com/ILP-Project/plugins
+cd plugins
 cargo build --target wasm32-wasip2 --release
 cp target/wasm32-wasip2/release/ilp_plugin_fanqie.wasm <宿主目录>/plugins/fanqie.wasm
 ```
+
+或者直接装：`ilp plugin install fanqie`（自动校验 ABI 与 SHA-256）。
 
 依赖都是 crates.io 上的常规库；`rusqlite` 用 `bundled` 特性自带 SQLite，不需要系统预装。
 
@@ -57,7 +59,8 @@ cp target/wasm32-wasip2/release/ilp_plugin_fanqie.wasm <宿主目录>/plugins/fa
 ```bash
 ilp get chapter|cover|author|title|all <id> -s <site_id> [-f]
 ilp search <keyword> -s <site_id>
-ilp plugin list|install <owner/repo>|uninstall|enable|disable <name>
+ilp plugin list|uninstall|enable|disable <name>
+ilp plugin install <name>[@<version>]   # 省略版本即 latest
 ilp version
 ```
 
@@ -90,14 +93,15 @@ data/
 | `crates/ilp-host` | 宿主二进制 `ilp`：CLI、配置、存储、HTTP、wasmtime 加载器、插件管理 |
 | `crates/ilp-plugin-wit` | 插件 ABI 定义（`wit/plugin.wit`），宿主与插件共享的唯一来源 |
 
-站点插件不在本仓库：一站点一仓库（`plugin-<site>`），产物经 GitHub Pages
-静态 registry 分发，详见 `plan/2026-10-26_plugin-distribution.md`。
+站点插件不在本仓库：统一放在 `ILP-Project/plugins`（一站点一子目录），
+产物经 Cloudflare Pages 的静态 registry 分发，详见
+`plan/2026-10-27_plugin-single-repo.md`。
 
 ## 已知限制
 
 - 番茄插件只覆盖**已登录可读的免费章节**；锁定章节服务端只返回一段试读，无法绕过。
-- `plugin install` 依赖上游仓库的 `plugin.json`；`url` 里若仍指向旧版 `.so` 产物会下载失败
-  （产物必须是 WASM 组件）。
+- `plugin install` 依赖插件站点的 `registry.json`（可用 `ILP_REGISTRY_URL` 指向镜像）。
+  宿主的 `SUPPORTED_ABI` 是编译期常量，装 ABI 不匹配的插件会被直接拒绝。
 - 搜索是游标分页，无法跳到指定页。
 
 ## 致谢与许可
