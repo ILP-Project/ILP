@@ -183,6 +183,7 @@ impl PluginInstance {
             .call_metadata(&mut store)
             .map_err(|e| anyhow!("调用插件 metadata 失败: {e}"))?;
         let metadata = PluginMetadata {
+            abi_version: raw.abi_version.clone(),
             site_name: raw.site_name,
             site_id: raw.site_id,
             site_domain: raw.site_domain,
@@ -190,6 +191,17 @@ impl PluginInstance {
             plugin_id: raw.plugin_id,
             version: raw.version,
         };
+
+        // ABI 不匹配必须在这里挡住。否则插件能"加载成功"，
+        // 然后在某个具体调用的参数编解码里炸出一个与真实原因无关的错误。
+        if metadata.abi_version != crate::plugin_manager::SUPPORTED_ABI {
+            return Err(anyhow!(
+                "插件 {} 的 ABI 版本为 {}，本版本 ilp 支持 {}。请升级插件或 ilp",
+                metadata.plugin_name,
+                metadata.abi_version,
+                crate::plugin_manager::SUPPORTED_ABI
+            ));
+        }
 
         Ok(Self {
             metadata,

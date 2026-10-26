@@ -6,39 +6,66 @@ use std::path::{Path, PathBuf};
 use crate::cli::PluginCommand;
 use crate::config::Config;
 
-/// 插件安装信息。`url` 旧版按 OS 分平台给，这里接受两种形态：
-/// 直接字符串，或 {os: url} 映射（取当前平台的，取不到再用 linux 兜底）。
+/// 站点只发布一个 ABI 版本。必须与 `ilp-plugin-wit` 里
+/// `package ilp:plugin@x.y.z` 保持一致。
+pub const SUPPORTED_ABI: &str = "0.1.0";
+
+/// 插件 registry（`registry.json`）。
+///
+/// 只取用得到的字段：宿主不该因为 registry 多了个新字段就装不了插件。
 #[derive(Deserialize)]
-struct PluginJson {
+struct Registry {
+    #[serde(default)]
+    schema: u32,
+    plugins: Vec<RegistryPlugin>,
+}
+
+#[derive(Deserialize, Debug)]
+struct RegistryPlugin {
     name: String,
-    #[serde(alias = "download_url")]
-    url: UrlField,
+    site_id: String,
+    abi: String,
+    latest: String,
+    versions: Vec<String>,
+    url: String,
+    /// registry 声明的产物大小与摘要，用于拒绝截断/被改的下载。
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    sha256: Option<String>,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum UrlField {
-    Single(String),
-    ByOs(std::collections::HashMap<String, String>),
-}
-
-impl UrlField {
-    fn pick(&self) -> Option<&str> {
-        match self {
-            UrlField::Single(u) => Some(u.as_str()),
-            UrlField::ByOs(m) => {
-                // 各仓库的键大小写不一，官方模板用的是 "Linux"/"Windows"。
-                let os = std::env::consts::OS;
-                let find = |want: &str| {
-                    m.iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(want))
-                        .map(|(_, v)| v.as_str())
-                };
-                find(os)
-                    .or_else(|| find("linux"))
-                    .or_else(|| m.values().next().map(|v| v.as_str()))
-            }
+impl Registry {
+    /// registry 自己声明的 site_id 是否重复。
+    ///
+    /// 宿主按 site_id 找插件，重复会让行为取决于文件加载顺序
+    /// （`load_plugins` 里对文件名排序）。registry 是最适合做这项校验的地方：
+    /// 它能看到全部插件，而单个插件自己看不到。
+    fn duplicate_site_ids(&self) -> Vec<(&str, Vec<&str>)> {
+        let mut by_site: std::collections::BTreeMap<&str, Vec<&str>> =
+            std::collections::BTreeMap::new();
+        for p in &self.plugins {
+            by_site
+                .entry(p.site_id.as_str())
+                .or_default()
+                .push(p.name.as_str());
         }
+        by_site
+            .into_iter()
+            .filter(|(_, names)| names.len() > 1)
+            .collect()
+    }
+
+    fn find(&self, name: &str) -> Result<&RegistryPlugin> {
+        self.plugins.iter().find(|p| p.name == name).ok_or_else(|| {
+            let mut names: Vec<&str> = self.plugins.iter().map(|p| p.name.as_str()).collect();
+            names.sort();
+            if names.is_empty() {
+                anyhow!("registry 里没有任何插件")
+            } else {
+                anyhow!("没有名为 {name} 的插件。可用插件: {}", names.join(", "))
+            }
+        })
     }
 }
 
@@ -91,30 +118,29 @@ fn list_wasm(dir: &Path) -> Vec<String> {
     names
 }
 
-/// 解析并校验 `owner/repo`。
-///
-/// 这两个值会被拼进 URL 和文件名，不校验就等于把路径穿越和任意 URL 交给用户。
+/// 解析 `name[@version]`。两段都会进 URL 和文件名，必须白名单化。
 fn parse_source(source: &str) -> Result<(String, String)> {
-    let (owner, repo) = source
-        .split_once('/')
-        .ok_or_else(|| anyhow!("安装源应为 owner/repo 格式，例如 RhenCloud/FanqiePlugin"))?;
-    for (label, value) in [("owner", owner), ("repo", repo)] {
+    let (name, version) = match source.split_once('@') {
+        Some((n, v)) => (n, v),
+        None => (source, "latest"),
+    };
+    for (label, value) in [("插件名", name), ("版本", version)] {
         if value.is_empty() {
-            return Err(anyhow!("安装源里的 {label} 不能为空"));
+            return Err(anyhow!("{label}不能为空"));
         }
         if !value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         {
             return Err(anyhow!(
-                "安装源里的 {label} 含非法字符: {value}（只允许字母、数字、- _ .）"
+                "{label}含非法字符: {value}（只允许字母、数字、- _ .）"
             ));
         }
         if value == "." || value == ".." {
-            return Err(anyhow!("安装源里的 {label} 不能是 {value}"));
+            return Err(anyhow!("{label}不能是 {value}"));
         }
     }
-    Ok((owner.to_string(), repo.to_string()))
+    Ok((name.to_string(), version.to_string()))
 }
 
 /// 插件名会变成文件名，必须白名单化：原版直接拿 name 拼路径，
@@ -137,54 +163,110 @@ fn safe_plugin_name(name: &str) -> Result<&str> {
     Ok(name)
 }
 
-/// 插件源站地址。抽成函数是为了能在测试里指向本地静态服务，
-/// 否则"安装成功"这条路只能靠线上仓库碰运气才能验证到。
-fn raw_base() -> String {
-    std::env::var("ILP_RAW_BASE")
-        .unwrap_or_else(|_| "https://raw.githubusercontent.com".to_string())
+/// registry 地址。抽成函数是为了能在测试里指向本地静态服务，
+/// 否则"安装成功"这条路只能靠线上站点碰运气才能验证到。
+fn registry_base() -> String {
+    std::env::var("ILP_REGISTRY_URL")
+        .unwrap_or_else(|_| "https://ilp-plugins.pages.dev".to_string())
         .trim_end_matches('/')
         .to_string()
 }
 
-fn install(config: &Config, source: &str) -> Result<()> {
-    let (owner, repo) = parse_source(source)?;
-    let base = raw_base();
+/// 把 registry 里的相对 url 补成绝对地址。
+///
+/// registry 存相对路径（`fanqie/1.0.0/fanqie.wasm`），这样换域名不用重发 registry；
+/// 但 CI 若给了绝对地址也得能用，所以只对相对路径拼接。
+fn resolve_url(base: &str, url: &str) -> Result<String> {
+    let full = if url.starts_with("http://") || url.starts_with("https://") {
+        url.to_string()
+    } else if url.starts_with('/') || url.contains("..") {
+        return Err(anyhow!("registry 里的 url 非法: {url}"));
+    } else {
+        format!("{base}/{url}")
+    };
+    Ok(full)
+}
 
-    // 主分支名不固定，main 拿不到就退回 master。
-    let mut text = None;
-    for branch in ["main", "master"] {
-        let url = format!("{base}/{owner}/{repo}/refs/heads/{branch}/plugin.json");
-        match crate::http::get_text(&url) {
-            Ok(t) => {
-                text = Some(t);
-                break;
-            }
-            Err(e) => {
-                tracing::debug!("{branch} 分支取 plugin.json 失败: {e:#}");
-            }
+/// 校验下载产物与 registry 声明一致。
+///
+/// 没有这一步时，截断的下载只要前 8 字节对就能装进去，然后在运行时以
+/// 一个和真实原因毫无关系的 wasmtime 错误失败。
+fn verify_artifact(bytes: &[u8], p: &RegistryPlugin) -> Result<()> {
+    if let Some(size) = p.size {
+        if bytes.len() as u64 != size {
+            return Err(anyhow!(
+                "产物大小不符: registry 声明 {size} 字节，实得 {} 字节",
+                bytes.len()
+            ));
         }
     }
-    let text = text
-        .ok_or_else(|| anyhow!("无法从 {owner}/{repo} 的 main 或 master 分支获取 plugin.json"))?;
+    if let Some(want) = &p.sha256 {
+        use sha2::{Digest, Sha256};
+        let got = format!("{:x}", Sha256::digest(bytes));
+        if !got.eq_ignore_ascii_case(want) {
+            return Err(anyhow!("产物校验和不符: registry 声明 {want}，实得 {got}"));
+        }
+    }
+    validate_wasm(bytes)
+}
 
-    let pj: PluginJson = serde_json::from_str(&text).context("解析 plugin.json 失败")?;
-    let name = safe_plugin_name(&pj.name)?.to_string();
-    let url = pj
-        .url
-        .pick()
-        .ok_or_else(|| anyhow!("plugin.json 里没有适用于当前平台的 url"))?;
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return Err(anyhow!("plugin.json 里的 url 不是 http(s) 地址: {url}"));
+fn install(config: &Config, source: &str) -> Result<()> {
+    let (name, version) = parse_source(source)?;
+    let base = registry_base();
+
+    let text = crate::http::get_text(&format!("{base}/registry.json"))
+        .context("获取插件 registry 失败（可用 ILP_REGISTRY_URL 指定镜像）")?;
+    let reg: Registry = serde_json::from_str(&text).context("解析 registry.json 失败")?;
+    if reg.schema != 0 && reg.schema != 1 {
+        return Err(anyhow!(
+            "registry schema {} 不受支持（本版本支持 1），请升级 ilp",
+            reg.schema
+        ));
     }
 
-    let bytes = crate::http::get_bytes(url).with_context(|| format!("下载插件失败: {url}"))?;
-    validate_wasm(&bytes)?;
+    // site_id 重复时先告警而不是拒绝：装插件这个动作本身没错，
+    // 但不说明白的话，用户会看到"装了两个同站点插件，只有其中一个生效"。
+    for (site_id, names) in reg.duplicate_site_ids() {
+        tracing::warn!(
+            "registry 里 site_id {site_id} 被多个插件声明: {}。按 site_id 查找时行为不确定",
+            names.join(", ")
+        );
+    }
+
+    let p = reg.find(&name)?;
+
+    // ABI 在下载前就比对：拿一个注定跑不起来的插件下来毫无意义，
+    // 而且装进去之后只会在某次调用里以无关错误的形式暴露。
+    if p.abi != SUPPORTED_ABI {
+        return Err(anyhow!(
+            "插件 {name} 要求 ABI {}，本版本 ilp 支持 {SUPPORTED_ABI}。请升级 ilp 或安装旧版插件",
+            p.abi
+        ));
+    }
+
+    let want = if version == "latest" {
+        p.latest.clone()
+    } else {
+        version
+    };
+    if !p.versions.iter().any(|v| v == &want) {
+        let mut vs = p.versions.clone();
+        vs.sort();
+        return Err(anyhow!(
+            "插件 {name} 没有版本 {want}。可用版本: {}",
+            vs.join(", ")
+        ));
+    }
+
+    let url = resolve_url(&base, &p.url)?;
+    let bytes = crate::http::get_bytes(&url).with_context(|| format!("下载插件失败: {url}"))?;
+    verify_artifact(&bytes, p)?;
 
     let dir = config.plugins_dir();
     fs::create_dir_all(&dir)?;
     let dest = dir.join(format!("{name}.wasm"));
     write_atomic(&dest, &bytes)?;
-    println!("已安装插件 {name} 到 {}", dest.display());
+    println!("已安装插件 {name} {want} 到 {}", dest.display());
     Ok(())
 }
 
@@ -298,24 +380,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_accepts_normal_repo() {
+    fn source_accepts_name_and_optional_version() {
         assert_eq!(
-            parse_source("RhenCloud/FanqiePlugin").expect("应接受"),
-            ("RhenCloud".to_string(), "FanqiePlugin".to_string())
+            parse_source("fanqie").expect("应接受"),
+            ("fanqie".to_string(), "latest".to_string())
+        );
+        assert_eq!(
+            parse_source("fanqie@1.2.0").expect("应接受"),
+            ("fanqie".to_string(), "1.2.0".to_string())
+        );
+        assert_eq!(
+            parse_source("my-plugin_2@0.1.0").expect("应接受"),
+            ("my-plugin_2".to_string(), "0.1.0".to_string())
         );
     }
 
     #[test]
     fn source_rejects_traversal_and_empty() {
         for bad in [
+            "",
+            "@1.0.0",
+            "fanqie@",
             "../etc/passwd",
-            "owner/..",
-            "a/b/c",
-            "no-slash",
-            "/repo",
-            "owner/",
-            "own er/repo",
-            "owner/re po",
+            "fanqie@..",
+            "a/b",
+            "own er",
+            "fanqie@1.0.0 beta",
         ] {
             assert!(parse_source(bad).is_err(), "应拒绝: {bad}");
         }
@@ -343,7 +433,7 @@ mod tests {
 
     #[test]
     fn wasm_validation_rejects_non_wasm() {
-        // 常见失败：拿到的是 GitHub 的 404 页面
+        // 常见失败：拿到的是错误页
         assert!(validate_wasm(b"<!DOCTYPE html><html>").is_err());
         // 截断
         assert!(validate_wasm(b"\0asm").is_err());
@@ -353,7 +443,7 @@ mod tests {
 
     #[test]
     fn real_built_plugin_passes_validation() {
-        // 用仓库里真实构建出的插件产物做一次整体校验，
+        // 用真实构建出的插件产物做一次整体校验，
         // 防止"校验逻辑和实际产物头部不一致"这类问题再次漏过去。
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/wasm32-wasip2/release/ilp_plugin_fanqie.wasm");
@@ -368,24 +458,141 @@ mod tests {
         );
     }
 
+    fn sample_registry() -> Registry {
+        serde_json::from_str(
+            r#"{
+                "schema": 1,
+                "plugins": [{
+                    "name": "fanqie",
+                    "site_id": "fanqie",
+                    "abi": "0.1.0",
+                    "latest": "1.2.0",
+                    "versions": ["1.2.0", "1.1.0"],
+                    "url": "fanqie/1.2.0/fanqie.wasm"
+                }]
+            }"#,
+        )
+        .expect("样例 registry")
+    }
+
     #[test]
-    fn url_field_supports_both_shapes() {
-        let single: PluginJson =
-            serde_json::from_str(r#"{"name":"a","url":"https://x/a.wasm"}"#).expect("单地址");
-        assert_eq!(single.url.pick().expect("有地址"), "https://x/a.wasm");
+    fn registry_lookup_reports_available_names() {
+        // 装错名字是常见操作，错误信息要给出可选名字，
+        // 否则用户只能去翻网页。
+        let reg = sample_registry();
+        let err = format!("{:#}", reg.find("nope").expect_err("不存在"));
+        assert!(err.contains("fanqie"), "应列出可用插件，实得: {err}");
+    }
 
-        let by_os: PluginJson = serde_json::from_str(
-            r#"{"name":"a","url":{"linux":"https://x/l.wasm","windows":"https://x/w.wasm"}}"#,
+    #[test]
+    fn duplicate_site_ids_are_detected() {
+        // 宿主按 site_id 找插件，重复时行为取决于文件名排序。
+        // registry 是唯一能看到全局的地方，必须在这里发现。
+        let reg: Registry = serde_json::from_str(
+            r#"{
+                "schema": 1,
+                "plugins": [
+                    {"name":"a","site_id":"x","abi":"0.1.0","latest":"1","versions":["1"],"url":"a.wasm"},
+                    {"name":"b","site_id":"x","abi":"0.1.0","latest":"1","versions":["1"],"url":"b.wasm"},
+                    {"name":"c","site_id":"y","abi":"0.1.0","latest":"1","versions":["1"],"url":"c.wasm"}
+                ]
+            }"#,
         )
-        .expect("分平台");
-        assert!(by_os.url.pick().is_some());
+        .expect("样例");
+        let dups = reg.duplicate_site_ids();
+        assert_eq!(dups.len(), 1, "只该报一组重复: {dups:?}");
+        assert_eq!(dups[0].0, "x");
+        assert_eq!(dups[0].1, vec!["a", "b"]);
+    }
 
-        // 官方模板用大写键，必须大小写不敏感。
-        let caps: PluginJson = serde_json::from_str(
-            r#"{"name":"a","url":{"Linux":"https://x/l.wasm","Windows":"https://x/w.wasm"}}"#,
-        )
-        .expect("大写键");
-        let picked = caps.url.pick().expect("有地址");
-        assert!(picked.ends_with(".wasm"), "拿到了 {picked}");
+    #[test]
+    fn distinct_site_ids_report_no_duplicates() {
+        assert!(sample_registry().duplicate_site_ids().is_empty());
+    }
+
+    #[test]
+    fn registry_entry_is_found_by_name() {
+        let reg = sample_registry();
+        assert_eq!(reg.find("fanqie").expect("存在").latest, "1.2.0");
+    }
+
+    #[test]
+    fn registry_without_optional_digest_still_parses() {
+        // 摘要字段是可选的：registry 早期版本没这两个字段，
+        // 少了它们应该仍能装，而不是整个 registry 解析失败。
+        let reg = sample_registry();
+        assert!(reg.plugins[0].size.is_none());
+        assert!(reg.plugins[0].sha256.is_none());
+    }
+
+    #[test]
+    fn relative_urls_are_joined_against_the_mirror() {
+        // registry 存相对路径，换域名不用重发；但绝对地址也要能用。
+        let base = "https://mirror.example";
+        assert_eq!(
+            resolve_url(base, "fanqie/1.0.0/fanqie.wasm").expect("相对"),
+            "https://mirror.example/fanqie/1.0.0/fanqie.wasm"
+        );
+        assert_eq!(
+            resolve_url(base, "https://cdn.example/f.wasm").expect("绝对"),
+            "https://cdn.example/f.wasm"
+        );
+        // 穿越与协议相对路径必须拒绝：否则 registry 能把下载引到任意位置。
+        for bad in ["/etc/passwd", "../x.wasm", "a/../../x"] {
+            assert!(resolve_url(base, bad).is_err(), "应拒绝: {bad}");
+        }
+    }
+
+    #[test]
+    fn artifact_size_mismatch_is_rejected() {
+        // 截断的下载：头部可能仍是合法 wasm，只有长度对不上。
+        let mut bytes = b"\0asm\x0d\0\x01\0".to_vec();
+        bytes.extend_from_slice(&[0u8; 16]);
+        let p = RegistryPlugin {
+            name: "a".into(),
+            site_id: "a".into(),
+            abi: "0.1.0".into(),
+            latest: "1".into(),
+            versions: vec!["1".into()],
+            url: "a.wasm".into(),
+            size: Some(999),
+            sha256: None,
+        };
+        let err = format!("{:#}", verify_artifact(&bytes, &p).expect_err("应拒绝"));
+        assert!(err.contains("大小不符"), "实得: {err}");
+    }
+
+    #[test]
+    fn artifact_digest_mismatch_is_rejected() {
+        let bytes = b"\0asm\x0d\0\x01\0".to_vec();
+        let p = RegistryPlugin {
+            name: "a".into(),
+            site_id: "a".into(),
+            abi: "0.1.0".into(),
+            latest: "1".into(),
+            versions: vec!["1".into()],
+            url: "a.wasm".into(),
+            size: Some(bytes.len() as u64),
+            sha256: Some("0".repeat(64)),
+        };
+        let err = format!("{:#}", verify_artifact(&bytes, &p).expect_err("应拒绝"));
+        assert!(err.contains("校验和不符"), "实得: {err}");
+    }
+
+    #[test]
+    fn artifact_with_matching_digest_is_accepted() {
+        use sha2::{Digest, Sha256};
+        let bytes = b"\0asm\x0d\0\x01\0".to_vec();
+        let p = RegistryPlugin {
+            name: "a".into(),
+            site_id: "a".into(),
+            abi: "0.1.0".into(),
+            latest: "1".into(),
+            versions: vec!["1".into()],
+            url: "a.wasm".into(),
+            size: Some(bytes.len() as u64),
+            sha256: Some(format!("{:x}", Sha256::digest(&bytes))),
+        };
+        assert!(verify_artifact(&bytes, &p).is_ok());
     }
 }

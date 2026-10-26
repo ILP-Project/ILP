@@ -33,6 +33,9 @@ interface types {
   }
 
   record plugin-metadata {
+    /// 插件编译时依据的 ABI 版本。宿主在加载阶段比对，
+    /// 不匹配直接拒绝，避免"加载成功、某次调用才炸"。
+    abi-version: string,
     site-name: string,
     site-id: string,
     site-domain: string,
