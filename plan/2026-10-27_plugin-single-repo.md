@@ -197,6 +197,68 @@ EOF
 4. 改 `Cargo.toml` 的 `ilp-plugin-wit` 为 git 依赖。
 5. ILP 仓库打 tag `abi-v0.1.0`（插件构建依赖它）。
 
+## 落地状态与实测（2026-10-27）
+
+已实施，宿主 `750ad2f`、plugins 仓库 `819eb26`。门禁：宿主 62 测试、插件 27 测试，
+两侧 fmt + clippy 全清。
+
+实测确认的几件事，后续改动不要重蹈：
+
+### 1. `git tag` 会挂起（不是卡死代码）
+
+全局 git 配置里 `tag.gpgsign=true`，非交互环境触发 pinentry 等密码 →
+永久阻塞。任何自动化脚本打 tag 必须 `git -c tag.gpgsign=false tag ...`。
+这条曾经让一条命令挂 20 分钟，并被误判为代码问题。
+
+### 2. `[patch]` / `paths` 救不了不存在的远端
+
+Cargo 总会先解析原始 git 源的 `tag`。`plugins/.cargo/config.toml` 里的
+`[patch."https://github.com/ILP-Project/ILP"]` 只能替换**已经解析成功**的源，
+所以本地开发要么临时改 path 依赖，要么用 git `insteadOf` 重定向。
+在 `abi-v0.1.0` 真正推到 GitHub 之前，干净 clone 的 plugins 仓库**无法构建**。
+
+### 3. Cargo 内置 git 不读 `insteadOf`，要加 `git-fetch-with-cli`
+
+实测把 `url.<local>.insteadOf` 指向本地裸仓库后，`cargo build` 仍报
+`reference 'refs/remotes/origin/tags/abi-v0.1.0' not found`：Cargo 自带的
+git 实现不认这个配置。加上
+
+```toml
+[net]
+git-fetch-with-cli = true
+```
+
+后立即成功（锁定 `#750ad2f3`），产物组件头 `00 61 73 6d 0d 00 01 00`，
+宿主能正常加载。**这是验证 tag 机制的唯一可靠姿势。**
+
+### 4. ABI 校验已双向落地
+
+- 装之前：`registry.json` 的 `abi` 与宿主 `plugin_manager::SUPPORTED_ABI` 比对，
+  不匹配直接拒绝，不浪费一次下载。
+- 加载时：`PluginMetadata.abi_version` 与同一常量比对。手工拷贝进来的插件
+  绕不过这条。实测把插件里的 `0.1.0` 改成 `0.9.9` 后，宿主明确报
+  "插件 FanqiePlugin 的 ABI 版本为 0.9.9，本版本 ilp 支持 0.1.0"。
+
+注意：用二进制替换全局改 `0.1.0` 会连 WIT 包名一起改掉，wasmtime 会在
+实例化阶段先报 `component imports instance ilp:plugin/host@0.9.9`。
+要测宿主自己的 ABI 校验，必须改源码里的 `ABI_VERSION` 常量再重新编译。
+
+### 5. 版本不可变已生效
+
+篡改已发布的 `_site/fanqie/1.0.0/fanqie.wasm` 后重跑 `build_site.py`
+会失败并提示升版本，不会覆盖。
+
+### 6. `sha256`/`size` 校验覆盖两种攻击
+
+- 追加字节 → 被 `size` 抓到（365474 → 365475）。
+- 等长改中间一个字节 → `size` 相同，被 `sha256` 抓到。
+
+## 遗留
+
+- `abi-v0.1.0` tag 已在本地 ILP 仓库创建，**尚未推送**（该仓库还没有 remote）。
+  推送到 GitHub 是 plugins 仓库能干净构建的前置条件。
+- Cloudflare Pages 项目尚未在 dashboard 里创建。
+
 ## 参考
 
 - 旧方案：`plan/2026-10-26_plugin-distribution.md`
