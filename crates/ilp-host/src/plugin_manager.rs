@@ -84,7 +84,7 @@ fn list(config: &Config) -> Result<()> {
     let disabled = list_wasm(&config.disabled_plugins_dir());
 
     if enabled.is_empty() && disabled.is_empty() {
-        println!("没有已安装的插件。用 `ilp plugin install <owner/repo>` 安装。");
+        println!("没有已安装的插件。用 `ilp plugin install <name>` 安装。");
         return Ok(());
     }
     if !enabled.is_empty() {
@@ -212,6 +212,10 @@ fn verify_artifact(bytes: &[u8], p: &RegistryPlugin) -> Result<()> {
 
 fn install(config: &Config, source: &str) -> Result<()> {
     let (name, version) = parse_source(source)?;
+    // parse_source 的白名单比文件名要求宽松（允许 `.`，为了版本号），
+    // 而 name 会直接拼成 `<name>.wasm`。再过一遍文件名白名单，
+    // 保证两条路径用的是同一个标准。
+    let name = safe_plugin_name(&name)?.to_string();
     let base = registry_base();
 
     let text = crate::http::get_text(&format!("{base}/registry.json"))

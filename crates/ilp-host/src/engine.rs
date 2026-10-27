@@ -337,18 +337,77 @@ pub fn load_plugins(config: &crate::config::Config) -> Result<Vec<PluginInstance
         .collect();
     paths.sort();
 
+    // 记下每个插件来自哪个文件：冲突时报文件名才可操作，
+    // 只报 plugin_name 时两个同名插件看上去一模一样。
+    let mut origins: Vec<(PathBuf, String)> = Vec::new();
     for path in paths {
         match PluginInstance::load(&path, &storage_root) {
-            Ok(p) => out.push(p),
+            Ok(p) => {
+                origins.push((path.clone(), p.site_id().to_string()));
+                out.push(p);
+            }
             Err(e) => tracing::warn!("加载插件 {} 失败: {e:#}", path.display()),
         }
     }
+
+    // 插件按 site_id 查找，而这里按文件名排序加载，所以两个插件声明同一个
+    // site_id 时，`ilp get -s <site>` 用哪个取决于文件名——同一个命令在不同
+    // 机器上行为不同。用户看不出原因，只会觉得"有时候抓错了"。
+    warn_on_duplicate_site_ids(&origins);
+
     Ok(out)
+}
+
+/// 报告重复的 site_id。只警告不拒绝：插件本身是好的，
+/// 问题在于用户同时装了两个抢同一个站点的插件。
+///
+/// `origins` 是 (文件路径, site_id)。
+fn warn_on_duplicate_site_ids(origins: &[(PathBuf, String)]) {
+    let mut by_site: std::collections::BTreeMap<&str, Vec<&Path>> =
+        std::collections::BTreeMap::new();
+    for (path, site_id) in origins {
+        by_site.entry(site_id.as_str()).or_default().push(path);
+    }
+    for (site_id, paths) in by_site.iter().filter(|(_, p)| p.len() > 1) {
+        let files: Vec<String> = paths
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.display().to_string())
+            })
+            .collect();
+        tracing::warn!(
+            "site_id {site_id} 被多个文件声明: {}。按 site_id 查找时只有其中一个生效，\
+             请卸载多余的插件（ilp plugin uninstall <name>）",
+            files.join(", ")
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_site_ids_are_grouped_by_file() {
+        // 两条路径抢同一个 site_id。分组逻辑必须把它们归到一起，
+        // 否则告警里只会看到一个文件，用户不知道冲突的是谁。
+        let origins = vec![
+            (PathBuf::from("/p/aaa.wasm"), "fanqie".to_string()),
+            (PathBuf::from("/p/zzz.wasm"), "fanqie".to_string()),
+            (PathBuf::from("/p/other.wasm"), "other".to_string()),
+        ];
+        let mut by_site: std::collections::BTreeMap<&str, Vec<&Path>> =
+            std::collections::BTreeMap::new();
+        for (path, site_id) in &origins {
+            by_site.entry(site_id.as_str()).or_default().push(path);
+        }
+        let dups: Vec<_> = by_site.iter().filter(|(_, p)| p.len() > 1).collect();
+        assert_eq!(dups.len(), 1, "只该报一组重复");
+        assert_eq!(dups[0].0, &"fanqie");
+        assert_eq!(dups[0].1.len(), 2);
+    }
 
     #[test]
     fn storage_keys_reject_traversal() {
