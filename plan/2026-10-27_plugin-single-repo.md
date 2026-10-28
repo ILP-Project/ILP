@@ -43,7 +43,7 @@ ILP-Project/
 ## 产物布局（CF Pages 站点根）
 
 ```
-https://<project>.pages.dev/
+https://ilp.elysola.org/
 ├── index.html                 插件列表（CI 由 registry.json 渲染）
 ├── fanqie/index.html          详情页：介绍、安装命令、版本历史
 ├── registry.json              机器可读索引（宿主读这个）
@@ -67,7 +67,7 @@ https://<project>.pages.dev/
       "abi": "0.1.0",
       "latest": "1.0.0",
       "versions": ["1.0.0"],
-      "url": "https://<project>.pages.dev/fanqie/1.0.0/fanqie.wasm",
+      "url": "https://ilp.elysola.org/fanqie/1.0.0/fanqie.wasm",
       "size": 365594,
       "sha256": "…"
     }
@@ -347,15 +347,19 @@ Cloudflare Dashboard → Workers & Pages → Create → Pages → **Connect to G
 
 ### 4. 自定义域名（可选）
 
-默认域名是 `ilp-plugins.pages.dev`，正是宿主 `registry_base()` 的默认值，
-所以不改也能直接用。
+域名已定为 **`ilp.elysola.org`**，它就是宿主 `DEFAULT_REGISTRY`
+（`crates/ilp-host/src/plugin_manager.rs`）的值，装插件时默认打这个地址。
+
+在 Pages 项目里 Add custom domain 填 `ilp.elysola.org`。若是该 zone 下的
+子域，CF 会自动建 CNAME 并签证书；`ilp.elysola.org` 的 DNS 目前已有记录
+（解析到 CF IP），但源站返回 **522**，说明 Pages 项目还没绑定上去。
 
 ### 5. 验证
 
 项目建好后跑：
 
 ```bash
-curl -s https://ilp-plugins.pages.dev/registry.json | head -c 200
+curl -s https://ilp.elysola.org/registry.json | head -c 200
 ```
 
 应能看到 `{"schema": 1, ...}`。然后：

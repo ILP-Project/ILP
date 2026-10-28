@@ -94,13 +94,15 @@ data/
 | `crates/ilp-plugin-wit` | 插件 ABI 定义（`wit/plugin.wit`），宿主与插件共享的唯一来源 |
 
 站点插件不在本仓库：统一放在 `ILP-Project/plugins`（一站点一子目录），
-产物经 Cloudflare Pages 的静态 registry 分发，详见
+产物经 Cloudflare Pages 的静态 registry 分发，默认地址
+`https://ilp.elysola.org`（`plugin_manager::DEFAULT_REGISTRY`），详见
 `plan/2026-10-27_plugin-single-repo.md`。
 
 ## 已知限制
 
 - 番茄插件只覆盖**已登录可读的免费章节**；锁定章节服务端只返回一段试读，无法绕过。
-- `plugin install` 依赖插件站点的 `registry.json`（可用 `ILP_REGISTRY_URL` 指向镜像）。
+- `plugin install` 依赖插件站点的 `registry.json`（默认 `https://ilp.elysola.org`，
+  可用 `ILP_REGISTRY_URL` 指向镜像）。
   宿主的 `SUPPORTED_ABI` 是编译期常量，装 ABI 不匹配的插件会被直接拒绝。
 - 搜索是游标分页，无法跳到指定页。
 

@@ -163,11 +163,15 @@ fn safe_plugin_name(name: &str) -> Result<&str> {
     Ok(name)
 }
 
+/// registry 的默认地址。发布站点由 plugins 仓库的 `publish.yml` 生成，
+/// 托管在 Cloudflare Pages 上，`ilp.elysola.org` 是其自定义域名。
+pub const DEFAULT_REGISTRY: &str = "https://ilp.elysola.org";
+
 /// registry 地址。抽成函数是为了能在测试里指向本地静态服务，
 /// 否则"安装成功"这条路只能靠线上站点碰运气才能验证到。
 fn registry_base() -> String {
     std::env::var("ILP_REGISTRY_URL")
-        .unwrap_or_else(|_| "https://ilp-plugins.pages.dev".to_string())
+        .unwrap_or_else(|_| DEFAULT_REGISTRY.to_string())
         .trim_end_matches('/')
         .to_string()
 }
@@ -527,6 +531,17 @@ mod tests {
         let reg = sample_registry();
         assert!(reg.plugins[0].size.is_none());
         assert!(reg.plugins[0].sha256.is_none());
+    }
+
+    #[test]
+    fn default_registry_is_the_published_site() {
+        // 这个常量是用户 `ilp plugin install fanqie` 时实际会打到的地址。
+        // 改域名时如果只改文档不改这里，用户装到的是旧站点；反之亦然。
+        // 断言成字面量，就是要让任何一处改动都必须同时改这里。
+        assert_eq!(DEFAULT_REGISTRY, "https://ilp.elysola.org");
+        // 不带末尾斜杠：resolve_url 会自己拼 `/`，带两个会变成 `//`。
+        assert!(!DEFAULT_REGISTRY.ends_with('/'));
+        assert!(DEFAULT_REGISTRY.starts_with("https://"));
     }
 
     #[test]
