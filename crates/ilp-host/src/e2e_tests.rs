@@ -13,6 +13,16 @@ fn wasm_path() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop();
     p.pop();
+    // 插件自单一仓库迁移后不再在本仓库构建，产物在兄弟目录 `plugins` 下。
+    // 保留旧路径做回退：拆分前构建过的产物还在，能让 e2e 继续跑。
+    let sibling = p
+        .parent()
+        .map(|root| root.join("plugins/target/wasm32-wasip2/release/ilp_plugin_fanqie.wasm"));
+    if let Some(path) = sibling {
+        if path.exists() {
+            return path;
+        }
+    }
     p.join("target/wasm32-wasip2/release/ilp_plugin_fanqie.wasm")
 }
 
@@ -23,7 +33,7 @@ fn plugin_wasm() -> Option<PathBuf> {
         Some(path)
     } else {
         eprintln!(
-            "跳过 e2e：未找到 {}（先 cargo build --target wasm32-wasip2 --release -p ilp-plugin-fanqie）",
+            "跳过 e2e：未找到 {}（先在 ILP-Project/plugins 里 cargo build --target wasm32-wasip2 --release）",
             path.display()
         );
         None

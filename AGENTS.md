@@ -42,12 +42,12 @@
 - `crates/ilp-types`：共享 serde 类型（`PluginMetadata` / `ChapterEntry` / `SearchResult` / `ParseInput`）。
 - `crates/ilp-host`：宿主二进制 `ilp`（clap CLI、config、storage、http、wasmtime loader、plugin manager）。
 - `crates/ilp-plugin-wit`：插件 ABI（`wit/plugin.wit`），宿主与插件共享的唯一来源。
-- 站点插件独立仓库：`ILP-Project/plugin-<site>`（如 `plugin-fanqie`），不在本仓库。
+- 站点插件在独立的 `ILP-Project/plugins` 仓库（一站点一子目录），不在本仓库。
 
 ## 命令
 
 - 宿主：`cargo build` / `cargo run -- <args>`
-- 插件（在 `plugin-<site>` 仓库里，需先 `rustup target add wasm32-wasip2`）：
+- 插件（在 `ILP-Project/plugins` 仓库里，需先 `rustup target add wasm32-wasip2`）：
   `cargo build --target wasm32-wasip2 --release`
   产物 `target/wasm32-wasip2/release/ilp_plugin_fanqie.wasm` 复制到宿主的 `plugins/` 下。
 - `cargo test`、`cargo clippy --all-targets -- -D warnings`、`cargo fmt --check`

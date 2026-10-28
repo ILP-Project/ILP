@@ -63,7 +63,10 @@ https://ilp-project.github.io/plugins/
 
 ### 发布流程（后续实现）
 
-1. `plugin-fanqie` 打 tag `v1.2.0` → CI 构建 wasm32-wasip2 → 上传到 Releases。
+> **已过时**：`plugin-fanqie` 仓库已删除，其全部历史并入 `ILP-Project/plugins`。
+> 现在的流程见 `2026-10-27_plugin-single-repo.md` 与 `plugins/.github/workflows/publish.yml`。
+
+1. ~~`plugin-fanqie` 打 tag `v1.2.0` → CI 构建 wasm32-wasip2 → 上传到 Releases。~~
 2. CI 推送到 `plugins` 仓库：写 `fanqie/1.2.0/fanqie.wasm`、更新 `fanqie/latest.json`
    和顶层 `registry.json`。
 3. `1.2.0/` 一旦写入不再修改；修 bug 发 `1.2.1`，绝不覆盖旧路径。
