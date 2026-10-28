@@ -311,10 +311,31 @@ issue #849 明确写了这件事）。原计划"CF 构建命令直接跑
   封面 `data/covers/部族荣光_7069948840148732967.jpg` 17.7K / 225×300；
   重跑 `所有章节已下载`，退出码 0。
 
+### 11. 自定义域名 `ilp.elysola.org` 已上线
+
+域名解析到 Cloudflare，但 Pages 项目绑定前一直返回 **522**（源站不可达）。
+绑定后立即 200，`registry.json` 内容正确。
+
+宿主默认地址随之从占位的 `ilp-plugins.pages.dev` 改为该域名，抽成
+`plugin_manager::DEFAULT_REGISTRY` 常量并加了断言字面量的测试——这个地址
+同时出现在 README、计划文档和默认值里，三处不一致时失败方式最隐蔽：
+安装照样成功，只是打到旧站点。
+
+用**不带任何环境变量**的默认配置实测：
+
+| 场景 | 结果 |
+|---|---|
+| `plugin install fanqie` | 退出码 0，装的产物与站点 sha256 一致 |
+| `plugin install fanqie@1.0.0` | 退出码 0 |
+| `plugin install fanqie@9.9.9` | 退出码 2，列出可用版本 |
+| `plugin install nope` | 退出码 2，列出可用插件 |
+| `plugin install ../evil` | 退出码 2，名字非法 |
+| 351 章 `get all` | **351 成功 / 0 失败**，PUA 0、HTML 0、空章 0 |
+| 幂等重跑 | `所有章节已下载`，退出码 0 |
+
 ## 遗留
 
-- Cloudflare Pages 项目尚未在 dashboard 里创建（需要一次性的 Git OAuth
-  授权，命令行无法代做）。见下方操作清单。
+- ~~Cloudflare Pages 项目尚未创建~~ — 已创建并绑定 `ilp.elysola.org`。
 - `ILP-Project/plugin-fanqie` 已被 `ILP-Project/plugins` 取代，尚未决定
   归档还是删除。
 
