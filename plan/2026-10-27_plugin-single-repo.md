@@ -253,11 +253,124 @@ git-fetch-with-cli = true
 - 追加字节 → 被 `size` 抓到（365474 → 365475）。
 - 等长改中间一个字节 → `size` 相同，被 `sha256` 抓到。
 
+### 7. Cloudflare Pages 构建镜像不含 Rust
+
+官方文档把 Rust 和 Swift 列在"默认不安装"里（`cloudflare/cloudflare-docs`
+issue #849 明确写了这件事）。原计划"CF 构建命令直接跑
+`python3 tools/build_site.py`"在 CF 上必然失败——它需要 `cargo` 和
+`wasm32-wasip2`。
+
+改成 **GitHub Actions 构建、CF 只托管 `site` 分支**：
+
+- `publish.yml` 装 wasm target → 回填上次产物 → `build_site.py` →
+  校验 → 推 `site` 分支；
+- CF Pages 监听 `site` 分支，构建命令留空，输出目录 `/`。
+
+这同时保住了"不需要 `CLOUDFLARE_API_TOKEN`"这个性质：只推分支，不调 API。
+
+### 8. 回填 `_site` 是版本不可变守卫的前置条件
+
+`publish.yml` 最不能省的一步是"把 `site` 分支的旧产物先 checkout 进
+`_site`，再构建"。原因：守卫靠比较 `_site` 里已有产物的 sha256，而 CI
+每次都是干净目录——不回填的话守卫永远不触发，改代码不升版本就会静默
+覆盖别人已装好的同名版本。
+
+本地实测（裸仓库模拟整个流程）：
+
+- 回填后改代码不升版本 → `错误: fanqie 1.0.0 已发布过，但产物内容不同
+  （afbe1a159674… → 5be401ba1b25…）`，退出码 1；
+- 升到 1.1.0 → 两个版本并存，`latest` 指向 1.1.0，1.0.0 仍可下载。
+
+### 9. 版本排序曾是字符串排序
+
+`versions` 用字符串倒序，`1.10.0` 会排在 `1.9.0` 前面；`latest` 也只是
+"这次构建的版本"，用旧版本号重新构建会把站点上的 latest 降回去。
+
+现在 `version_key()` 按数字分段比较（预发布版本排在同号正式版之前），
+`latest` 取所有已发布版本的最大值。CI 的校验步骤里也断言了这两点。
+
+### 10. `_site` 里 `git init` 的仓库没有 remote
+
+第一次真实运行死在 `'origin' does not appear to be a git repository`——
+`_site` 是被 `git init` 出来的全新仓库，从未配置远端。改成显式带 token
+推送完整 URL，不依赖 `actions/checkout` 留在外层仓库的 credential helper。
+
+## 落地状态（2026-10-28）
+
+- **已推送**：ILP `main` 18 个 commit + tag `abi-v0.1.0` 到
+  `https://github.com/ILP-Project/ILP.git`；plugins `main` 到
+  `https://github.com/ILP-Project/plugins.git`。
+- **干净环境验证通过**：删掉 `Cargo.lock` 和 `target`、无 `.cargo` 补丁
+  克隆 plugins，全量解析并锁定 `#750ad2f3`，组件头
+  `00 61 73 6d 0d 00 01 00`，宿主可加载 `FanqiePlugin v1.0.0`。
+- **CI 绿灯**：`ci` run 40714849372、`publish` run 40714849397 均 success。
+- **`site` 分支已产出**：6 个文件，`registry.json` 的 sha256 与分支内
+  产物一致（`541dac990bc951b8…`）。
+- **351 章 E2E 通过**：网络恢复后，用从 `site` 分支安装的插件跑完整
+  `get all`，**成功 351 章、失败 0 章**；PUA 残留 0、HTML 残留 0、空章节 0；
+  封面 `data/covers/部族荣光_7069948840148732967.jpg` 17.7K / 225×300；
+  重跑 `所有章节已下载`，退出码 0。
+
 ## 遗留
 
-- `abi-v0.1.0` tag 已在本地 ILP 仓库创建，**尚未推送**（该仓库还没有 remote）。
-  推送到 GitHub 是 plugins 仓库能干净构建的前置条件。
-- Cloudflare Pages 项目尚未在 dashboard 里创建。
+- Cloudflare Pages 项目尚未在 dashboard 里创建（需要一次性的 Git OAuth
+  授权，命令行无法代做）。见下方操作清单。
+- `ILP-Project/plugin-fanqie` 已被 `ILP-Project/plugins` 取代，尚未决定
+  归档还是删除。
+
+## Cloudflare Pages 操作清单
+
+命令行无法代做 dashboard 里的 Git 授权，需要手动点。全部只做一次。
+
+### 1. 创建项目
+
+Cloudflare Dashboard → Workers & Pages → Create → Pages → **Connect to Git**。
+
+- 授权 GitHub，选择仓库 **`ILP-Project/plugins`**。
+- 分支：**`site`**（不是 `main`）。
+
+### 2. 构建设置
+
+| 字段 | 值 |
+|---|---|
+| Framework preset | `None` |
+| Build command | **留空** |
+| Build output directory | **`/`** |
+| Root directory | 留空 |
+
+产物已经在 `site` 分支的根目录，CF 不需要再构建任何东西。
+
+### 3. 环境变量
+
+不需要。特别**不要**设 `CLOUDFLARE_API_TOKEN`——那条路径是给 wrangler
+直传用的，本方案走的是分支托管。
+
+### 4. 自定义域名（可选）
+
+默认域名是 `ilp-plugins.pages.dev`，正是宿主 `registry_base()` 的默认值，
+所以不改也能直接用。
+
+### 5. 验证
+
+项目建好后跑：
+
+```bash
+curl -s https://ilp-plugins.pages.dev/registry.json | head -c 200
+```
+
+应能看到 `{"schema": 1, ...}`。然后：
+
+```bash
+ilp plugin install fanqie        # 装 latest
+ilp plugin install fanqie@1.0.0  # 装指定版本
+```
+
+### 注意事项
+
+- **分支必须选 `site`**。选 `main` 会去构建源码仓库，而 CF 镜像没有
+  Rust，构建必然失败。
+- 每次 push `main` 后 `publish.yml` 会更新 `site` 分支，CF 自动重新部署。
+- `site` 分支由 CI 强推（`push -f`），**不要在上面手动提交**，会被覆盖。
 
 ## 参考
 
