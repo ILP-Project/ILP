@@ -336,8 +336,21 @@ issue #849 明确写了这件事）。原计划"CF 构建命令直接跑
 ## 遗留
 
 - ~~Cloudflare Pages 项目尚未创建~~ — 已创建并绑定 `ilp.elysola.org`。
-- `ILP-Project/plugin-fanqie` 已被 `ILP-Project/plugins` 取代，尚未决定
-  归档还是删除。
+- ~~`ILP-Project/plugin-fanqie` 已被 `ILP-Project/plugins` 取代，尚未决定
+  归档还是删除。~~ — **已删除**（远端本就不存在，删除的是本地目录）。
+  删除前按 patch-id 比对，确认全部 6 个 commit 的内容都已在 `plugins` 里，
+  工作区那三个未提交文件也与 `plugins/fanqie` 逐字节相同。
+
+## 删除 `plugin-fanqie` 时发现的陈旧产物问题
+
+`crates/ilp-host/src/e2e_tests.rs` 找的是 `ILP/target/wasm32-wasip2/release/
+ilp_plugin_fanqie.wasm`。插件自 `12d0e9e` 拆出去之后，这个路径**不会再有新
+产物**，但拆分前留下的那份一直在，于是一段时间里 e2e 对着过时二进制跑，
+绿灯是假的（旧产物 sha256 `7846000c…`，当前源码构建出 `afbe1a15…`）。
+
+现在先找兄弟目录 `plugins/target/…`，找不到才回退旧路径；跳过提示也改成
+指向 `ILP-Project/plugins`。把旧产物移走后重跑，8 个 e2e 测试仍通过，
+证明走的确实是 `plugins` 里的当前产物。
 
 ## Cloudflare Pages 操作清单
 
