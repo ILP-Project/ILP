@@ -22,6 +22,17 @@ pub struct Book {
 pub struct ChapterState {
     pub path: PathBuf,
     pub bytes: u64,
+    pub sha256: String,
+}
+
+pub struct BookLock {
+    path: PathBuf,
+}
+
+impl Drop for BookLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 pub struct Storage {
@@ -46,17 +57,22 @@ impl Storage {
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY (site_id, book_id)
             );
-            CREATE TABLE IF NOT EXISTS chapters (
+             CREATE TABLE IF NOT EXISTS chapters (
                 site_id    TEXT NOT NULL,
                 book_id    TEXT NOT NULL,
                 chapter_id TEXT NOT NULL,
                 path       TEXT NOT NULL,
                 status     TEXT NOT NULL,
                 bytes      INTEGER NOT NULL,
+                sha256     TEXT NOT NULL DEFAULT '',
                 mtime      INTEGER NOT NULL,
                 PRIMARY KEY (site_id, book_id, chapter_id)
-            );",
+             );",
         )?;
+        let _ = db.execute(
+            "ALTER TABLE chapters ADD COLUMN sha256 TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         Ok(Self {
             db,
             novels_dir,
@@ -176,13 +192,14 @@ impl Storage {
         let row = self
             .db
             .prepare(
-                "SELECT path, bytes FROM chapters
+                "SELECT path, bytes, sha256 FROM chapters
                  WHERE site_id = ?1 AND book_id = ?2 AND chapter_id = ?3 AND status = 'ok'",
             )?
             .query_row(params![site_id, book_id, chapter_id], |r| {
                 Ok(ChapterState {
                     path: PathBuf::from(r.get::<_, String>(0)?),
                     bytes: r.get::<_, i64>(1)? as u64,
+                    sha256: r.get::<_, String>(2)?,
                 })
             })
             .optional()?;
@@ -196,8 +213,13 @@ impl Storage {
             return false;
         };
         match std::fs::metadata(&state.path) {
-            Ok(meta) => meta.is_file() && meta.len() == state.bytes,
-            Err(_) => false,
+            Ok(meta) if meta.is_file() && meta.len() == state.bytes => {
+                state.sha256.is_empty()
+                    || file_sha256(&state.path)
+                        .map(|hash| hash == state.sha256)
+                        .unwrap_or(false)
+            }
+            _ => false,
         }
     }
 
@@ -219,7 +241,15 @@ impl Storage {
     ) -> Result<PathBuf> {
         let path = self.chapter_path(book_title, book_id, seq, chapter_title);
         atomic_write(&path, content.as_bytes())?;
-        self.record_chapter(site_id, book_id, chapter_id, &path, content.len() as u64)?;
+        let digest = sha256_bytes(content.as_bytes());
+        self.record_chapter(
+            site_id,
+            book_id,
+            chapter_id,
+            &path,
+            content.len() as u64,
+            &digest,
+        )?;
         Ok(path)
     }
 
@@ -230,15 +260,17 @@ impl Storage {
         chapter_id: &str,
         path: &Path,
         bytes: u64,
+        sha256: &str,
     ) -> Result<()> {
         self.db.execute(
             "INSERT INTO chapters
-                 (site_id, book_id, chapter_id, path, status, bytes, mtime)
-             VALUES (?1, ?2, ?3, ?4, 'ok', ?5, ?6)
+                 (site_id, book_id, chapter_id, path, status, bytes, sha256, mtime)
+             VALUES (?1, ?2, ?3, ?4, 'ok', ?5, ?6, ?7)
              ON CONFLICT(site_id, book_id, chapter_id) DO UPDATE SET
                  path   = excluded.path,
                  status = excluded.status,
                  bytes  = excluded.bytes,
+                 sha256 = excluded.sha256,
                  mtime  = excluded.mtime",
             params![
                 site_id,
@@ -246,6 +278,7 @@ impl Storage {
                 chapter_id,
                 path.to_string_lossy().to_string(),
                 bytes as i64,
+                sha256,
                 now_secs()
             ],
         )?;
@@ -281,6 +314,26 @@ impl Storage {
             .query_map(params![site_id, book_id], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    pub fn lock_book(&self, site_id: &str, book_id: &str) -> Result<BookLock> {
+        let lock_dir = self.novels_dir.join(".locks");
+        std::fs::create_dir_all(&lock_dir)?;
+        let path = lock_dir.join(format!("{}_{}.lock", sanitize(site_id), sanitize(book_id)));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                writeln!(file, "pid={}", std::process::id())?;
+                Ok(BookLock { path })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(anyhow::anyhow!(
+                "这本书正在被另一个进程下载: {site_id}/{book_id}"
+            )),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn save_cover(&self, book_title: &str, book_id: &str, data: &[u8]) -> Result<PathBuf> {
@@ -330,6 +383,16 @@ fn unique_tmp(dir: &Path, target: &Path) -> PathBuf {
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
     dir.join(format!(".{stem}.{}.{nanos}.tmp", std::process::id()))
+}
+
+fn sha256_bytes(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(data))
+}
+
+fn file_sha256(path: &Path) -> std::io::Result<String> {
+    let data = std::fs::read(path)?;
+    Ok(sha256_bytes(&data))
 }
 
 fn now_secs() -> i64 {

@@ -86,6 +86,7 @@ fn do_chapters(
         storage.save_cover(&book.title, book_id, &bytes)?;
     }
 
+    let _lock = storage.lock_book(site_id, book_id)?;
     fetch_all(plugin, storage, config, site_id, book_id, &book)
 }
 
