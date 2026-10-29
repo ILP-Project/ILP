@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Context, Result};
 use reqwest::blocking::{Client, ClientBuilder};
-use reqwest::{Method, NoProxy, Proxy};
+use reqwest::{redirect::Policy, Method, NoProxy, Proxy};
 
 use crate::engine::wit_types::{HttpHeader, HttpRequest, HttpResponse};
+use std::io::Read;
+use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -12,6 +14,8 @@ const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 const TIMEOUT_SECS: u64 = 30;
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_TEXT_BYTES: usize = 2 * 1024 * 1024;
 
 /// 每个请求最多再试几次（不含首次）。网络抖动与瞬时 5xx 都能靠它自愈。
 const MAX_RETRIES: u32 = 2;
@@ -37,6 +41,7 @@ pub fn init(proxy: Option<&str>, no_proxy: &[String]) -> Result<()> {
 fn build_client(proxy: Option<&str>, no_proxy: &[String]) -> Result<Client> {
     let mut builder: ClientBuilder = Client::builder()
         .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .redirect(Policy::none())
         .user_agent(USER_AGENT);
 
     let matcher = if no_proxy.is_empty() {
@@ -91,7 +96,9 @@ pub fn get_text(url: &str) -> Result<String> {
     if !resp.status().is_success() {
         return Err(anyhow!("HTTP 状态码 {}: {url}", resp.status()));
     }
-    resp.text().with_context(|| format!("读取响应失败: {url}"))
+    let bytes =
+        read_limited(resp, MAX_TEXT_BYTES).with_context(|| format!("读取响应失败: {url}"))?;
+    String::from_utf8(bytes).context("响应不是有效 UTF-8")
 }
 
 pub fn get_bytes(url: &str) -> Result<Vec<u8>> {
@@ -102,10 +109,9 @@ pub fn get_bytes(url: &str) -> Result<Vec<u8>> {
     if !resp.status().is_success() {
         return Err(anyhow!("HTTP 状态码 {}: {url}", resp.status()));
     }
-    let bytes = resp
-        .bytes()
-        .with_context(|| format!("读取响应失败: {url}"))?;
-    Ok(bytes.to_vec())
+    let bytes =
+        read_limited(resp, MAX_RESPONSE_BYTES).with_context(|| format!("读取响应失败: {url}"))?;
+    Ok(bytes)
 }
 
 /// 把插件给的请求发给对端，返回 WIT 形状的响应。
@@ -135,16 +141,66 @@ pub fn send(request: &HttpRequest) -> Result<HttpResponse> {
             value: v.to_str().unwrap_or_default().to_string(),
         })
         .collect();
-    let body = resp
-        .bytes()
-        .with_context(|| format!("读取响应失败: {}", request.url))?
-        .to_vec();
+    let body = read_limited(resp, MAX_RESPONSE_BYTES)
+        .with_context(|| format!("读取响应失败: {}", request.url))?;
 
     Ok(HttpResponse {
         status,
         headers,
         body,
     })
+}
+
+fn read_limited(response: reqwest::blocking::Response, limit: usize) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(anyhow!("HTTP response 过大: 超过 {limit} 字节"));
+    }
+    let mut body = Vec::new();
+    response
+        .take((limit + 1) as u64)
+        .read_to_end(&mut body)
+        .context("读取 HTTP 响应失败")?;
+    if body.len() > limit {
+        return Err(anyhow!("HTTP response 过大: 超过 {limit} 字节"));
+    }
+    Ok(body)
+}
+
+/// Reject destinations that must never be reachable by plugins.
+pub fn validate_plugin_url(url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url).context("invalid URL")?;
+    if parsed.scheme() != "https" {
+        return Err(anyhow!("只允许 HTTPS 请求"));
+    }
+    let host = parsed.host_str().ok_or_else(|| anyhow!("URL 缺少主机名"))?;
+    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
+        return Err(anyhow!("禁止访问 localhost"));
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        let forbidden = match ip {
+            IpAddr::V4(ip) => {
+                ip.is_loopback()
+                    || ip.is_private()
+                    || ip.is_link_local()
+                    || ip.is_unspecified()
+                    || ip.is_broadcast()
+                    || ip.is_documentation()
+            }
+            IpAddr::V6(ip) => {
+                ip.is_loopback()
+                    || ip.is_unspecified()
+                    || ip.is_unique_local()
+                    || ip.is_unicast_link_local()
+            }
+        };
+        if forbidden {
+            return Err(anyhow!("禁止访问内网或特殊 IP"));
+        }
+    }
+    Ok(())
 }
 
 /// 一次请求是否值得重试。
@@ -266,6 +322,14 @@ pub fn fetch_requests(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_private_and_redirect_urls() {
+        assert!(validate_plugin_url("https://127.0.0.1/api").is_err());
+        assert!(validate_plugin_url("https://localhost/api").is_err());
+        assert!(validate_plugin_url("http://example.com").is_err());
+        assert!(validate_plugin_url("https://example.com/api").is_ok());
+    }
 
     #[test]
     fn client_builds_with_default_no_proxy() {

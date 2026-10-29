@@ -320,6 +320,7 @@ impl legacy::ilp::plugin::host::Host for HostState {
         &mut self,
         request: legacy::ilp::plugin::host::HttpRequest,
     ) -> Result<legacy::ilp::plugin::host::HttpResponse, String> {
+        crate::http::validate_plugin_url(&request.url).map_err(|e| format!("{e:#}"))?;
         validate_legacy_http_request(&request)?;
         self.policy.allows_url(&request.url)?;
         let request = ilp::plugin::types::HttpRequest {
@@ -376,6 +377,7 @@ impl ilp::plugin::host::HostHttpHandle for HostState {
             .allows("http")
             .then_some(())
             .ok_or_else(|| "permission-denied: http".to_string())?;
+        crate::http::validate_plugin_url(&request.url).map_err(|e| format!("{e:#}"))?;
         validate_http_request(&request)?;
         self.policy.allows_url(&request.url)?;
         let response = crate::http::send(&request).map_err(|e| format!("{e:#}"))?;
