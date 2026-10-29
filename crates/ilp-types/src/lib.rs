@@ -10,6 +10,10 @@ pub struct PluginMetadata {
     pub plugin_name: String,
     pub plugin_id: String,
     pub version: String,
+    #[serde(default)]
+    pub permissions: Vec<String>,
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

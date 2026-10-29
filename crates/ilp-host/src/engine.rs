@@ -11,6 +11,77 @@ pub struct HttpCapability;
 pub struct StorageCapability;
 pub struct SecretCapability;
 
+#[derive(Clone, Debug)]
+struct CapabilityPolicy {
+    permissions: std::collections::HashSet<String>,
+    allowed_domains: Vec<String>,
+}
+
+impl CapabilityPolicy {
+    fn unrestricted() -> Self {
+        Self {
+            permissions: [
+                "http",
+                "clock",
+                "storage-read",
+                "storage-write",
+                "secret-read",
+                "secret-write",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            allowed_domains: Vec::new(),
+        }
+    }
+
+    fn allows(&self, permission: &str) -> bool {
+        self.permissions.contains(permission)
+    }
+
+    fn allows_url(&self, url: &str) -> Result<(), String> {
+        let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid-url: {e}"))?;
+        if parsed.scheme() != "https" {
+            return Err("permission-denied: only https is allowed".to_string());
+        }
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| "invalid-url: missing host".to_string())?;
+        if self.allowed_domains.is_empty()
+            || self
+                .allowed_domains
+                .iter()
+                .any(|domain| domain_matches(host, domain))
+        {
+            Ok(())
+        } else {
+            Err(format!("permission-denied: domain {host}"))
+        }
+    }
+}
+
+fn domain_matches(host: &str, domain: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let domain = domain
+        .trim()
+        .trim_start_matches("*.")
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
+fn permission_name(permission: current::ilp::plugin::types::Permission) -> String {
+    match permission {
+        current::ilp::plugin::types::Permission::Http => "http",
+        current::ilp::plugin::types::Permission::Clock => "clock",
+        current::ilp::plugin::types::Permission::StorageRead => "storage-read",
+        current::ilp::plugin::types::Permission::StorageWrite => "storage-write",
+        current::ilp::plugin::types::Permission::SecretRead => "secret-read",
+        current::ilp::plugin::types::Permission::SecretWrite => "secret-write",
+    }
+    .to_string()
+}
+
 mod current {
     wasmtime::component::bindgen!({
         world: "novel-plugin",
@@ -47,16 +118,22 @@ pub struct HostState {
     storage_dir: PathBuf,
     /// 内存里的 KV，落盘前先命中这里
     cache: HashMap<String, Vec<u8>>,
+    policy: CapabilityPolicy,
 }
 
 impl HostState {
     fn new(plugin_name: String, storage_dir: PathBuf) -> Self {
+        Self::with_policy(plugin_name, storage_dir, CapabilityPolicy::unrestricted())
+    }
+
+    fn with_policy(plugin_name: String, storage_dir: PathBuf, policy: CapabilityPolicy) -> Self {
         Self {
             ctx: WasiCtx::builder().build(),
             table: ResourceTable::new(),
             plugin_name,
             storage_dir,
             cache: HashMap::new(),
+            policy,
         }
     }
 }
@@ -98,22 +175,33 @@ impl HostTrait for HostState {
         &mut self,
         request: ilp::plugin::types::HttpRequest,
     ) -> Result<ilp::plugin::types::HttpResponse, String> {
+        self.policy.allows_url(&request.url)?;
         crate::http::send(&request).map_err(|e| format!("{e:#}"))
     }
 
     fn acquire_http(&mut self) -> Option<Resource<HttpCapability>> {
-        self.table.push(HttpCapability).ok()
+        self.policy
+            .allows("http")
+            .then(|| self.table.push(HttpCapability).ok())
+            .flatten()
     }
 
     fn acquire_storage(&mut self) -> Option<Resource<StorageCapability>> {
-        self.table.push(StorageCapability).ok()
+        (self.policy.allows("storage-read") || self.policy.allows("storage-write"))
+            .then(|| self.table.push(StorageCapability).ok())
+            .flatten()
     }
 
     fn acquire_secret(&mut self) -> Option<Resource<SecretCapability>> {
-        None
+        (self.policy.allows("secret-read") || self.policy.allows("secret-write"))
+            .then(|| self.table.push(SecretCapability).ok())
+            .flatten()
     }
 
     fn storage_get(&mut self, key: String) -> Option<Vec<u8>> {
+        if !self.policy.allows("storage-read") {
+            return None;
+        }
         if let Some(v) = self.cache.get(&key) {
             return Some(v.clone());
         }
@@ -129,6 +217,9 @@ impl HostTrait for HostState {
     }
 
     fn storage_set(&mut self, key: String, value: Vec<u8>) -> Result<(), String> {
+        if !self.policy.allows("storage-write") {
+            return Err("permission-denied: storage-write".to_string());
+        }
         if !is_safe_key(&key) {
             return Err(format!("非法 storage key: {key}"));
         }
@@ -139,6 +230,9 @@ impl HostTrait for HostState {
     }
 
     fn storage_delete(&mut self, key: String) -> Result<(), String> {
+        if !self.policy.allows("storage-write") {
+            return Err("permission-denied: storage-write".to_string());
+        }
         if !is_safe_key(&key) {
             return Err(format!("非法 storage key: {key}"));
         }
@@ -170,6 +264,7 @@ impl legacy::ilp::plugin::host::Host for HostState {
         &mut self,
         request: legacy::ilp::plugin::host::HttpRequest,
     ) -> Result<legacy::ilp::plugin::host::HttpResponse, String> {
+        self.policy.allows_url(&request.url)?;
         let request = ilp::plugin::types::HttpRequest {
             method: request.method,
             url: request.url,
@@ -219,6 +314,11 @@ impl ilp::plugin::host::HostHttpHandle for HostState {
         _handle: Resource<HttpCapability>,
         request: ilp::plugin::types::HttpRequest,
     ) -> Result<ilp::plugin::types::HttpResponse, String> {
+        self.policy
+            .allows("http")
+            .then_some(())
+            .ok_or_else(|| "permission-denied: http".to_string())?;
+        self.policy.allows_url(&request.url)?;
         crate::http::send(&request).map_err(|e| format!("{e:#}"))
     }
 
@@ -253,7 +353,11 @@ impl ilp::plugin::host::HostStorageHandle for HostState {
 }
 
 impl ilp::plugin::host::HostSecretHandle for HostState {
-    fn get(&mut self, _handle: Resource<SecretCapability>, _key: String) -> Option<Vec<u8>> {
+    fn get(&mut self, _handle: Resource<SecretCapability>, key: String) -> Option<Vec<u8>> {
+        if !self.policy.allows("secret-read") {
+            return None;
+        }
+        let _ = key;
         None
     }
 
@@ -290,6 +394,49 @@ fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, data)?;
     std::fs::rename(&tmp, path)
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn domain_matching_respects_label_boundaries() {
+        assert!(domain_matches("fanqienovel.com", "fanqienovel.com"));
+        assert!(domain_matches("api.fanqienovel.com", "*.fanqienovel.com"));
+        assert!(!domain_matches("evilfanqienovel.com", "fanqienovel.com"));
+        assert!(!domain_matches(
+            "fanqienovel.com.evil.test",
+            "fanqienovel.com"
+        ));
+    }
+
+    #[test]
+    fn policy_rejects_http_and_unlisted_domains() {
+        let policy = CapabilityPolicy {
+            permissions: ["http".to_string()].into_iter().collect(),
+            allowed_domains: vec!["fanqienovel.com".to_string()],
+        };
+        assert!(policy.allows_url("https://fanqienovel.com/page/1").is_ok());
+        assert!(policy.allows_url("http://fanqienovel.com/page/1").is_err());
+        assert!(policy.allows_url("https://evil.example/page/1").is_err());
+    }
+
+    #[test]
+    fn undeclared_capabilities_are_not_issued() {
+        let mut state = HostState::with_policy(
+            "test".to_string(),
+            PathBuf::from("/tmp/ilp-test-storage"),
+            CapabilityPolicy {
+                permissions: std::collections::HashSet::new(),
+                allowed_domains: Vec::new(),
+            },
+        );
+        assert!(state.acquire_http().is_none());
+        assert!(state.acquire_storage().is_none());
+        assert!(state.acquire_secret().is_none());
+        assert!(state.storage_set("key".to_string(), vec![1]).is_err());
+    }
 }
 
 /// 已加载的插件。
@@ -351,6 +498,12 @@ impl PluginInstance {
                     plugin_name: raw.plugin_name,
                     plugin_id: raw.plugin_id,
                     version: raw.version,
+                    permissions: raw.permissions.into_iter().map(permission_name).collect(),
+                    allowed_domains: raw.allowed_domains,
+                };
+                store.data_mut().policy = CapabilityPolicy {
+                    permissions: metadata.permissions.iter().cloned().collect(),
+                    allowed_domains: metadata.allowed_domains.clone(),
                 };
                 Self::finish(metadata, PluginBackend::Current { store, bindings })
             }
@@ -380,6 +533,8 @@ impl PluginInstance {
                     plugin_name: raw.plugin_name,
                     plugin_id: raw.plugin_id,
                     version: raw.version,
+                    permissions: Vec::new(),
+                    allowed_domains: Vec::new(),
                 };
                 Self::finish(metadata, PluginBackend::Legacy { store, bindings })
             }
