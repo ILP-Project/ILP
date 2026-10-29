@@ -126,6 +126,7 @@ pub struct HostState {
     /// 插件名，用于隔离 storage 命名空间
     plugin_name: String,
     storage_dir: PathBuf,
+    secret_dir: PathBuf,
     /// 内存里的 KV，落盘前先命中这里
     cache: HashMap<String, Vec<u8>>,
     policy: CapabilityPolicy,
@@ -134,15 +135,42 @@ pub struct HostState {
 
 impl HostState {
     fn new(plugin_name: String, storage_dir: PathBuf) -> Self {
-        Self::with_policy(plugin_name, storage_dir, CapabilityPolicy::unrestricted())
+        let secret_dir = storage_dir
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("secrets")
+            .join(&plugin_name);
+        Self::with_policy_and_secret(
+            plugin_name,
+            storage_dir,
+            secret_dir,
+            CapabilityPolicy::unrestricted(),
+        )
     }
 
+    #[cfg(test)]
     fn with_policy(plugin_name: String, storage_dir: PathBuf, policy: CapabilityPolicy) -> Self {
+        let plugin_name_for_secret = plugin_name.clone();
+        let secret_dir = storage_dir
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("secrets")
+            .join(plugin_name_for_secret);
+        Self::with_policy_and_secret(plugin_name, storage_dir, secret_dir, policy)
+    }
+
+    fn with_policy_and_secret(
+        plugin_name: String,
+        storage_dir: PathBuf,
+        secret_dir: PathBuf,
+        policy: CapabilityPolicy,
+    ) -> Self {
         Self {
             ctx: WasiCtx::builder().build(),
             table: ResourceTable::new(),
             plugin_name,
             storage_dir,
+            secret_dir,
             cache: HashMap::new(),
             policy,
             limits: StoreLimitsBuilder::new()
@@ -387,24 +415,42 @@ impl ilp::plugin::host::HostStorageHandle for HostState {
 
 impl ilp::plugin::host::HostSecretHandle for HostState {
     fn get(&mut self, _handle: Resource<SecretCapability>, key: String) -> Option<Vec<u8>> {
-        if !self.policy.allows("secret-read") {
+        if !self.policy.allows("secret-read") || !is_safe_key(&key) {
             return None;
         }
-        let _ = key;
-        None
+        std::fs::read(self.secret_dir.join(key)).ok()
     }
 
     fn set(
         &mut self,
         _handle: Resource<SecretCapability>,
-        _key: String,
-        _value: Vec<u8>,
+        key: String,
+        value: Vec<u8>,
     ) -> Result<(), String> {
-        Err("permission-denied: secret storage is not enabled".to_string())
+        if !self.policy.allows("secret-write") {
+            return Err("permission-denied: secret-write".to_string());
+        }
+        if !is_safe_key(&key) {
+            return Err("非法 secret key".to_string());
+        }
+        if value.len() > MAX_STORAGE_VALUE {
+            return Err(format!("secret value 过大: {} 字节", value.len()));
+        }
+        std::fs::create_dir_all(&self.secret_dir).map_err(|e| e.to_string())?;
+        let path = self.secret_dir.join(key);
+        atomic_write(&path, &value).map_err(|e| e.to_string())?;
+        restrict_secret_permissions(&path).map_err(|e| e.to_string())
     }
 
-    fn delete(&mut self, _handle: Resource<SecretCapability>, _key: String) -> Result<(), String> {
-        Err("permission-denied: secret storage is not enabled".to_string())
+    fn delete(&mut self, _handle: Resource<SecretCapability>, key: String) -> Result<(), String> {
+        if !self.policy.allows("secret-write") || !is_safe_key(&key) {
+            return Err("permission-denied: secret-write".to_string());
+        }
+        match std::fs::remove_file(self.secret_dir.join(key)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     fn drop(&mut self, handle: Resource<SecretCapability>) -> wasmtime::Result<()> {
@@ -486,6 +532,15 @@ fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+fn restrict_secret_permissions(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod security_tests {
     use super::*;
@@ -526,6 +581,46 @@ mod security_tests {
         assert!(state.acquire_storage().is_none());
         assert!(state.acquire_secret().is_none());
         assert!(state.storage_set("key".to_string(), vec![1]).is_err());
+    }
+
+    #[test]
+    fn secrets_are_isolated_and_permission_checked() {
+        let root = std::env::temp_dir().join(format!("ilp-secret-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut state = HostState::with_policy_and_secret(
+            "plugin-a".to_string(),
+            root.join("storage"),
+            root.join("secrets/plugin-a"),
+            CapabilityPolicy {
+                permissions: ["secret-read".to_string(), "secret-write".to_string()]
+                    .into_iter()
+                    .collect(),
+                allowed_domains: Vec::new(),
+            },
+        );
+        <HostState as ilp::plugin::host::HostSecretHandle>::set(
+            &mut state,
+            Resource::new_own(0),
+            "token".into(),
+            b"value".to_vec(),
+        )
+        .expect("写入 secret");
+        assert_eq!(
+            <HostState as ilp::plugin::host::HostSecretHandle>::get(
+                &mut state,
+                Resource::new_own(0),
+                "token".into()
+            ),
+            Some(b"value".to_vec())
+        );
+        assert!(<HostState as ilp::plugin::host::HostSecretHandle>::set(
+            &mut state,
+            Resource::new_own(0),
+            "../escape".into(),
+            vec![1]
+        )
+        .is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
