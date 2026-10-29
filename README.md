@@ -95,8 +95,8 @@ data/
 
 站点插件不在本仓库：统一放在 `ILP-Project/plugins`（一站点一子目录），
 产物经 Cloudflare Pages 的静态 registry 分发，默认地址
-`https://ilp.elysola.org`（`plugin_manager::DEFAULT_REGISTRY`），详见
-`plan/2026-10-27_plugin-single-repo.md`。
+`https://ilp.elysola.org`（`plugin_manager::DEFAULT_REGISTRY`）。
+路线图与设计决策在 `ILP-Project/plan/`（仓库之外，不进 git tree）。
 
 ## 已知限制
 

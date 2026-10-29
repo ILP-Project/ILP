@@ -7,13 +7,22 @@
 ## 已锁定决策（勿改）
 
 - **插件机制：WASM + wasmtime**（不是 native cdylib/libloading）。插件产物是 `.wasm`。
-- **范围：仅功能对齐，可重构存储**。`config.json`、`cache.db` schema、`txt` 分章 + `covers/` 目录布局均无需兼容旧版数据。
+- **范围：仅功能对齐，可重构存储**。`config.json`、旧 `cache.db` schema、`txt` 分章 + `covers/` 目录布局均无需兼容旧版数据。
+- **任务状态用 JSON manifest，不引入数据库**（旧计划里的 SQLite 方案已废）。
+- **插件安装按 registry 名 + 版本**：`ilp plugin install <name>[@<version>]`，
+  默认 registry `https://ilp.elysola.org`。`owner/repo` 形式已废。
+- **输出只做中文**，但用户可见字符串集中管理。
+
+> 完整路线图和 106 项设计决策见 `ILP-Project/plan/2026-10-29_roadmap.md`
+> （**在仓库之外**，不进 git tree）。本文只保留实现时必须知道的事实。
 
 ## WASM 插件模型的关键含义（易被忽略）
 
 - 插件是沙箱，不能直接发 HTTP、读写文件、用 SQLite。这些能力必须由宿主通过 WASI 或自定义 host function（imports）注入。
 - 因此网络请求、`sleep_time` 限速、`max_workers` 并发、进度判断（跳过已下载）、章节落盘等逻辑应**收敛到宿主**，而非像原版那样由 IPlugin 基类 + 各插件各自用 cpr 发请求。
-- 插件安装：`.wasm` 跨平台，`plugin.json` 里按 OS 区分的 `url` 映射可简化为单一产物 URL；但「拉 GitHub 上的 `plugin.json` 再下载产物」的安装流程应保留。
+- 插件安装：`.wasm` 跨平台，单一产物 URL；安装走静态 registry + ABI 预检 + size/sha256 校验。
+- **权限声明在 WIT `plugin-metadata` 里，registry 不参与**。真正安全边界是宿主在
+  每个 host function 调用点的策略检查，不是插件自己的声明。
 
 ## 需对齐的 CLI 与行为
 
@@ -21,7 +30,7 @@
 
 - `get chapter|cover|author|all <id> -s <site_id> [-f/--force_update]`
 - `search <keyword> -s <site_id>`（分页交互：`n` 翻页 / 数字跳转 / `q` 退出）
-- `plugin list|install <owner/repo>|uninstall|enable|disable <name>`
+- `plugin list|info|install <name>[@<version>]|uninstall|enable|disable <name>`
 - `version`
 
 `-s/--site_id` 需校验是否为已加载插件的 `site_id`（原版 `CLI::IsMember(site_ids)`）。
@@ -51,6 +60,54 @@
   `cargo build --target wasm32-wasip2 --release`
   产物 `target/wasm32-wasip2/release/ilp_plugin_fanqie.wasm` 复制到宿主的 `plugins/` 下。
 - `cargo test`、`cargo clippy --all-targets -- -D warnings`、`cargo fmt --check`
+
+## 番茄协议链（已端到端跑通，勿重新试错）
+
+```
+① 设备注册  POST i.snssdk.com/service/2/device_register/?tt_data=a
+   body = TT加密(JSON)，header: tt-data=a, UA: okhttp/4.10.0
+   TT加密 = magic[116,99,5,16,0,0] ‖ rand32 ‖ AES-128-CBC(
+                key=sha512(sha512(rand32)‖FIXED)[0..16],
+                iv =sha512(sha512(rand32)‖FIXED)[16..32],
+                sha512(gzip(json)) ‖ gzip(json))
+   → device_id / install_id / device_token
+
+② 密钥注册  POST reading.snssdk.com/reading/crypt/registerkey
+   明文 = reverse(device_id 大端16字节)[0..8]
+   body = gzip(JSON{content: b64(iv16 ‖ AES-256-CBC(shared_key, iv, 明文))})
+   需 x-argus + x-ladon + x-khronos + x-ss-req-ticket + X-SS-STUB(md5(body))
+   → key(16B 实测) / keyver
+
+③ 正文  GET reading.snssdk.com/reading/reader/{full,batch_full}/v
+   data.content = b64(iv16 ‖ AES-128-CBC(key, iv, 密文))
+   compress_status==1 → gunzip → XHTML 或 JSON
+```
+
+`FIXED` 盐值（base64）：
+`TdTC5rgxYgkOUrPHpnM7pByyRiuCmrWKGWs521cXdST0m69/COjWjSanLjfBqVovHwWlGJKu8pSXMrYqOKrdWA==`
+
+**四处反直觉的坑（都是实测打脸的）**：
+
+- 正文密钥是 **16 字节 AES-128**，不是 32 字节 AES-256。
+- `FIXED` 抄错两个字节，服务端**静默**回 `device_id=0`（HTTP 仍 200）。
+- 设备上报缺 `ipv6_list` 即被拒，同样是 200 + `device_id=0`。
+- `now_ms` 必须是 UTC epoch 毫秒，不能用单调时钟。
+
+**限流实测**：背靠背连发只回 1 章；间隔 ≥3 s 回满 30 章。351 章 = 12 批 ≈ 36 秒。
+服务端触发限流时会**静默少返回章节**（一批 30 章只回 29 章不报错），
+必须检测缺失并逐章单章重试，否则产出带洞的书。
+
+**正文通道唯一性**：网页阅读页已被风控整体封掉（返回验证码中间页），
+与并发/UA/Referer 无关；APP 网关是唯一可用正文通道。目录 API 与书籍页仍免签名可用。
+
+**搜索响应结构**：书籍列表不在 `data.search_tab_data`，而在顶层 `search_tabs`
+数组中 `tab_type == 3` 的那个 tab，条目正文在 `book_data[0]`，分页凭据是该 tab
+自己的 `passback` / `search_id`。
+
+**字体码表**：区间 `0xe3e8`(58344) .. `0xe55b`(58715)，共 372 码点，`?` 表示空位。
+静态码表（非轮廓匹配）；长度不符时宁可不解密，直接返回原文。
+
+**代理**：`https_proxy` 会让 `i.snssdk.com` TLS RST/EOF，必须直连。
 
 ## 原版已知问题（重写时规避）
 
