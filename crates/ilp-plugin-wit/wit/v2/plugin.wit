@@ -1,0 +1,246 @@
+/// ILP 插件接口 0.2.0。
+///
+/// 相对 0.1.0 的变化：
+/// - 新增 `permission` 枚举与 metadata 的 `permissions` 字段：插件必须声明
+///   自己要哪些能力，宿主按用户策略发放，不再"一律全给"。
+/// - 新增 `allowed-domains`：网络访问的基础域名声明。
+/// - 正文抓取结果从 `chapter-content` 换成 `chapter-result`：带结构化状态。
+///   以前的 ABI 只能表达"成功"或"这个任务失败"，无法区分验证码、锁定、
+///   需要登录这些情况，宿主只能一律重试或一律放弃，两种都不对。
+/// - 章节条目新增 `order-key`：站点目录顺序与章节 id 不总是等价，
+///   排序语义必须显式传递，而不是让宿主猜。
+/// - capability handle：宿主通过 `acquire-*` 发放能力句柄。
+///
+/// 关于 handle 的方向：设计讨论里曾设想由插件在 `init` 里返回
+/// `option<handle>`。这在 Component Model 里做不到——guest 无法构造宿主
+/// 资源句柄（宿主侧该类型是空 enum，没有构造器，也没有 `new`）。
+/// 因此改为宿主单向下发：拿不到就是 `none`，插件据此降级。
+package ilp:plugin@0.2.0;
+
+/// 插件可申请的能力。
+///
+/// 用固定枚举而不是字符串：未知权限必须显式失败，不能被宿主静默忽略。
+/// 拼错一个权限名就等于悄悄少给一项能力，那种 bug 极难发现。
+interface types {
+  enum permission {
+    /// 发起 HTTP 请求
+    http,
+    /// 读取当前时间
+    clock,
+    /// 读取插件私有普通存储
+    storage-read,
+    /// 写入插件私有普通存储
+    storage-write,
+    /// 读取敏感凭据（Cookie / Token / 设备密钥）
+    secret-read,
+    /// 写入敏感凭据
+    secret-write,
+  }
+
+  /// 章节正文抓取的结构化状态。
+  ///
+  /// 宿主只在 `ok` 时写文件；其余状态进 manifest 与报告，
+  /// 并按 `retryable` 决定是否重新排队。
+  enum chapter-status {
+    /// 正常拿到正文
+    ok,
+    /// 站点提示章节被锁定（未购买 / 到期 / 仅 App 内可读）
+    locked,
+    /// 命中验证码或人机校验中间页
+    captcha,
+    /// 需要登录或凭据已失效
+    auth-required,
+    /// 章节已不存在
+    not-found,
+    /// 服务端返回了内容，但不是正文（错误页、空壳、风控页）
+    invalid,
+    /// 其他失败
+    error,
+  }
+
+  /// 章节目录条目。
+  record chapter-entry {
+    id: string,
+    title: string,
+    /// 阅读页地址
+    url: string,
+    /// 内容获取地址（网页型插件即正文页；批量型插件可留空）
+    fetch-url: string,
+    /// 更新时间（Unix 秒）
+    update-time: s64,
+    /// 排序键。站点用它表达真实展示顺序；空字符串表示按目录位置排。
+    ///
+    /// 不能只靠 id 排序：有的站点 id 是递增的，有的是哈希，有的插章后
+    /// id 比后续章节还小。排序语义必须由插件给出。
+    order-key: string,
+  }
+
+  /// 搜索结果条目。
+  record search-result {
+    id: string,
+    title: string,
+    author: string,
+    /// 封面地址，可能为空
+    cover-url: string,
+    /// 简介摘要
+    description: string,
+  }
+
+  record plugin-metadata {
+    /// 插件编译时依据的 ABI 版本。宿主在加载阶段比对，
+    /// 不匹配直接拒绝，避免"加载成功、某次调用才炸"。
+    abi-version: string,
+    site-name: string,
+    site-id: string,
+    site-domain: string,
+    plugin-name: string,
+    plugin-id: string,
+    version: string,
+    /// 插件申请的能力。
+    ///
+    /// 这是"申请"不是"授权"：真正是否发放由宿主按用户策略决定。
+    /// registry 里记录的权限只用于审核与展示，不能当作安全边界——
+    /// 恶意插件完全可以在 metadata 里少写几项，运行时再去调。
+    permissions: list<permission>,
+    /// 允许访问的域名。空列表表示不作域名限制（宿主仍受全局策略约束）。
+    ///
+    /// 注意：当前实现只校验首个请求的目标域名，重定向会被自动跟随。
+    /// 也就是说它约束的是"起点"，不是沙箱。
+    allowed-domains: list<string>,
+  }
+
+  record http-header {
+    name: string,
+    value: string,
+  }
+
+  /// 宿主代发的请求。
+  record http-request {
+    method: string,
+    url: string,
+    headers: list<http-header>,
+    body: option<list<u8>>,
+  }
+
+  /// 宿主回传的响应。
+  record http-response {
+    status: u16,
+    headers: list<http-header>,
+    body: list<u8>,
+  }
+
+  /// 一个抓取任务。id 用于把响应与请求对应回去。
+  record fetch-task {
+    id: string,
+    request: http-request,
+  }
+
+  /// 一章的抓取结果。
+  record chapter-result {
+    id: string,
+    title: string,
+    status: chapter-status,
+    /// 仅 `ok` 时给正文
+    text: option<string>,
+    /// 稳定错误分类，供脚本与重试策略使用（如 `rate-limit`、`auth`）。
+    /// `ok` 时为空串。
+    error-code: string,
+    /// 是否值得重试。宿主不会自作主张重试 `locked` 之类必然失败的章节。
+    retryable: bool,
+    /// 给用户看的提示，可为空。不含敏感信息。
+    message: option<string>,
+  }
+
+  /// 一页搜索结果。
+  ///
+  /// 分页是游标式的，不是 offset 式的：番茄的搜索接口会直接忽略 offset
+  /// 参数，必须把上一页返回的 cursor 原样带回去才能翻到下一页。
+  /// 宿主因此只能"下一页/上一页"，无法跳到任意页。
+  record search-page {
+    results: list<search-result>,
+    /// 下一页游标；has-more 为 false 时无意义
+    cursor: string,
+    has-more: bool,
+  }
+}
+
+/// 宿主提供给插件的能力。
+///
+/// 能力不是无条件可用的：插件必须先用 `acquire-*` 拿到句柄，
+/// 宿主按该插件的权限策略决定给不给。
+interface host {
+  use types.{http-request, http-response};
+
+  /// 发送请求的能力句柄。
+  resource http-handle {
+    /// 同步 HTTP。宿主统一处理代理、超时、UA。
+    fetch: func(request: http-request) -> result<http-response, string>;
+  }
+
+  /// 插件私有普通存储句柄。
+  resource storage-handle {
+    get: func(key: string) -> option<list<u8>>;
+    set: func(key: string, value: list<u8>) -> result<_, string>;
+    delete: func(key: string) -> result<_, string>;
+  }
+
+  /// 敏感凭据句柄。
+  resource secret-handle {
+    get: func(key: string) -> option<list<u8>>;
+    set: func(key: string, value: list<u8>) -> result<_, string>;
+    delete: func(key: string) -> result<_, string>;
+  }
+
+  /// 申请网络能力。没有 `http` 权限时返回 `none`。
+  acquire-http: func() -> option<http-handle>;
+  /// 申请普通存储能力。没有相应读/写权限时返回 `none`。
+  acquire-storage: func() -> option<storage-handle>;
+  /// 申请凭据能力。没有相应读/写权限时返回 `none`。
+  acquire-secret: func() -> option<secret-handle>;
+
+  /// 写日志。level: 0=error 1=warn 2=info 3=debug 4=trace
+  log: func(level: u8, message: string);
+
+  /// 当前 UTC epoch 毫秒（插件沙箱里没有系统时钟）。
+  now-ms: func() -> u64;
+}
+
+/// 插件必须实现的接口。
+interface plugin {
+  use types.{
+    chapter-entry, chapter-result, fetch-task, http-response, plugin-metadata,
+    search-page,
+  };
+
+  /// 元数据，加载时调用一次。
+  metadata: func() -> plugin-metadata;
+
+  /// 绑定小说并预热（可能触发一次目录抓取）。
+  init: func(book-id: string, force-update: bool) -> result<_, string>;
+
+  title: func() -> result<string, string>;
+  author: func() -> result<string, string>;
+  cover-url: func() -> result<string, string>;
+  description: func() -> result<string, string>;
+
+  /// 章节目录。
+  catalog: func(force-update: bool) -> result<list<chapter-entry>, string>;
+
+  /// 搜索。cursor 为空表示取第一页，否则原样传入上一页返回的 cursor。
+  search: func(keyword: string, cursor: string) -> result<search-page, string>;
+
+  /// 第一阶段：给定章节 id，产出要发的请求。
+  /// 批量站点一次返回一个任务覆盖多章，网页站点每章一个任务。
+  plan-fetch: func(chapter-ids: list<string>) -> result<list<fetch-task>, string>;
+
+  /// 第二阶段：把响应交回来，插件解密/解析成结果。
+  ///
+  /// 每一章都必须在返回值里出现一次，即使是失败也要带状态；
+  /// 静默少返回会被宿主当成"服务端限流"，进而触发逐章重试。
+  consume-fetch: func(task-id: string, response: http-response) -> result<list<chapter-result>, string>;
+}
+
+world novel-plugin {
+  import host;
+  export plugin;
+}
