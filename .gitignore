@@ -4,3 +4,6 @@
 /data
 /plugins/*.wasm
 result
+
+# 计划文档在仓库之外，见 ILP-Project/plan/
+/plan
