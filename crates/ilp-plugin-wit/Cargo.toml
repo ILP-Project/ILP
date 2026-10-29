@@ -1,6 +1,6 @@
 [package]
 name = "ilp-plugin-wit"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "ILP 插件 WIT 接口定义（宿主与插件共享的唯一来源）"
 license = "GPL-3.0-or-later"

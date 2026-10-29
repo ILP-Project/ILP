@@ -3,19 +3,38 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use wasmtime::component::{Component, Linker};
+use wasmtime::component::{Component, Linker, Resource};
 use wasmtime::{Engine, Store};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxView, WasiView};
 
-wasmtime::component::bindgen!({
-    world: "novel-plugin",
-    path: "../ilp-plugin-wit/wit/v1",
-});
+pub struct HttpCapability;
+pub struct StorageCapability;
+pub struct SecretCapability;
 
-use ilp::plugin::host::Host as HostTrait;
-use ilp::plugin::types::{FetchTask, HttpResponse};
+mod current {
+    wasmtime::component::bindgen!({
+        world: "novel-plugin",
+        path: "../ilp-plugin-wit/wit/v2",
+        with: {
+            "ilp:plugin/host.http-handle": super::HttpCapability,
+            "ilp:plugin/host.storage-handle": super::StorageCapability,
+            "ilp:plugin/host.secret-handle": super::SecretCapability,
+        },
+    });
+}
 
-pub use ilp::plugin::types as wit_types;
+mod legacy {
+    wasmtime::component::bindgen!({
+        world: "novel-plugin",
+        path: "../ilp-plugin-wit/wit/v1",
+    });
+}
+
+use current::ilp;
+use current::ilp::plugin::host::Host as HostTrait;
+use current::ilp::plugin::types::{FetchTask, HttpResponse};
+
+pub use current::ilp::plugin::types as wit_types;
 
 use ilp_types::{ChapterContent, ChapterEntry, PluginMetadata, SearchResult};
 
@@ -77,16 +96,21 @@ impl HostTrait for HostState {
 
     fn http_fetch(
         &mut self,
-        request: ilp::plugin::host::HttpRequest,
-    ) -> Result<ilp::plugin::host::HttpResponse, String> {
-        let req = ilp::plugin::types::HttpRequest {
-            method: request.method,
-            url: request.url,
-            headers: request.headers,
-            body: request.body,
-        };
-        let resp = crate::http::send(&req).map_err(|e| format!("{e:#}"))?;
-        Ok(resp)
+        request: ilp::plugin::types::HttpRequest,
+    ) -> Result<ilp::plugin::types::HttpResponse, String> {
+        crate::http::send(&request).map_err(|e| format!("{e:#}"))
+    }
+
+    fn acquire_http(&mut self) -> Option<Resource<HttpCapability>> {
+        self.table.push(HttpCapability).ok()
+    }
+
+    fn acquire_storage(&mut self) -> Option<Resource<StorageCapability>> {
+        self.table.push(StorageCapability).ok()
+    }
+
+    fn acquire_secret(&mut self) -> Option<Resource<SecretCapability>> {
+        None
     }
 
     fn storage_get(&mut self, key: String) -> Option<Vec<u8>> {
@@ -130,6 +154,128 @@ impl HostTrait for HostState {
 
 impl ilp::plugin::types::Host for HostState {}
 
+impl legacy::ilp::plugin::host::Host for HostState {
+    fn log(&mut self, level: u8, message: String) {
+        level_to_tracing(level, &self.plugin_name, &message);
+    }
+
+    fn now_ms(&mut self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn http_fetch(
+        &mut self,
+        request: legacy::ilp::plugin::host::HttpRequest,
+    ) -> Result<legacy::ilp::plugin::host::HttpResponse, String> {
+        let request = ilp::plugin::types::HttpRequest {
+            method: request.method,
+            url: request.url,
+            headers: request
+                .headers
+                .into_iter()
+                .map(|h| ilp::plugin::types::HttpHeader {
+                    name: h.name,
+                    value: h.value,
+                })
+                .collect(),
+            body: request.body,
+        };
+        let resp = crate::http::send(&request).map_err(|e| format!("{e:#}"))?;
+        Ok(legacy::ilp::plugin::host::HttpResponse {
+            status: resp.status,
+            headers: resp
+                .headers
+                .into_iter()
+                .map(|h| legacy::ilp::plugin::types::HttpHeader {
+                    name: h.name,
+                    value: h.value,
+                })
+                .collect(),
+            body: resp.body,
+        })
+    }
+
+    fn storage_get(&mut self, key: String) -> Option<Vec<u8>> {
+        <HostState as current::ilp::plugin::host::Host>::storage_get(self, key)
+    }
+
+    fn storage_set(&mut self, key: String, value: Vec<u8>) -> Result<(), String> {
+        <HostState as current::ilp::plugin::host::Host>::storage_set(self, key, value)
+    }
+
+    fn storage_delete(&mut self, key: String) -> Result<(), String> {
+        <HostState as current::ilp::plugin::host::Host>::storage_delete(self, key)
+    }
+}
+
+impl legacy::ilp::plugin::types::Host for HostState {}
+
+impl ilp::plugin::host::HostHttpHandle for HostState {
+    fn fetch(
+        &mut self,
+        _handle: Resource<HttpCapability>,
+        request: ilp::plugin::types::HttpRequest,
+    ) -> Result<ilp::plugin::types::HttpResponse, String> {
+        crate::http::send(&request).map_err(|e| format!("{e:#}"))
+    }
+
+    fn drop(&mut self, handle: Resource<HttpCapability>) -> wasmtime::Result<()> {
+        self.table.delete(handle)?;
+        Ok(())
+    }
+}
+
+impl ilp::plugin::host::HostStorageHandle for HostState {
+    fn get(&mut self, _handle: Resource<StorageCapability>, key: String) -> Option<Vec<u8>> {
+        <HostState as current::ilp::plugin::host::Host>::storage_get(self, key)
+    }
+
+    fn set(
+        &mut self,
+        _handle: Resource<StorageCapability>,
+        key: String,
+        value: Vec<u8>,
+    ) -> Result<(), String> {
+        <HostState as current::ilp::plugin::host::Host>::storage_set(self, key, value)
+    }
+
+    fn delete(&mut self, _handle: Resource<StorageCapability>, key: String) -> Result<(), String> {
+        <HostState as current::ilp::plugin::host::Host>::storage_delete(self, key)
+    }
+
+    fn drop(&mut self, handle: Resource<StorageCapability>) -> wasmtime::Result<()> {
+        self.table.delete(handle)?;
+        Ok(())
+    }
+}
+
+impl ilp::plugin::host::HostSecretHandle for HostState {
+    fn get(&mut self, _handle: Resource<SecretCapability>, _key: String) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn set(
+        &mut self,
+        _handle: Resource<SecretCapability>,
+        _key: String,
+        _value: Vec<u8>,
+    ) -> Result<(), String> {
+        Err("permission-denied: secret storage is not enabled".to_string())
+    }
+
+    fn delete(&mut self, _handle: Resource<SecretCapability>, _key: String) -> Result<(), String> {
+        Err("permission-denied: secret storage is not enabled".to_string())
+    }
+
+    fn drop(&mut self, handle: Resource<SecretCapability>) -> wasmtime::Result<()> {
+        self.table.delete(handle)?;
+        Ok(())
+    }
+}
+
 fn is_safe_key(key: &str) -> bool {
     !key.is_empty()
         && key.len() <= 128
@@ -149,8 +295,18 @@ fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
 /// 已加载的插件。
 pub struct PluginInstance {
     pub metadata: PluginMetadata,
-    store: Store<HostState>,
-    bindings: NovelPlugin,
+    backend: PluginBackend,
+}
+
+enum PluginBackend {
+    Current {
+        store: Store<HostState>,
+        bindings: current::NovelPlugin,
+    },
+    Legacy {
+        store: Store<HostState>,
+        bindings: legacy::NovelPlugin,
+    },
 }
 
 impl PluginInstance {
@@ -158,56 +314,88 @@ impl PluginInstance {
         let engine = Engine::default();
         let component = Component::from_file(&engine, path)
             .map_err(|e| anyhow!("读取组件失败 {}: {e}", path.display()))?;
-
+        let version = component
+            .component_type()
+            .exports(&engine)
+            .find_map(|(name, _)| name.strip_prefix("ilp:plugin/plugin@").map(str::to_string))
+            .ok_or_else(|| anyhow!("组件 {} 没有导出 ilp:plugin/plugin", path.display()))?;
         let name = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("plugin")
             .to_string();
+        match version.as_str() {
+            "0.2.0" => {
+                let mut linker = Linker::new(&engine);
+                wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
+                    .map_err(|e| anyhow!("注册 WASI p2 失败: {e}"))?;
+                current::NovelPlugin::add_to_linker::<
+                    HostState,
+                    wasmtime::component::HasSelf<HostState>,
+                >(&mut linker, |s| s)?;
+                let mut store = Store::new(
+                    &engine,
+                    HostState::new(name.clone(), storage_root.join(&name)),
+                );
+                let bindings = current::NovelPlugin::instantiate(&mut store, &component, &linker)
+                    .map_err(|e| anyhow!("实例化插件失败 {}: {e}", path.display()))?;
+                let raw = bindings
+                    .ilp_plugin_plugin()
+                    .call_metadata(&mut store)
+                    .map_err(|e| anyhow!("调用插件 metadata 失败: {e}"))?;
+                let metadata = PluginMetadata {
+                    abi_version: raw.abi_version,
+                    site_name: raw.site_name,
+                    site_id: raw.site_id,
+                    site_domain: raw.site_domain,
+                    plugin_name: raw.plugin_name,
+                    plugin_id: raw.plugin_id,
+                    version: raw.version,
+                };
+                Self::finish(metadata, PluginBackend::Current { store, bindings })
+            }
+            "0.1.0" => {
+                let mut linker = Linker::new(&engine);
+                wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
+                    .map_err(|e| anyhow!("注册 WASI p2 失败: {e}"))?;
+                legacy::NovelPlugin::add_to_linker::<
+                    HostState,
+                    wasmtime::component::HasSelf<HostState>,
+                >(&mut linker, |s| s)?;
+                let mut store = Store::new(
+                    &engine,
+                    HostState::new(name.clone(), storage_root.join(&name)),
+                );
+                let bindings = legacy::NovelPlugin::instantiate(&mut store, &component, &linker)
+                    .map_err(|e| anyhow!("实例化旧版插件失败 {}: {e}", path.display()))?;
+                let raw = bindings
+                    .ilp_plugin_plugin()
+                    .call_metadata(&mut store)
+                    .map_err(|e| anyhow!("调用旧版插件 metadata 失败: {e}"))?;
+                let metadata = PluginMetadata {
+                    abi_version: raw.abi_version,
+                    site_name: raw.site_name,
+                    site_id: raw.site_id,
+                    site_domain: raw.site_domain,
+                    plugin_name: raw.plugin_name,
+                    plugin_id: raw.plugin_id,
+                    version: raw.version,
+                };
+                Self::finish(metadata, PluginBackend::Legacy { store, bindings })
+            }
+            other => Err(anyhow!("插件 ABI 版本 {other} 不受支持")),
+        }
+    }
 
-        let mut linker: Linker<HostState> = Linker::new(&engine);
-        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
-            .map_err(|e| anyhow!("注册 WASI p2 失败: {e}"))?;
-        NovelPlugin::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
-            &mut linker,
-            |s: &mut HostState| s,
-        )?;
-
-        let state = HostState::new(name.clone(), storage_root.join(&name));
-        let mut store = Store::new(&engine, state);
-        let bindings = NovelPlugin::instantiate(&mut store, &component, &linker)
-            .map_err(|e| anyhow!("实例化插件失败 {}: {e}", path.display()))?;
-
-        let raw = bindings
-            .ilp_plugin_plugin()
-            .call_metadata(&mut store)
-            .map_err(|e| anyhow!("调用插件 metadata 失败: {e}"))?;
-        let metadata = PluginMetadata {
-            abi_version: raw.abi_version.clone(),
-            site_name: raw.site_name,
-            site_id: raw.site_id,
-            site_domain: raw.site_domain,
-            plugin_name: raw.plugin_name,
-            plugin_id: raw.plugin_id,
-            version: raw.version,
-        };
-
-        // ABI 不匹配必须在这里挡住。否则插件能"加载成功"，
-        // 然后在某个具体调用的参数编解码里炸出一个与真实原因无关的错误。
-        if metadata.abi_version != crate::plugin_manager::SUPPORTED_ABI {
+    fn finish(metadata: PluginMetadata, backend: PluginBackend) -> Result<Self> {
+        if metadata.abi_version != "0.1.0" && metadata.abi_version != "0.2.0" {
             return Err(anyhow!(
-                "插件 {} 的 ABI 版本为 {}，本版本 ilp 支持 {}。请升级插件或 ilp",
+                "插件 {} 的 ABI 版本 {} 不受支持",
                 metadata.plugin_name,
-                metadata.abi_version,
-                crate::plugin_manager::SUPPORTED_ABI
+                metadata.abi_version
             ));
         }
-
-        Ok(Self {
-            metadata,
-            store,
-            bindings,
-        })
+        Ok(Self { metadata, backend })
     }
 
     pub fn site_id(&self) -> &str {
@@ -215,78 +403,136 @@ impl PluginInstance {
     }
 
     pub fn init(&mut self, book_id: &str, force_update: bool) -> Result<()> {
-        let g = self.bindings.ilp_plugin_plugin();
-        g.call_init(&mut self.store, book_id, force_update)
-            .map_err(|e| anyhow!("plugin::{e}"))?
-            .map_err(|e| anyhow!("plugin::{e}"))
+        match &mut self.backend {
+            PluginBackend::Current { store, bindings } => bindings
+                .ilp_plugin_plugin()
+                .call_init(store, book_id, force_update)
+                .map_err(|e| anyhow!("plugin::{e}"))?
+                .map_err(|e| anyhow!("plugin::{e}")),
+            PluginBackend::Legacy { store, bindings } => bindings
+                .ilp_plugin_plugin()
+                .call_init(store, book_id, force_update)
+                .map_err(|e| anyhow!("plugin::{e}"))?
+                .map_err(|e| anyhow!("plugin::{e}")),
+        }
     }
 
     pub fn title(&mut self) -> Result<String> {
-        let g = self.bindings.ilp_plugin_plugin();
-        g.call_title(&mut self.store)
-            .map_err(|e| anyhow!("plugin::{e}"))?
-            .map_err(|e| anyhow!("plugin::{e}"))
+        match &mut self.backend {
+            PluginBackend::Current { store, bindings } => bindings
+                .ilp_plugin_plugin()
+                .call_title(store)
+                .map_err(|e| anyhow!("plugin::{e}"))?
+                .map_err(|e| anyhow!("plugin::{e}")),
+            PluginBackend::Legacy { store, bindings } => bindings
+                .ilp_plugin_plugin()
+                .call_title(store)
+                .map_err(|e| anyhow!("plugin::{e}"))?
+                .map_err(|e| anyhow!("plugin::{e}")),
+        }
     }
 
     pub fn author(&mut self) -> Result<String> {
-        let g = self.bindings.ilp_plugin_plugin();
-        g.call_author(&mut self.store)
-            .map_err(|e| anyhow!("plugin::{e}"))?
-            .map_err(|e| anyhow!("plugin::{e}"))
+        match &mut self.backend {
+            PluginBackend::Current { store, bindings } => bindings
+                .ilp_plugin_plugin()
+                .call_author(store)
+                .map_err(|e| anyhow!("plugin::{e}"))?
+                .map_err(|e| anyhow!("plugin::{e}")),
+            PluginBackend::Legacy { store, bindings } => bindings
+                .ilp_plugin_plugin()
+                .call_author(store)
+                .map_err(|e| anyhow!("plugin::{e}"))?
+                .map_err(|e| anyhow!("plugin::{e}")),
+        }
     }
 
     pub fn cover_url(&mut self) -> Result<String> {
-        let g = self.bindings.ilp_plugin_plugin();
-        g.call_cover_url(&mut self.store)
-            .map_err(|e| anyhow!("plugin::{e}"))?
-            .map_err(|e| anyhow!("plugin::{e}"))
+        match &mut self.backend {
+            PluginBackend::Current { store, bindings } => bindings
+                .ilp_plugin_plugin()
+                .call_cover_url(store)
+                .map_err(|e| anyhow!("plugin::{e}"))?
+                .map_err(|e| anyhow!("plugin::{e}")),
+            PluginBackend::Legacy { store, bindings } => bindings
+                .ilp_plugin_plugin()
+                .call_cover_url(store)
+                .map_err(|e| anyhow!("plugin::{e}"))?
+                .map_err(|e| anyhow!("plugin::{e}")),
+        }
     }
 
     pub fn description(&mut self) -> Result<String> {
-        let g = self.bindings.ilp_plugin_plugin();
-        g.call_description(&mut self.store)
-            .map_err(|e| anyhow!("plugin::{e}"))?
-            .map_err(|e| anyhow!("plugin::{e}"))
+        match &mut self.backend {
+            PluginBackend::Current { store, bindings } => bindings
+                .ilp_plugin_plugin()
+                .call_description(store)
+                .map_err(|e| anyhow!("plugin::{e}"))?
+                .map_err(|e| anyhow!("plugin::{e}")),
+            PluginBackend::Legacy { store, bindings } => bindings
+                .ilp_plugin_plugin()
+                .call_description(store)
+                .map_err(|e| anyhow!("plugin::{e}"))?
+                .map_err(|e| anyhow!("plugin::{e}")),
+        }
     }
 
     pub fn catalog(&mut self, force: bool) -> Result<Vec<ChapterEntry>> {
-        let g = self.bindings.ilp_plugin_plugin();
-        let raw = g
-            .call_catalog(&mut self.store, force)
-            .map_err(|e| anyhow!("plugin::{e}"))?
-            .map_err(|e| anyhow!("plugin::{e}"))?;
-        Ok(raw.into_iter().map(convert_entry).collect())
+        match &mut self.backend {
+            PluginBackend::Current { store, bindings } => Ok(bindings
+                .ilp_plugin_plugin()
+                .call_catalog(store, force)
+                .map_err(|e| anyhow!("plugin::{e}"))?
+                .map_err(|e| anyhow!("plugin::{e}"))?
+                .into_iter()
+                .map(convert_entry)
+                .collect()),
+            PluginBackend::Legacy { store, bindings } => Ok(bindings
+                .ilp_plugin_plugin()
+                .call_catalog(store, force)
+                .map_err(|e| anyhow!("plugin::{e}"))?
+                .map_err(|e| anyhow!("plugin::{e}"))?
+                .into_iter()
+                .map(convert_legacy_entry)
+                .collect()),
+        }
     }
 
-    /// `cursor` 为空表示取第一页，否则原样传上一页返回的游标。
     pub fn search(&mut self, keyword: &str, cursor: &str) -> Result<ilp_types::SearchPage> {
-        let g = self.bindings.ilp_plugin_plugin();
-        let raw = g
-            .call_search(&mut self.store, keyword, cursor)
-            .map_err(|e| anyhow!("plugin::{e}"))?
-            .map_err(|e| anyhow!("plugin::{e}"))?;
-        Ok(ilp_types::SearchPage {
-            cursor: raw.cursor,
-            has_more: raw.has_more,
-            results: raw
-                .results
-                .into_iter()
-                .map(|r| SearchResult {
-                    id: r.id,
-                    title: r.title,
-                    author: r.author,
-                    cover_url: r.cover_url,
-                    description: r.description,
-                })
-                .collect(),
-        })
+        match &mut self.backend {
+            PluginBackend::Current { store, bindings } => convert_search(
+                bindings
+                    .ilp_plugin_plugin()
+                    .call_search(store, keyword, cursor)
+                    .map_err(|e| anyhow!("plugin::{e}"))?
+                    .map_err(|e| anyhow!("plugin::{e}"))?,
+            ),
+            PluginBackend::Legacy { store, bindings } => convert_legacy_search(
+                bindings
+                    .ilp_plugin_plugin()
+                    .call_search(store, keyword, cursor)
+                    .map_err(|e| anyhow!("plugin::{e}"))?
+                    .map_err(|e| anyhow!("plugin::{e}"))?,
+            ),
+        }
     }
 
     pub fn plan_fetch(&mut self, ids: &[String]) -> Result<Vec<FetchTask>> {
-        let g = self.bindings.ilp_plugin_plugin();
-        g.call_plan_fetch(&mut self.store, ids)
-            .map_err(|e| anyhow!("plugin::{e}"))?
-            .map_err(|e| anyhow!("plugin::{e}"))
+        match &mut self.backend {
+            PluginBackend::Current { store, bindings } => Ok(bindings
+                .ilp_plugin_plugin()
+                .call_plan_fetch(store, ids)
+                .map_err(|e| anyhow!("plugin::{e}"))?
+                .map_err(|e| anyhow!("plugin::{e}"))?),
+            PluginBackend::Legacy { store, bindings } => Ok(bindings
+                .ilp_plugin_plugin()
+                .call_plan_fetch(store, ids)
+                .map_err(|e| anyhow!("plugin::{e}"))?
+                .map_err(|e| anyhow!("plugin::{e}"))?
+                .into_iter()
+                .map(convert_legacy_task)
+                .collect()),
+        }
     }
 
     pub fn consume_fetch(
@@ -294,19 +540,37 @@ impl PluginInstance {
         task_id: &str,
         resp: HttpResponse,
     ) -> Result<Vec<ChapterContent>> {
-        let g = self.bindings.ilp_plugin_plugin();
-        let raw = g
-            .call_consume_fetch(&mut self.store, task_id, &resp)
-            .map_err(|e| anyhow!("plugin::{e}"))?
-            .map_err(|e| anyhow!("plugin::{e}"))?;
-        Ok(raw
-            .into_iter()
-            .map(|c| ChapterContent {
-                id: c.id,
-                title: c.title,
-                text: c.text,
-            })
-            .collect())
+        match &mut self.backend {
+            PluginBackend::Current { store, bindings } => Ok(bindings
+                .ilp_plugin_plugin()
+                .call_consume_fetch(store, task_id, &resp)
+                .map_err(|e| anyhow!("plugin::{e}"))?
+                .map_err(|e| anyhow!("plugin::{e}"))?
+                .into_iter()
+                .filter_map(|c| {
+                    c.text.map(|text| ChapterContent {
+                        id: c.id,
+                        title: c.title,
+                        text,
+                    })
+                })
+                .collect()),
+            PluginBackend::Legacy { store, bindings } => {
+                let resp = convert_legacy_response(resp);
+                Ok(bindings
+                    .ilp_plugin_plugin()
+                    .call_consume_fetch(store, task_id, &resp)
+                    .map_err(|e| anyhow!("plugin::{e}"))?
+                    .map_err(|e| anyhow!("plugin::{e}"))?
+                    .into_iter()
+                    .map(|c| ChapterContent {
+                        id: c.id,
+                        title: c.title,
+                        text: c.text,
+                    })
+                    .collect())
+            }
+        }
     }
 }
 
@@ -317,6 +581,89 @@ fn convert_entry(e: ilp::plugin::types::ChapterEntry) -> ChapterEntry {
         url: e.url,
         fetch_url: e.fetch_url,
         update_time: e.update_time,
+    }
+}
+
+fn convert_legacy_entry(e: legacy::ilp::plugin::types::ChapterEntry) -> ChapterEntry {
+    ChapterEntry {
+        id: e.id,
+        title: e.title,
+        url: e.url,
+        fetch_url: e.fetch_url,
+        update_time: e.update_time,
+    }
+}
+
+fn convert_search(raw: ilp::plugin::types::SearchPage) -> Result<ilp_types::SearchPage> {
+    Ok(ilp_types::SearchPage {
+        cursor: raw.cursor,
+        has_more: raw.has_more,
+        results: raw
+            .results
+            .into_iter()
+            .map(|r| SearchResult {
+                id: r.id,
+                title: r.title,
+                author: r.author,
+                cover_url: r.cover_url,
+                description: r.description,
+            })
+            .collect(),
+    })
+}
+
+fn convert_legacy_search(
+    raw: legacy::ilp::plugin::types::SearchPage,
+) -> Result<ilp_types::SearchPage> {
+    Ok(ilp_types::SearchPage {
+        cursor: raw.cursor,
+        has_more: raw.has_more,
+        results: raw
+            .results
+            .into_iter()
+            .map(|r| SearchResult {
+                id: r.id,
+                title: r.title,
+                author: r.author,
+                cover_url: r.cover_url,
+                description: r.description,
+            })
+            .collect(),
+    })
+}
+
+fn convert_legacy_task(t: legacy::ilp::plugin::types::FetchTask) -> ilp::plugin::types::FetchTask {
+    ilp::plugin::types::FetchTask {
+        id: t.id,
+        request: ilp::plugin::types::HttpRequest {
+            method: t.request.method,
+            url: t.request.url,
+            headers: t
+                .request
+                .headers
+                .into_iter()
+                .map(|h| ilp::plugin::types::HttpHeader {
+                    name: h.name,
+                    value: h.value,
+                })
+                .collect(),
+            body: t.request.body,
+        },
+    }
+}
+
+fn convert_legacy_response(r: HttpResponse) -> legacy::ilp::plugin::types::HttpResponse {
+    legacy::ilp::plugin::types::HttpResponse {
+        status: r.status,
+        headers: r
+            .headers
+            .into_iter()
+            .map(|h| legacy::ilp::plugin::types::HttpHeader {
+                name: h.name,
+                value: h.value,
+            })
+            .collect(),
+        body: r.body,
     }
 }
 

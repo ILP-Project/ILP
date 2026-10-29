@@ -8,7 +8,7 @@ use crate::config::Config;
 
 /// 站点只发布一个 ABI 版本。必须与 `ilp-plugin-wit` 里
 /// `package ilp:plugin@x.y.z` 保持一致。
-pub const SUPPORTED_ABI: &str = "0.1.0";
+pub const SUPPORTED_ABI: &str = "0.2.0";
 
 /// 插件 registry（`registry.json`）。
 ///
