@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
+use sha2::Digest;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -85,6 +86,7 @@ impl Registry {
 pub fn run(config: &Config, cmd: PluginCommand) -> Result<()> {
     match cmd {
         PluginCommand::List => list(config),
+        PluginCommand::Info { name } => info(config, &name),
         PluginCommand::Install { source } => install(config, &source),
         PluginCommand::Uninstall { name } => uninstall(config, &name),
         PluginCommand::Enable { name } => enable(config, &name),
@@ -112,6 +114,36 @@ fn list(config: &Config) -> Result<()> {
             println!("  {name}");
         }
     }
+    Ok(())
+}
+
+fn info(config: &Config, name: &str) -> Result<()> {
+    let name = safe_plugin_name(name)?;
+    let path = config.plugins_dir().join(format!("{name}.wasm"));
+    if !path.exists() {
+        return Err(anyhow!("未找到已启用插件: {name}"));
+    }
+    let bytes = fs::read(&path)?;
+    verify_artifact(
+        &bytes,
+        &RegistryPlugin {
+            name: name.to_string(),
+            site_id: String::new(),
+            abi: String::new(),
+            latest: String::new(),
+            versions: Vec::new(),
+            url: String::new(),
+            size: Some(bytes.len() as u64),
+            sha256: Some(format!("{:x}", sha2::Sha256::digest(&bytes))),
+            artifacts: HashMap::new(),
+        },
+    )?;
+    let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+    println!(
+        "插件: {name}\n文件: {}\n大小: {} 字节\nSHA-256: {digest}",
+        path.display(),
+        bytes.len()
+    );
     Ok(())
 }
 

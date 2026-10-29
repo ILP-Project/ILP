@@ -43,6 +43,8 @@ pub enum Command {
 pub enum PluginCommand {
     /// 列出插件
     List,
+    /// 显示插件元数据与完整性信息
+    Info { name: String },
     /// 安装插件（name 或 name@version，省略版本即 latest）
     Install { source: String },
     /// 卸载插件
