@@ -1,4 +1,6 @@
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::Deserialize;
 use sha2::Digest;
 use std::collections::HashMap;
@@ -38,6 +40,14 @@ struct RegistryPlugin {
     /// 每个版本的独立产物信息。旧 schema 没有此字段，回退到顶层字段。
     #[serde(default)]
     artifacts: HashMap<String, RegistryArtifact>,
+    #[serde(default)]
+    signatures: HashMap<String, RegistrySignature>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct RegistrySignature {
+    key_id: String,
+    signature: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -136,6 +146,7 @@ fn info(config: &Config, name: &str) -> Result<()> {
             size: Some(bytes.len() as u64),
             sha256: Some(format!("{:x}", sha2::Sha256::digest(&bytes))),
             artifacts: HashMap::new(),
+            signatures: HashMap::new(),
         },
     )?;
     let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
@@ -251,7 +262,52 @@ fn clone_registry_plugin(p: &RegistryPlugin) -> RegistryPlugin {
         size: p.size,
         sha256: p.sha256.clone(),
         artifacts: p.artifacts.clone(),
+        signatures: p.signatures.clone(),
     }
+}
+
+fn verify_signature(
+    config: &Config,
+    plugin: &RegistryPlugin,
+    version: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    let signature = plugin.signatures.get(version);
+    if signature.is_none() {
+        if config.require_plugin_signatures {
+            return Err(anyhow!("插件 {} {} 缺少签名", plugin.name, version));
+        }
+        tracing::warn!(plugin = %plugin.name, version, "插件没有签名，继续安装（未启用强制签名校验）");
+        return Ok(());
+    }
+    let signature = signature.expect("checked above");
+    let key_text = config
+        .plugin_trusted_keys
+        .get(&signature.key_id)
+        .ok_or_else(|| {
+            anyhow!(
+                "插件 {} 使用未信任的签名密钥 {}",
+                plugin.name,
+                signature.key_id
+            )
+        })?;
+    let key_bytes = BASE64
+        .decode(key_text)
+        .context("信任公钥不是有效的 base64")?;
+    let key_array: [u8; 32] = key_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("Ed25519 公钥必须是 32 字节"))?;
+    let key = VerifyingKey::from_bytes(&key_array).context("Ed25519 公钥无效")?;
+    let sig_bytes = BASE64
+        .decode(&signature.signature)
+        .context("插件签名不是有效的 base64")?;
+    let sig_array: [u8; 64] = sig_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("Ed25519 签名必须是 64 字节"))?;
+    key.verify(bytes, &Signature::from_bytes(&sig_array))
+        .map_err(|_| anyhow!("插件 {} {} 的签名校验失败", plugin.name, version))
 }
 
 fn verify_artifact(bytes: &[u8], p: &RegistryPlugin) -> Result<()> {
@@ -329,6 +385,7 @@ fn install(config: &Config, source: &str) -> Result<()> {
     let artifact_url = artifact.map(|a| a.url.as_str()).unwrap_or(&p.url);
     let url = resolve_url(&base, artifact_url)?;
     let bytes = crate::http::get_bytes(&url).with_context(|| format!("下载插件失败: {url}"))?;
+    verify_signature(config, p, &want, &bytes)?;
     let expected = RegistryPlugin {
         url: artifact
             .map(|a| a.url.clone())
@@ -648,6 +705,7 @@ mod tests {
             size: Some(999),
             sha256: None,
             artifacts: HashMap::new(),
+            signatures: HashMap::new(),
         };
         let err = format!("{:#}", verify_artifact(&bytes, &p).expect_err("应拒绝"));
         assert!(err.contains("大小不符"), "实得: {err}");
@@ -666,6 +724,7 @@ mod tests {
             size: Some(bytes.len() as u64),
             sha256: Some("0".repeat(64)),
             artifacts: HashMap::new(),
+            signatures: HashMap::new(),
         };
         let err = format!("{:#}", verify_artifact(&bytes, &p).expect_err("应拒绝"));
         assert!(err.contains("校验和不符"), "实得: {err}");
@@ -685,6 +744,7 @@ mod tests {
             size: Some(bytes.len() as u64),
             sha256: Some(format!("{:x}", Sha256::digest(&bytes))),
             artifacts: HashMap::new(),
+            signatures: HashMap::new(),
         };
         assert!(verify_artifact(&bytes, &p).is_ok());
     }

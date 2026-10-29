@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
@@ -34,12 +35,18 @@ pub struct Config {
     /// 不走代理的主机名
     #[serde(default = "default_no_proxy")]
     pub no_proxy: Vec<String>,
+    /// 插件签名信任根：key_id -> base64 编码的 Ed25519 公钥。
+    #[serde(default)]
+    pub plugin_trusted_keys: HashMap<String, String>,
+    /// 配置了信任根后，是否拒绝没有有效签名的插件。
+    #[serde(default)]
+    pub require_plugin_signatures: bool,
     /// 原始文件内容，仅用于检查未知字段，不参与序列化
     #[serde(skip)]
     raw: String,
 }
 
-const KNOWN_FIELDS: [&str; 11] = [
+const KNOWN_FIELDS: [&str; 13] = [
     "data_folder",
     "novels_folder",
     "logs_folder",
@@ -51,6 +58,8 @@ const KNOWN_FIELDS: [&str; 11] = [
     "log_to_stderr",
     "proxy",
     "no_proxy",
+    "plugin_trusted_keys",
+    "require_plugin_signatures",
 ];
 
 fn default_data_folder() -> String {
@@ -100,6 +109,8 @@ impl Default for Config {
             log_to_stderr: default_true(),
             proxy: None,
             no_proxy: default_no_proxy(),
+            plugin_trusted_keys: HashMap::new(),
+            require_plugin_signatures: false,
             raw: String::new(),
         }
     }

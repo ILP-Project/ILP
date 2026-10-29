@@ -21,6 +21,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 sha2 = "0.10"
+ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
+base64 = "0.23.1"
 
 [dev-dependencies]
 wiremock = "0.6"
