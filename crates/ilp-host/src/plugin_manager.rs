@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -20,7 +21,7 @@ struct Registry {
     plugins: Vec<RegistryPlugin>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 struct RegistryPlugin {
     name: String,
     site_id: String,
@@ -29,6 +30,18 @@ struct RegistryPlugin {
     versions: Vec<String>,
     url: String,
     /// registry 声明的产物大小与摘要，用于拒绝截断/被改的下载。
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    sha256: Option<String>,
+    /// 每个版本的独立产物信息。旧 schema 没有此字段，回退到顶层字段。
+    #[serde(default)]
+    artifacts: HashMap<String, RegistryArtifact>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct RegistryArtifact {
+    url: String,
     #[serde(default)]
     size: Option<u64>,
     #[serde(default)]
@@ -195,6 +208,20 @@ fn resolve_url(base: &str, url: &str) -> Result<String> {
 ///
 /// 没有这一步时，截断的下载只要前 8 字节对就能装进去，然后在运行时以
 /// 一个和真实原因毫无关系的 wasmtime 错误失败。
+fn clone_registry_plugin(p: &RegistryPlugin) -> RegistryPlugin {
+    RegistryPlugin {
+        name: p.name.clone(),
+        site_id: p.site_id.clone(),
+        abi: p.abi.clone(),
+        latest: p.latest.clone(),
+        versions: p.versions.clone(),
+        url: p.url.clone(),
+        size: p.size,
+        sha256: p.sha256.clone(),
+        artifacts: p.artifacts.clone(),
+    }
+}
+
 fn verify_artifact(bytes: &[u8], p: &RegistryPlugin) -> Result<()> {
     if let Some(size) = p.size {
         if bytes.len() as u64 != size {
@@ -266,9 +293,21 @@ fn install(config: &Config, source: &str) -> Result<()> {
         ));
     }
 
-    let url = resolve_url(&base, &p.url)?;
+    let artifact = p.artifacts.get(&want);
+    let artifact_url = artifact.map(|a| a.url.as_str()).unwrap_or(&p.url);
+    let url = resolve_url(&base, artifact_url)?;
     let bytes = crate::http::get_bytes(&url).with_context(|| format!("下载插件失败: {url}"))?;
-    verify_artifact(&bytes, p)?;
+    let expected = RegistryPlugin {
+        url: artifact
+            .map(|a| a.url.clone())
+            .unwrap_or_else(|| p.url.clone()),
+        size: artifact.and_then(|a| a.size).or(p.size),
+        sha256: artifact
+            .and_then(|a| a.sha256.clone())
+            .or_else(|| p.sha256.clone()),
+        ..clone_registry_plugin(p)
+    };
+    verify_artifact(&bytes, &expected)?;
 
     let dir = config.plugins_dir();
     fs::create_dir_all(&dir)?;
@@ -576,6 +615,7 @@ mod tests {
             url: "a.wasm".into(),
             size: Some(999),
             sha256: None,
+            artifacts: HashMap::new(),
         };
         let err = format!("{:#}", verify_artifact(&bytes, &p).expect_err("应拒绝"));
         assert!(err.contains("大小不符"), "实得: {err}");
@@ -593,6 +633,7 @@ mod tests {
             url: "a.wasm".into(),
             size: Some(bytes.len() as u64),
             sha256: Some("0".repeat(64)),
+            artifacts: HashMap::new(),
         };
         let err = format!("{:#}", verify_artifact(&bytes, &p).expect_err("应拒绝"));
         assert!(err.contains("校验和不符"), "实得: {err}");
@@ -611,6 +652,7 @@ mod tests {
             url: "a.wasm".into(),
             size: Some(bytes.len() as u64),
             sha256: Some(format!("{:x}", Sha256::digest(&bytes))),
+            artifacts: HashMap::new(),
         };
         assert!(verify_artifact(&bytes, &p).is_ok());
     }
