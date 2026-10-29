@@ -4,12 +4,22 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use wasmtime::component::{Component, Linker, Resource};
-use wasmtime::{Engine, Store};
+use wasmtime::{Config as WasmtimeConfig, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxView, WasiView};
 
 pub struct HttpCapability;
 pub struct StorageCapability;
 pub struct SecretCapability;
+
+const MAX_PLUGIN_MEMORY: usize = 64 * 1024 * 1024;
+const MAX_PLUGIN_FUEL: u64 = 50_000_000;
+const MAX_HTTP_BODY: usize = 2 * 1024 * 1024;
+const MAX_HTTP_RESPONSE: usize = 16 * 1024 * 1024;
+const MAX_HTTP_HEADERS: usize = 128;
+const MAX_HTTP_HEADER_VALUE: usize = 16 * 1024;
+const MAX_FETCH_TASKS: usize = 128;
+const MAX_STORAGE_VALUE: usize = 4 * 1024 * 1024;
+const MAX_LOG_MESSAGE: usize = 16 * 1024;
 
 #[derive(Clone, Debug)]
 struct CapabilityPolicy {
@@ -119,6 +129,7 @@ pub struct HostState {
     /// 内存里的 KV，落盘前先命中这里
     cache: HashMap<String, Vec<u8>>,
     policy: CapabilityPolicy,
+    limits: StoreLimits,
 }
 
 impl HostState {
@@ -134,6 +145,13 @@ impl HostState {
             storage_dir,
             cache: HashMap::new(),
             policy,
+            limits: StoreLimitsBuilder::new()
+                .memory_size(MAX_PLUGIN_MEMORY)
+                .instances(8)
+                .tables(16)
+                .memories(4)
+                .trap_on_grow_failure(true)
+                .build(),
         }
     }
 }
@@ -159,6 +177,10 @@ fn level_to_tracing(level: u8, plugin: &str, msg: &str) {
 
 impl HostTrait for HostState {
     fn log(&mut self, level: u8, message: String) {
+        if message.len() > MAX_LOG_MESSAGE {
+            tracing::warn!("插件 {} 日志过长，已丢弃", self.plugin_name);
+            return;
+        }
         level_to_tracing(level, &self.plugin_name, &message);
     }
 
@@ -175,8 +197,11 @@ impl HostTrait for HostState {
         &mut self,
         request: ilp::plugin::types::HttpRequest,
     ) -> Result<ilp::plugin::types::HttpResponse, String> {
+        validate_http_request(&request)?;
         self.policy.allows_url(&request.url)?;
-        crate::http::send(&request).map_err(|e| format!("{e:#}"))
+        let response = crate::http::send(&request).map_err(|e| format!("{e:#}"))?;
+        validate_http_response(&response)?;
+        Ok(response)
     }
 
     fn acquire_http(&mut self) -> Option<Resource<HttpCapability>> {
@@ -223,6 +248,9 @@ impl HostTrait for HostState {
         if !is_safe_key(&key) {
             return Err(format!("非法 storage key: {key}"));
         }
+        if value.len() > MAX_STORAGE_VALUE {
+            return Err(format!("storage value 过大: {} 字节", value.len()));
+        }
         std::fs::create_dir_all(&self.storage_dir).map_err(|e| e.to_string())?;
         atomic_write(&self.storage_dir.join(&key), &value).map_err(|e| e.to_string())?;
         self.cache.insert(key, value);
@@ -264,6 +292,7 @@ impl legacy::ilp::plugin::host::Host for HostState {
         &mut self,
         request: legacy::ilp::plugin::host::HttpRequest,
     ) -> Result<legacy::ilp::plugin::host::HttpResponse, String> {
+        validate_legacy_http_request(&request)?;
         self.policy.allows_url(&request.url)?;
         let request = ilp::plugin::types::HttpRequest {
             method: request.method,
@@ -279,6 +308,7 @@ impl legacy::ilp::plugin::host::Host for HostState {
             body: request.body,
         };
         let resp = crate::http::send(&request).map_err(|e| format!("{e:#}"))?;
+        validate_http_response(&resp)?;
         Ok(legacy::ilp::plugin::host::HttpResponse {
             status: resp.status,
             headers: resp
@@ -318,8 +348,11 @@ impl ilp::plugin::host::HostHttpHandle for HostState {
             .allows("http")
             .then_some(())
             .ok_or_else(|| "permission-denied: http".to_string())?;
+        validate_http_request(&request)?;
         self.policy.allows_url(&request.url)?;
-        crate::http::send(&request).map_err(|e| format!("{e:#}"))
+        let response = crate::http::send(&request).map_err(|e| format!("{e:#}"))?;
+        validate_http_response(&response)?;
+        Ok(response)
     }
 
     fn drop(&mut self, handle: Resource<HttpCapability>) -> wasmtime::Result<()> {
@@ -378,6 +411,63 @@ impl ilp::plugin::host::HostSecretHandle for HostState {
         self.table.delete(handle)?;
         Ok(())
     }
+}
+
+fn validate_http_request(request: &ilp::plugin::types::HttpRequest) -> Result<(), String> {
+    if request
+        .body
+        .as_ref()
+        .is_some_and(|body| body.len() > MAX_HTTP_BODY)
+    {
+        return Err(format!("request body 过大: 超过 {MAX_HTTP_BODY} 字节"));
+    }
+    if request.headers.len() > MAX_HTTP_HEADERS {
+        return Err(format!("HTTP header 数量过多: 超过 {MAX_HTTP_HEADERS}"));
+    }
+    if request
+        .headers
+        .iter()
+        .any(|h| h.name.len() > 256 || h.value.len() > MAX_HTTP_HEADER_VALUE)
+    {
+        return Err("HTTP header 过大".to_string());
+    }
+    Ok(())
+}
+
+fn validate_legacy_http_request(
+    request: &legacy::ilp::plugin::host::HttpRequest,
+) -> Result<(), String> {
+    if request
+        .body
+        .as_ref()
+        .is_some_and(|body| body.len() > MAX_HTTP_BODY)
+    {
+        return Err(format!("request body 过大: 超过 {MAX_HTTP_BODY} 字节"));
+    }
+    if request.headers.len() > MAX_HTTP_HEADERS
+        || request
+            .headers
+            .iter()
+            .any(|h| h.name.len() > 256 || h.value.len() > MAX_HTTP_HEADER_VALUE)
+    {
+        return Err("HTTP header 过大".to_string());
+    }
+    Ok(())
+}
+
+fn validate_http_response(response: &ilp::plugin::types::HttpResponse) -> Result<(), String> {
+    if response.body.len() > MAX_HTTP_RESPONSE {
+        return Err(format!("HTTP response 过大: 超过 {MAX_HTTP_RESPONSE} 字节"));
+    }
+    if response.headers.len() > MAX_HTTP_HEADERS
+        || response
+            .headers
+            .iter()
+            .any(|h| h.name.len() > 256 || h.value.len() > MAX_HTTP_HEADER_VALUE)
+    {
+        return Err("HTTP response header 过大".to_string());
+    }
+    Ok(())
 }
 
 fn is_safe_key(key: &str) -> bool {
@@ -458,7 +548,10 @@ enum PluginBackend {
 
 impl PluginInstance {
     pub fn load(path: &Path, storage_root: &Path) -> Result<Self> {
-        let engine = Engine::default();
+        let mut engine_config = WasmtimeConfig::new();
+        engine_config.consume_fuel(true);
+        let engine =
+            Engine::new(&engine_config).map_err(|e| anyhow!("创建 Wasmtime engine 失败: {e}"))?;
         let component = Component::from_file(&engine, path)
             .map_err(|e| anyhow!("读取组件失败 {}: {e}", path.display()))?;
         let version = component
@@ -484,6 +577,10 @@ impl PluginInstance {
                     &engine,
                     HostState::new(name.clone(), storage_root.join(&name)),
                 );
+                store.limiter(|state| &mut state.limits);
+                store
+                    .set_fuel(MAX_PLUGIN_FUEL)
+                    .map_err(|e| anyhow!("设置插件 fuel 失败: {e}"))?;
                 let bindings = current::NovelPlugin::instantiate(&mut store, &component, &linker)
                     .map_err(|e| anyhow!("实例化插件失败 {}: {e}", path.display()))?;
                 let raw = bindings
@@ -519,6 +616,10 @@ impl PluginInstance {
                     &engine,
                     HostState::new(name.clone(), storage_root.join(&name)),
                 );
+                store.limiter(|state| &mut state.limits);
+                store
+                    .set_fuel(MAX_PLUGIN_FUEL)
+                    .map_err(|e| anyhow!("设置插件 fuel 失败: {e}"))?;
                 let bindings = legacy::NovelPlugin::instantiate(&mut store, &component, &linker)
                     .map_err(|e| anyhow!("实例化旧版插件失败 {}: {e}", path.display()))?;
                 let raw = bindings
@@ -673,6 +774,12 @@ impl PluginInstance {
     }
 
     pub fn plan_fetch(&mut self, ids: &[String]) -> Result<Vec<FetchTask>> {
+        if ids.len() > MAX_FETCH_TASKS {
+            return Err(anyhow!(
+                "抓取任务过多: {}，上限 {MAX_FETCH_TASKS}",
+                ids.len()
+            ));
+        }
         match &mut self.backend {
             PluginBackend::Current { store, bindings } => Ok(bindings
                 .ilp_plugin_plugin()
