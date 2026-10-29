@@ -305,7 +305,12 @@ fn persist(
     ) {
         Ok(_) => {
             *done += 1;
-            println!("已下载: {} - {}", book.title, item.title);
+            if std::env::var_os("ILP_JSONL").is_some() {
+                let event = serde_json::json!({"event":"chapter_downloaded","book":book.title,"chapter":item.title,"id":item.id});
+                println!("{}", event);
+            } else {
+                println!("已下载: {} - {}", book.title, item.title);
+            }
         }
         Err(e) => {
             tracing::warn!("写入失败: {} - {}: {e:#}", book.title, item.title);
