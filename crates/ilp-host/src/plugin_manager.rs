@@ -12,7 +12,15 @@ use crate::config::Config;
 
 /// 站点只发布一个 ABI 版本。必须与 `ilp-plugin-wit` 里
 /// `package ilp:plugin@x.y.z` 保持一致。
-pub const SUPPORTED_ABI: &str = "0.2.0";
+pub const CURRENT_ABI: &str = "0.2.0";
+pub const SUPPORTED_ABIS: &[&str] = &["0.1.0", CURRENT_ABI];
+/// 保留旧名称，避免外部集成在迁移期间中断。
+#[allow(dead_code)]
+pub const SUPPORTED_ABI: &str = CURRENT_ABI;
+
+fn is_supported_abi(abi: &str) -> bool {
+    SUPPORTED_ABIS.contains(&abi)
+}
 
 /// 插件 registry（`registry.json`）。
 ///
@@ -360,11 +368,18 @@ fn install(config: &Config, source: &str) -> Result<()> {
 
     // ABI 在下载前就比对：拿一个注定跑不起来的插件下来毫无意义，
     // 而且装进去之后只会在某次调用里以无关错误的形式暴露。
-    if p.abi != SUPPORTED_ABI {
+    if !is_supported_abi(&p.abi) {
         return Err(anyhow!(
-            "插件 {name} 要求 ABI {}，本版本 ilp 支持 {SUPPORTED_ABI}。请升级 ilp 或安装旧版插件",
-            p.abi
+            "插件 {name} 要求 ABI {}，本版本 ilp 支持 {}。请升级 ilp 或安装兼容版本",
+            p.abi,
+            SUPPORTED_ABIS.join(", ")
         ));
+    }
+    if p.abi != CURRENT_ABI {
+        tracing::warn!(
+            "插件 {name} 使用已弃用 ABI {}；当前 ABI 为 {CURRENT_ABI}，请尽快升级插件",
+            p.abi
+        );
     }
 
     let want = if version == "latest" {

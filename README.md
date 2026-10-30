@@ -103,7 +103,7 @@ data/
 - 番茄插件只覆盖**已登录可读的免费章节**；锁定章节服务端只返回一段试读，无法绕过。
 - `plugin install` 依赖插件站点的 `registry.json`（默认 `https://ilp.elysola.org`，
   可用 `ILP_REGISTRY_URL` 指向镜像）。
-  宿主的 `SUPPORTED_ABI` 是编译期常量，装 ABI 不匹配的插件会被直接拒绝。
+  宿主通过 `CURRENT_ABI` 和 `SUPPORTED_ABIS` 管理 ABI 兼容性：当前 ABI 为 `0.2.0`，目前支持 `0.1.0` 与 `0.2.0`。ABI `0.1.0` 仍可加载，但安装时会发出弃用警告；不在支持列表中的 ABI 会在下载前拒绝。旧的 `SUPPORTED_ABI` 常量仅作为兼容别名保留。
 - 搜索是游标分页，无法跳到指定页。
 
 ## 致谢与许可
