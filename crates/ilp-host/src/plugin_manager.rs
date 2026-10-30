@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::cli::PluginCommand;
 use crate::config::Config;
 use crate::signing::SignatureSet;
+use ilp_types::PluginMetadata;
 
 /// 站点只发布一个 ABI 版本。必须与 `ilp-plugin-wit` 里
 /// `package ilp:plugin@x.y.z` 保持一致。
@@ -49,6 +50,15 @@ struct RegistryPlugin {
     artifacts: HashMap<String, RegistryArtifact>,
     #[serde(default)]
     signatures: HashMap<String, RegistrySignatures>,
+    /// registry 声称插件申请哪些权限。
+    ///
+    /// 这只是**声明**，安装时会与 WASM 自己的 metadata 逐项比对：
+    /// registry 是展示面，插件作者完全可以让它说一套、代码里做另一套。
+    /// 不改的话，`plugin info` 展示的权限与实际情况无关。
+    #[serde(default)]
+    permissions: Vec<String>,
+    #[serde(default)]
+    allowed_domains: Vec<String>,
 }
 
 /// 每版本签名集合，与 registry 元数据签名共用同一套信任语义。
@@ -151,6 +161,8 @@ fn info(config: &Config, name: &str) -> Result<()> {
             sha256: Some(format!("{:x}", sha2::Sha256::digest(&bytes))),
             artifacts: HashMap::new(),
             signatures: HashMap::new(),
+            permissions: Vec::new(),
+            allowed_domains: Vec::new(),
         },
     )?;
     let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
@@ -159,7 +171,37 @@ fn info(config: &Config, name: &str) -> Result<()> {
         path.display(),
         bytes.len()
     );
+
+    // 权限与域名只能从 WASM 自己的 metadata 读：registry 里那份是展示用的，
+    // 不能当作事实。用户要看“这个插件到底能干什么”，必须看真实声明。
+    let storage_root = Path::new(&config.data_folder).join("plugins");
+    match crate::engine::PluginInstance::load(&path, &storage_root) {
+        Ok(plugin) => print_metadata(&plugin.metadata),
+        // 加载失败不该让 info 整个失败：元数据与完整性信息本身是有用的。
+        Err(e) => println!("\n无法读取插件内声明的元数据: {e:#}"),
+    }
     Ok(())
+}
+
+fn print_metadata(m: &PluginMetadata) {
+    println!("\n站点: {}（{}）", m.site_name, m.site_domain);
+    println!("站点 ID: {}", m.site_id);
+    println!("插件: {} {}", m.plugin_name, m.version);
+    println!("ABI: {}", m.abi_version);
+    if m.permissions.is_empty() {
+        println!("申请的权限: 无");
+    } else {
+        let mut perms = m.permissions.clone();
+        perms.sort();
+        println!("申请的权限: {}", perms.join(", "));
+    }
+    if m.allowed_domains.is_empty() {
+        println!("声明的域名: 未限制");
+    } else {
+        let mut domains = m.allowed_domains.clone();
+        domains.sort();
+        println!("声明的域名: {}", domains.join(", "));
+    }
 }
 
 fn list_wasm(dir: &Path) -> Vec<String> {
@@ -267,6 +309,8 @@ fn clone_registry_plugin(p: &RegistryPlugin) -> RegistryPlugin {
         sha256: p.sha256.clone(),
         artifacts: p.artifacts.clone(),
         signatures: p.signatures.clone(),
+        permissions: p.permissions.clone(),
+        allowed_domains: p.allowed_domains.clone(),
     }
 }
 
@@ -388,9 +432,109 @@ fn install(config: &Config, source: &str) -> Result<()> {
     let dir = config.plugins_dir();
     fs::create_dir_all(&dir)?;
     let dest = dir.join(format!("{name}.wasm"));
+    // 先落到暂存目录再改名：下面的能力核对需要真的加载组件，
+    // 而加载失败的半成品不该已经占到最终位置。
+    let staging_dir = dir.join("_staging");
+    fs::create_dir_all(&staging_dir)?;
+    let staging = staging_dir.join(format!("{name}.wasm"));
+    write_atomic(&staging, &bytes)?;
+    let verdict = check_declared_capabilities(config, p, &staging);
+    let _ = fs::remove_dir_all(&staging_dir);
+    verdict?;
+
     write_atomic(&dest, &bytes)?;
     println!("已安装插件 {name} {want} 到 {}", dest.display());
     Ok(())
+}
+
+/// 核对 registry 声明的权限与 WASM 自己的声明。
+///
+/// 宿主的安全策略取的是 **WASM metadata**，registry 那份只用于展示与审核。
+/// 两份不一致时，用户看到的权限就不是他实际拿到的权限。
+///
+/// 规则不对称：
+///
+/// - WASM 比注册表**多**申请一项能力 → 拒绝安装。这是信息隐瞒，
+///   必须保证“安装前看到的”和“装完跑起来的”一致；
+/// - WASM 比注册表**少** → 仅告警。注册表写多了是文档过错，不影响安全。
+///
+/// 注册表什么都没写时跳过：旧镜像没这些字段，不能因此拒绝所有旧插件。
+fn check_declared_capabilities(config: &Config, p: &RegistryPlugin, wasm: &Path) -> Result<()> {
+    if p.permissions.is_empty() && p.allowed_domains.is_empty() {
+        return Ok(());
+    }
+    let storage_root = Path::new(&config.data_folder).join("plugins");
+    let plugin = crate::engine::PluginInstance::load(wasm, &storage_root)
+        .with_context(|| format!("插件 {} 的元数据校验未通过（组件无法加载）", p.name))?;
+    for warning in compare_capabilities(&p.permissions, &p.allowed_domains, &plugin.metadata)? {
+        tracing::warn!("插件 {}: {warning}", p.name);
+    }
+    Ok(())
+}
+
+/// `check_declared_capabilities` 的纯逻辑部分：不碰磁盘，可以直接测。
+///
+/// 返回的字符串是“注册表多写了”的告警；真正的不一致直接返回错误。
+fn compare_capabilities(
+    declared_permissions: &[String],
+    declared_domains: &[String],
+    actual: &PluginMetadata,
+) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
+    let declared: std::collections::HashSet<&str> =
+        declared_permissions.iter().map(String::as_str).collect();
+    let mut undeclared: Vec<&str> = actual
+        .permissions
+        .iter()
+        .map(String::as_str)
+        .filter(|perm| !declared.contains(perm))
+        .collect();
+    if !undeclared.is_empty() {
+        undeclared.sort_unstable();
+        let mut declared_sorted: Vec<&str> = declared.into_iter().collect();
+        declared_sorted.sort_unstable();
+        return Err(anyhow!(
+            "插件在 registry 里申报的权限是 [{}]，但 WASM 自己申请了额外权限 [{}]。\n\
+             注册表隐瞒了插件真实能做的事，已拒绝安装",
+            declared_sorted.join(", "),
+            undeclared.join(", ")
+        ));
+    }
+    let mut unused: Vec<&str> = declared_permissions
+        .iter()
+        .map(String::as_str)
+        .filter(|perm| !actual.permissions.iter().any(|a| a == perm))
+        .collect();
+    if !unused.is_empty() {
+        unused.sort_unstable();
+        warnings.push(format!(
+            "registry 里多申报了权限 [{}]，WASM 实际未申请。以 WASM 为准",
+            unused.join(", ")
+        ));
+    }
+
+    // 域名同理：插件能连到注册表没写的主机，用户装的就不是他以为的东西。
+    // 空列表的含义是“不作限制”，所以只在注册表真的写了限制时才比。
+    if !declared_domains.is_empty() {
+        let allowed: std::collections::HashSet<&str> =
+            declared_domains.iter().map(String::as_str).collect();
+        let mut extra: Vec<&str> = actual
+            .allowed_domains
+            .iter()
+            .map(String::as_str)
+            .filter(|d| !allowed.contains(d))
+            .collect();
+        if !extra.is_empty() {
+            extra.sort_unstable();
+            return Err(anyhow!(
+                "插件在 registry 里申报的域名是 [{}]，但 WASM 自己声明了额外域名 [{}]。\n\
+                 注册表隐瞒了插件真实访问范围，已拒绝安装",
+                declared_domains.join(", "),
+                extra.join(", ")
+            ));
+        }
+    }
+    Ok(warnings)
 }
 
 /// 校验下载到的确实是一段 WebAssembly 模块，而不是错误页或截断文件。
@@ -759,6 +903,8 @@ mod tests {
             sha256: None,
             artifacts: HashMap::new(),
             signatures: HashMap::new(),
+            permissions: Vec::new(),
+            allowed_domains: Vec::new(),
         };
         let err = format!("{:#}", verify_artifact(&bytes, &p).expect_err("应拒绝"));
         assert!(err.contains("大小不符"), "实得: {err}");
@@ -778,6 +924,8 @@ mod tests {
             sha256: Some("0".repeat(64)),
             artifacts: HashMap::new(),
             signatures: HashMap::new(),
+            permissions: Vec::new(),
+            allowed_domains: Vec::new(),
         };
         let err = format!("{:#}", verify_artifact(&bytes, &p).expect_err("应拒绝"));
         assert!(err.contains("校验和不符"), "实得: {err}");
@@ -800,6 +948,8 @@ mod tests {
             size: None,
             sha256: None,
             artifacts: HashMap::new(),
+            permissions: Vec::new(),
+            allowed_domains: Vec::new(),
             signatures: [(
                 "1".into(),
                 RegistrySignatures::One(SignatureEntry {
@@ -847,6 +997,8 @@ mod tests {
             signatures: [("1".to_string(), RegistrySignatures::Many(sigs))]
                 .into_iter()
                 .collect(),
+            permissions: Vec::new(),
+            allowed_domains: Vec::new(),
         }
     }
 
@@ -953,7 +1105,86 @@ mod tests {
             sha256: Some(format!("{:x}", Sha256::digest(&bytes))),
             artifacts: HashMap::new(),
             signatures: HashMap::new(),
+            permissions: Vec::new(),
+            allowed_domains: Vec::new(),
         };
         assert!(verify_artifact(&bytes, &p).is_ok());
+    }
+
+    fn meta(permissions: &[&str], domains: &[&str]) -> PluginMetadata {
+        PluginMetadata {
+            abi_version: "0.2.0".into(),
+            site_name: "s".into(),
+            site_id: "s".into(),
+            site_domain: "example.com".into(),
+            plugin_name: "p".into(),
+            plugin_id: "p".into(),
+            version: "1".into(),
+            permissions: permissions.iter().map(|s| s.to_string()).collect(),
+            allowed_domains: domains.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn owned(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn registry_hiding_a_permission_is_rejected() {
+        // registry 说只要 http，WASM 里却还要 secret-read：
+        // 用户看到的权限清单是假的，必须拒绝安装。
+        let declared = owned(&["http"]);
+        let actual = meta(&["http", "secret-read"], &[]);
+        let err = format!(
+            "{:#}",
+            compare_capabilities(&declared, &[], &actual).expect_err("应拒绝")
+        );
+        assert!(err.contains("额外权限"), "实得: {err}");
+        assert!(err.contains("secret-read"), "实得: {err}");
+    }
+
+    #[test]
+    fn registry_declaring_more_than_wasm_is_only_a_warning() {
+        // 反方向只是文档写错了，不构成安全风险，不该拦下载。
+        let declared = owned(&["http", "clock", "storage-read"]);
+        let actual = meta(&["http"], &[]);
+        let warnings = compare_capabilities(&declared, &[], &actual).expect("不该失败");
+        assert_eq!(warnings.len(), 1, "实得: {warnings:?}");
+        assert!(warnings[0].contains("clock"), "实得: {warnings:?}");
+        assert!(warnings[0].contains("storage-read"), "实得: {warnings:?}");
+    }
+
+    #[test]
+    fn matching_declarations_pass_silently() {
+        let declared = owned(&["http", "clock"]);
+        let actual = meta(&["clock", "http"], &["a.com"]);
+        // 顺序不同不算差异：HashSet 比较。
+        assert!(compare_capabilities(&declared, &owned(&["a.com"]), &actual)
+            .expect("不该失败")
+            .is_empty());
+    }
+
+    #[test]
+    fn registry_hiding_a_domain_is_rejected() {
+        let declared_perms = owned(&["http"]);
+        let actual = meta(&["http"], &["fanqienovel.com", "evil.example"]);
+        let err = format!(
+            "{:#}",
+            compare_capabilities(&declared_perms, &owned(&["fanqienovel.com"]), &actual)
+                .expect_err("应拒绝")
+        );
+        assert!(err.contains("额外域名"), "实得: {err}");
+        assert!(err.contains("evil.example"), "实得: {err}");
+    }
+
+    #[test]
+    fn empty_registry_domains_mean_unrestricted() {
+        // 旧镜像没有 allowed_domains 字段。若把它当成"插件不许连任何域名"，
+        // 所有旧版本都会装不上。
+        let declared = owned(&["http"]);
+        let actual = meta(&["http"], &["fanqienovel.com"]);
+        assert!(compare_capabilities(&declared, &[], &actual)
+            .expect("不该失败")
+            .is_empty());
     }
 }

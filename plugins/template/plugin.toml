@@ -9,4 +9,10 @@ data_source = "Example Site 公开可访问内容"
 authorization_boundary = "仅用于公开内容测试；不实现账号密码登录，不绕过付费或访问控制"
 maintenance = "active"
 known_limitations = ["模板不实现真实站点抓取"]
+
+# 与 src/lib.rs 里 metadata() 的返回值逐项一致，否则 build_site.py 会拦下来。
+# 模板只演示 http + clock，正好是没有 storage/secret 的最小权限范例。
+permissions = ["http", "clock"]
+allowed_domains = ["example.com"]
+
 abi = "0.2.0"

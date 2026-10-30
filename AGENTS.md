@@ -23,6 +23,11 @@
 - 插件安装：`.wasm` 跨平台，单一产物 URL；安装走静态 registry + ABI 预检 + size/sha256 校验。
 - **权限声明在 WIT `plugin-metadata` 里，registry 不参与**。真正安全边界是宿主在
   每个 host function 调用点的策略检查，不是插件自己的声明。
+- 但 registry 会**展示**权限，所以两份声明必须一致，否则用户看到的是假信息。
+  于是有两道核对：发布侧 `plugin.toml` 的 `permissions`/`allowed_domains` 由
+  插件自己的 `manifest_matches_metadata` 测试锁死在 `metadata()` 上（`cargo test`
+  即门禁）；安装侧宿主把 registry 那份与 WASM 实际声明逐项比对，
+  **WASM 多申请一项就拒绝安装**（信息隐瞒），registry 多写只告警（文档过错）。
 - 出口的 SSRF 防线必须覆盖**解析结果**，不能只看 URL 里的主机名：主机名可以解析成公网
   IP 骗过检查后再改指向 `127.0.0.1`（DNS rebinding）。宿主自己解析、逐条校验，
   再把地址钉给 reqwest。

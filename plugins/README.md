@@ -29,9 +29,21 @@ cargo build --manifest-path plugins/my-site/Cargo.toml \
 - `data_source`：数据来源；
 - `authorization_boundary`：授权边界与不支持的行为；
 - `maintenance`：`active`、`limited`、`unmaintained` 或 `archived`；
-- `known_limitations`：已知限制列表。
+- `known_limitations`：已知限制列表；
+- `permissions`：插件实际申请的宿主能力（`http`、`clock`、`storage-read`、
+  `storage-write`、`secret-read`、`secret-write`）；
+- `allowed_domains`：插件实际访问的域名。申请了 `http` 就必须写，且不允许通配；
+  站点主域名必须被它覆盖。
 
-发布脚本会拒绝缺少这些字段或维护状态无效的插件，并将元数据写入 registry 和插件页面。
+发布脚本会拒绝缺少这些字段、维护状态无效、许可证不在允许列表、或
+`Cargo.toml` 与 `plugin.toml` 许可证不一致的插件，并把元数据写入 registry 与插件页面。
+
+`permissions`/`allowed_domains` 是**唯一会被要求与代码一致的元数据**：它们必须
+与插件 `metadata()` 的返回值逐项相同。插件侧的契约测试
+（模板里的 `manifest_matches_metadata`）让 `cargo test` 直接拦下不一致。宿主的
+安全策略取的是 WASM 自己那份，registry 这份只用于展示与审核，因此宿主在
+**安装时**还会再比对一次：WASM 比 registry 多申请一项能力就拒绝安装（注册表
+隐瞒了插件真实能力），registry 多写则只告警（文档过错，不影响安全）。
 
 ## 离线回放与录制
 
