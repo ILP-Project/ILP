@@ -106,6 +106,21 @@ data/
   宿主通过 `CURRENT_ABI` 和 `SUPPORTED_ABIS` 管理 ABI 兼容性：当前 ABI 为 `0.2.0`，目前支持 `0.1.0` 与 `0.2.0`。ABI `0.1.0` 仍可加载，但安装时会发出弃用警告；不在支持列表中的 ABI 会在下载前拒绝。旧的 `SUPPORTED_ABI` 常量仅作为兼容别名保留。
 - 搜索是游标分页，无法跳到指定页。
 
+## 插件签名与信任治理
+
+配置项（`config.json`）：
+
+| 字段 | 说明 |
+|---|---|
+| `plugin_trusted_keys` | `key_id` → Base64 的 32 字节 Ed25519 公钥 |
+| `plugin_revoked_keys` | 已撤销的 `key_id`；撤销优先于验证，命中即拒绝 |
+| `require_plugin_signatures` | 是否拒绝无签名的插件 |
+| `plugin_signature_threshold` | 要求多少个**不同密钥**的有效签名，默认 `1` |
+
+轮换流程：新密钥加入 `plugin_trusted_keys` 后重新发布；确认旧密钥停用后把它的 `key_id` 加入 `plugin_revoked_keys`，此时带旧签名的元数据即使公钥仍在信任列表里也会被拒绝。
+
+多签时候选签名集为数组，同一 `key_id` 重复出现只计一次，因此阈值无法靠复制同一行凑够；未知或已撤销的签名者会被跳过，只要剩余有效签名数达到阈值就允许安装。
+
 ## 致谢与许可
 
 协议细节（设备注册、Argus 签名、密钥协商、正文解密）的实现参考了

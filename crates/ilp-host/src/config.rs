@@ -44,12 +44,15 @@ pub struct Config {
     /// 配置了信任根后，是否拒绝没有有效签名的插件。
     #[serde(default)]
     pub require_plugin_signatures: bool,
+    /// 安装时要求多少个“不同密钥”的有效签名。默认 1。
+    #[serde(default = "default_signature_threshold")]
+    pub plugin_signature_threshold: usize,
     /// 原始文件内容，仅用于检查未知字段，不参与序列化
     #[serde(skip)]
     raw: String,
 }
 
-const KNOWN_FIELDS: [&str; 14] = [
+const KNOWN_FIELDS: [&str; 15] = [
     "data_folder",
     "novels_folder",
     "logs_folder",
@@ -64,7 +67,12 @@ const KNOWN_FIELDS: [&str; 14] = [
     "plugin_trusted_keys",
     "plugin_revoked_keys",
     "require_plugin_signatures",
+    "plugin_signature_threshold",
 ];
+
+fn default_signature_threshold() -> usize {
+    1
+}
 
 fn default_data_folder() -> String {
     "data".into()
@@ -116,6 +124,7 @@ impl Default for Config {
             plugin_trusted_keys: HashMap::new(),
             plugin_revoked_keys: Vec::new(),
             require_plugin_signatures: false,
+            plugin_signature_threshold: default_signature_threshold(),
             raw: String::new(),
         }
     }

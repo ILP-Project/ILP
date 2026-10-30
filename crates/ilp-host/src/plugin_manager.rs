@@ -49,7 +49,27 @@ struct RegistryPlugin {
     #[serde(default)]
     artifacts: HashMap<String, RegistryArtifact>,
     #[serde(default)]
-    signatures: HashMap<String, RegistrySignature>,
+    signatures: HashMap<String, RegistrySignatures>,
+}
+
+/// 每版本签名集合。
+///
+/// registry 历史上只发单个对象，后续要支持多签，因此两种形态都要能解析：
+/// 拒掉旧格式会让已经发布的 registry 直接装不了。
+#[derive(Deserialize, Debug, Clone)]
+#[serde(untagged)]
+enum RegistrySignatures {
+    One(RegistrySignature),
+    Many(Vec<RegistrySignature>),
+}
+
+impl RegistrySignatures {
+    fn iter(&self) -> impl Iterator<Item = &RegistrySignature> {
+        match self {
+            RegistrySignatures::One(sig) => std::slice::from_ref(sig).iter(),
+            RegistrySignatures::Many(sigs) => sigs.iter(),
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -280,15 +300,58 @@ fn verify_signature(
     version: &str,
     bytes: &[u8],
 ) -> Result<()> {
-    let signature = plugin.signatures.get(version);
-    if signature.is_none() {
+    let Some(signatures) = plugin.signatures.get(version) else {
         if config.require_plugin_signatures {
             return Err(anyhow!("插件 {} {} 缺少签名", plugin.name, version));
         }
         tracing::warn!(plugin = %plugin.name, version, "插件没有签名，继续安装（未启用强制签名校验）");
         return Ok(());
+    };
+
+    // 同一 key 重复出现不能算两个签名，否则满足阈值只需把同一行复制两遍。
+    let mut verified_keys: Vec<&str> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for signature in signatures.iter() {
+        match verify_one_signature(config, plugin, version, bytes, signature) {
+            Ok(()) => {
+                if verified_keys.contains(&signature.key_id.as_str()) {
+                    tracing::warn!(
+                        plugin = %plugin.name,
+                        key_id = %signature.key_id,
+                        "重复的签名密钥被去重，不重复计入阈值"
+                    );
+                } else {
+                    verified_keys.push(&signature.key_id);
+                }
+            }
+            Err(err) => errors.push(format!("{err:#}")),
+        }
     }
-    let signature = signature.expect("checked above");
+
+    if verified_keys.len() >= config.plugin_signature_threshold {
+        return Ok(());
+    }
+
+    let mut message = format!(
+        "插件 {} {} 的有效签名数 {} 未达到要求的 {}",
+        plugin.name,
+        version,
+        verified_keys.len(),
+        config.plugin_signature_threshold
+    );
+    if !errors.is_empty() {
+        message.push_str(&format!("；签名错误: {}", errors.join(" | ")));
+    }
+    Err(anyhow!(message))
+}
+
+fn verify_one_signature(
+    config: &Config,
+    plugin: &RegistryPlugin,
+    version: &str,
+    bytes: &[u8],
+    signature: &RegistrySignature,
+) -> Result<()> {
     if config
         .plugin_revoked_keys
         .iter()
@@ -775,10 +838,10 @@ mod tests {
             artifacts: HashMap::new(),
             signatures: [(
                 "1".into(),
-                RegistrySignature {
+                RegistrySignatures::One(RegistrySignature {
                     key_id: key_id.into(),
                     signature,
-                },
+                }),
             )]
             .into_iter()
             .collect(),
@@ -794,6 +857,121 @@ mod tests {
         config.require_plugin_signatures = true;
         let err = verify_signature(&config, &plugin, "1", bytes).expect_err("撤销密钥必须拒绝");
         assert!(format!("{err:#}").contains("已撤销"));
+    }
+
+    fn plugin_with_signatures(
+        signatures: Vec<(&str, &ed25519_dalek::SigningKey)>,
+        bytes: &[u8],
+    ) -> RegistryPlugin {
+        let sigs = signatures
+            .into_iter()
+            .map(|(key_id, signing)| RegistrySignature {
+                key_id: key_id.into(),
+                signature: BASE64.encode(ed25519_dalek::Signer::sign(signing, bytes).to_bytes()),
+            })
+            .collect::<Vec<_>>();
+        RegistryPlugin {
+            name: "a".into(),
+            site_id: "a".into(),
+            abi: "0.2.0".into(),
+            latest: "1".into(),
+            versions: vec!["1".into()],
+            url: "a.wasm".into(),
+            size: None,
+            sha256: None,
+            artifacts: HashMap::new(),
+            signatures: [("1".to_string(), RegistrySignatures::Many(sigs))]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    fn trust(keys: &[(&str, &ed25519_dalek::SigningKey)]) -> Config {
+        let mut config = Config::default();
+        config.plugin_trusted_keys = keys
+            .iter()
+            .map(|(id, signing)| {
+                (
+                    id.to_string(),
+                    BASE64.encode(signing.verifying_key().to_bytes()),
+                )
+            })
+            .collect();
+        config.require_plugin_signatures = true;
+        config
+    }
+
+    #[test]
+    fn multi_signature_threshold_is_enforced() {
+        use ed25519_dalek::SigningKey;
+        let a = SigningKey::from_bytes(&[1u8; 32]);
+        let b = SigningKey::from_bytes(&[2u8; 32]);
+        let bytes = b"plugin";
+        let plugin = plugin_with_signatures(vec![("a", &a), ("b", &b)], bytes);
+
+        let mut config = trust(&[("a", &a), ("b", &b)]);
+        config.plugin_signature_threshold = 2;
+        verify_signature(&config, &plugin, "1", bytes).expect("双签应满足阈值 2");
+
+        // 阈值提到 3，只有两个不同密钥，必须拒绝。
+        config.plugin_signature_threshold = 3;
+        let err = verify_signature(&config, &plugin, "1", bytes).expect_err("阈值不足必须拒绝");
+        assert!(
+            format!("{err:#}").contains("未达到要求的 3"),
+            "实得: {err:#}"
+        );
+    }
+
+    #[test]
+    fn duplicated_key_does_not_count_twice() {
+        use ed25519_dalek::SigningKey;
+        let a = SigningKey::from_bytes(&[3u8; 32]);
+        let bytes = b"plugin";
+        // 同一把密钥签两次：不能算两个签名者。
+        let plugin = plugin_with_signatures(vec![("a", &a), ("a", &a)], bytes);
+        let mut config = trust(&[("a", &a)]);
+        config.plugin_signature_threshold = 2;
+        let err = verify_signature(&config, &plugin, "1", bytes).expect_err("重复密钥不能凑够阈值");
+        assert!(
+            format!("{err:#}").contains("未达到要求的 2"),
+            "实得: {err:#}"
+        );
+    }
+
+    #[test]
+    fn unknown_signer_is_ignored_when_threshold_met() {
+        use ed25519_dalek::SigningKey;
+        let a = SigningKey::from_bytes(&[4u8; 32]);
+        let b = SigningKey::from_bytes(&[5u8; 32]);
+        let bytes = b"plugin";
+        // b 未配置为信任根：它的签名必须被跳过，不能因为“有一行不认识”就整包失败。
+        let plugin = plugin_with_signatures(vec![("a", &a), ("b", &b)], bytes);
+        let config = trust(&[("a", &a)]);
+        verify_signature(&config, &plugin, "1", bytes).expect("已信任的一签已足够");
+    }
+
+    #[test]
+    fn legacy_single_signature_shape_still_parses() {
+        let raw = r#"{
+            "name":"a","site_id":"a","abi":"0.2.0","latest":"1","versions":["1"],
+            "url":"a.wasm",
+            "signatures":{"1":{"key_id":"k","signature":"c2ln"}}
+        }"#;
+        let plugin: RegistryPlugin = serde_json::from_str(raw).expect("旧单签格式仍可解析");
+        let sigs = plugin.signatures.get("1").expect("有签名");
+        assert_eq!(sigs.iter().count(), 1);
+    }
+
+    #[test]
+    fn signature_array_shape_parses() {
+        let raw = r#"{
+            "name":"a","site_id":"a","abi":"0.2.0","latest":"1","versions":["1"],
+            "url":"a.wasm",
+            "signatures":{"1":[{"key_id":"k1","signature":"c2ln"},{"key_id":"k2","signature":"c2ln"}]}
+        }"#;
+        let plugin: RegistryPlugin = serde_json::from_str(raw).expect("多签格式可解析");
+        let sigs = plugin.signatures.get("1").expect("有签名");
+        assert_eq!(sigs.iter().count(), 2);
     }
 
     #[test]
