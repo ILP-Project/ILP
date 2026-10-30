@@ -16,7 +16,6 @@ const USER_AGENT: &str =
 
 const TIMEOUT_SECS: u64 = 30;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_TEXT_BYTES: usize = 2 * 1024 * 1024;
 
 /// 每个请求最多再试几次（不含首次）。网络抖动与瞬时 5xx 都能靠它自愈。
 const MAX_RETRIES: u32 = 2;
@@ -229,21 +228,6 @@ fn client_for(url: &reqwest::Url) -> Result<Arc<Client>> {
     pinned_client(host, &addrs)
 }
 
-pub fn get_text(url: &str) -> Result<String> {
-    crate::cancel::check()?;
-    let parsed = reqwest::Url::parse(url).with_context(|| format!("无效 URL: {url}"))?;
-    let resp = client_for(&parsed)?
-        .get(url)
-        .send()
-        .with_context(|| format!("请求失败: {url}"))?;
-    if !resp.status().is_success() {
-        return Err(anyhow!("HTTP 状态码 {}: {url}", resp.status()));
-    }
-    let bytes =
-        read_limited(resp, MAX_TEXT_BYTES).with_context(|| format!("读取响应失败: {url}"))?;
-    String::from_utf8(bytes).context("响应不是有效 UTF-8")
-}
-
 pub fn get_bytes(url: &str) -> Result<Vec<u8>> {
     crate::cancel::check()?;
     let parsed = reqwest::Url::parse(url).with_context(|| format!("无效 URL: {url}"))?;
@@ -257,6 +241,28 @@ pub fn get_bytes(url: &str) -> Result<Vec<u8>> {
     let bytes =
         read_limited(resp, MAX_RESPONSE_BYTES).with_context(|| format!("读取响应失败: {url}"))?;
     Ok(bytes)
+}
+
+/// 取一个可能不存在的资源：404 返回 `Ok(None)`，其它错误照常上报。
+///
+/// 给“可选的旁路文件”用（比如 registry 的分离签名）。不能用它区分
+/// “不存在”和“网络坏了”——后者必须报错，否则断网会被当成“没有签名”。
+pub fn get_bytes_if_exists(url: &str) -> Result<Option<Vec<u8>>> {
+    crate::cancel::check()?;
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("无效 URL: {url}"))?;
+    let resp = client_for(&parsed)?
+        .get(url)
+        .send()
+        .with_context(|| format!("请求失败: {url}"))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(anyhow!("HTTP 状态码 {}: {url}", resp.status()));
+    }
+    let bytes =
+        read_limited(resp, MAX_RESPONSE_BYTES).with_context(|| format!("读取响应失败: {url}"))?;
+    Ok(Some(bytes))
 }
 
 /// 把插件给的请求发给对端，返回 WIT 形状的响应。
@@ -601,6 +607,46 @@ mod tests {
             headers: Vec::new(),
             body: None,
         }
+    }
+
+    /// “可选资源”不能被网络故障伪装成“不存在”。
+    ///
+    /// 若 404 和其它错误混淆，registry 签名校验会在断网时静默跳过，
+    /// 那等于关掉了整条元数据信任链。
+    #[test]
+    fn optional_fetch_reports_missing_but_not_broken() {
+        let _guard = crate::cancel::test_guard();
+        let rt = rt();
+        let server = start_server(&rt, |server| {
+            Box::pin(async move {
+                wiremock::Mock::given(wiremock::matchers::method("GET"))
+                    .and(wiremock::matchers::path("/present.sig"))
+                    .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("sig"))
+                    .mount(&server)
+                    .await;
+                wiremock::Mock::given(wiremock::matchers::method("GET"))
+                    .and(wiremock::matchers::path("/gone.sig"))
+                    .respond_with(wiremock::ResponseTemplate::new(404))
+                    .mount(&server)
+                    .await;
+                server
+            })
+        });
+
+        let present = get_bytes_if_exists(&format!("{}/present.sig", server.uri()))
+            .expect("200 应成功")
+            .expect("应有内容");
+        assert_eq!(present, b"sig");
+
+        let missing =
+            get_bytes_if_exists(&format!("{}/gone.sig", server.uri())).expect("404 不是错误");
+        assert!(missing.is_none(), "404 应表示不存在");
+
+        // 指向一个不该解析的地址：必须报错，而不是 Ok(None)。
+        let broken = get_bytes_if_exists("https://127.0.0.1/sig");
+        assert!(broken.is_err(), "网络/地址错误不能退化成“不存在”");
+        drop(server);
+        drop(rt);
     }
 
     #[test]

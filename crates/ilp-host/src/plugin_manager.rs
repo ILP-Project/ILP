@@ -1,6 +1,4 @@
 use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::Deserialize;
 use sha2::Digest;
 use std::collections::HashMap;
@@ -9,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::PluginCommand;
 use crate::config::Config;
+use crate::signing::SignatureSet;
 
 /// 站点只发布一个 ABI 版本。必须与 `ilp-plugin-wit` 里
 /// `package ilp:plugin@x.y.z` 保持一致。
@@ -52,31 +51,8 @@ struct RegistryPlugin {
     signatures: HashMap<String, RegistrySignatures>,
 }
 
-/// 每版本签名集合。
-///
-/// registry 历史上只发单个对象，后续要支持多签，因此两种形态都要能解析：
-/// 拒掉旧格式会让已经发布的 registry 直接装不了。
-#[derive(Deserialize, Debug, Clone)]
-#[serde(untagged)]
-enum RegistrySignatures {
-    One(RegistrySignature),
-    Many(Vec<RegistrySignature>),
-}
-
-impl RegistrySignatures {
-    fn iter(&self) -> impl Iterator<Item = &RegistrySignature> {
-        match self {
-            RegistrySignatures::One(sig) => std::slice::from_ref(sig).iter(),
-            RegistrySignatures::Many(sigs) => sigs.iter(),
-        }
-    }
-}
-
-#[derive(Deserialize, Debug, Clone)]
-struct RegistrySignature {
-    key_id: String,
-    signature: String,
-}
+/// 每版本签名集合，与 registry 元数据签名共用同一套信任语义。
+type RegistrySignatures = SignatureSet;
 
 #[derive(Deserialize, Debug, Clone)]
 struct RegistryArtifact {
@@ -300,96 +276,15 @@ fn verify_signature(
     version: &str,
     bytes: &[u8],
 ) -> Result<()> {
+    let subject = format!("插件 {} {}", plugin.name, version);
     let Some(signatures) = plugin.signatures.get(version) else {
         if config.require_plugin_signatures {
-            return Err(anyhow!("插件 {} {} 缺少签名", plugin.name, version));
+            return Err(anyhow!("{subject} 缺少签名"));
         }
         tracing::warn!(plugin = %plugin.name, version, "插件没有签名，继续安装（未启用强制签名校验）");
         return Ok(());
     };
-
-    // 同一 key 重复出现不能算两个签名，否则满足阈值只需把同一行复制两遍。
-    let mut verified_keys: Vec<&str> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-    for signature in signatures.iter() {
-        match verify_one_signature(config, plugin, version, bytes, signature) {
-            Ok(()) => {
-                if verified_keys.contains(&signature.key_id.as_str()) {
-                    tracing::warn!(
-                        plugin = %plugin.name,
-                        key_id = %signature.key_id,
-                        "重复的签名密钥被去重，不重复计入阈值"
-                    );
-                } else {
-                    verified_keys.push(&signature.key_id);
-                }
-            }
-            Err(err) => errors.push(format!("{err:#}")),
-        }
-    }
-
-    if verified_keys.len() >= config.plugin_signature_threshold {
-        return Ok(());
-    }
-
-    let mut message = format!(
-        "插件 {} {} 的有效签名数 {} 未达到要求的 {}",
-        plugin.name,
-        version,
-        verified_keys.len(),
-        config.plugin_signature_threshold
-    );
-    if !errors.is_empty() {
-        message.push_str(&format!("；签名错误: {}", errors.join(" | ")));
-    }
-    Err(anyhow!(message))
-}
-
-fn verify_one_signature(
-    config: &Config,
-    plugin: &RegistryPlugin,
-    version: &str,
-    bytes: &[u8],
-    signature: &RegistrySignature,
-) -> Result<()> {
-    if config
-        .plugin_revoked_keys
-        .iter()
-        .any(|key_id| key_id == &signature.key_id)
-    {
-        return Err(anyhow!(
-            "插件 {} 使用已撤销的签名密钥 {}",
-            plugin.name,
-            signature.key_id
-        ));
-    }
-    let key_text = config
-        .plugin_trusted_keys
-        .get(&signature.key_id)
-        .ok_or_else(|| {
-            anyhow!(
-                "插件 {} 使用未信任的签名密钥 {}",
-                plugin.name,
-                signature.key_id
-            )
-        })?;
-    let key_bytes = BASE64
-        .decode(key_text)
-        .context("信任公钥不是有效的 base64")?;
-    let key_array: [u8; 32] = key_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("Ed25519 公钥必须是 32 字节"))?;
-    let key = VerifyingKey::from_bytes(&key_array).context("Ed25519 公钥无效")?;
-    let sig_bytes = BASE64
-        .decode(&signature.signature)
-        .context("插件签名不是有效的 base64")?;
-    let sig_array: [u8; 64] = sig_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("Ed25519 签名必须是 64 字节"))?;
-    key.verify(bytes, &Signature::from_bytes(&sig_array))
-        .map_err(|_| anyhow!("插件 {} {} 的签名校验失败", plugin.name, version))
+    crate::signing::verify(config, &subject, bytes, signatures)
 }
 
 fn verify_artifact(bytes: &[u8], p: &RegistryPlugin) -> Result<()> {
@@ -419,8 +314,11 @@ fn install(config: &Config, source: &str) -> Result<()> {
     let name = safe_plugin_name(&name)?.to_string();
     let base = registry_base();
 
-    let text = crate::http::get_text(&format!("{base}/registry.json"))
+    let registry_url = format!("{base}/registry.json");
+    let raw = crate::http::get_bytes(&registry_url)
         .context("获取插件 registry 失败（可用 ILP_REGISTRY_URL 指定镜像）")?;
+    verify_registry_signature(config, &base, &raw)?;
+    let text = String::from_utf8(raw).context("registry.json 不是有效 UTF-8")?;
     let reg: Registry = serde_json::from_str(&text).context("解析 registry.json 失败")?;
     if reg.schema != 0 && reg.schema != 1 {
         return Err(anyhow!(
@@ -525,6 +423,33 @@ fn validate_wasm(bytes: &[u8]) -> Result<()> {
     }
 }
 
+/// 校验 registry 元数据的签名。
+///
+/// 插件产物本身已单独签名，为什么还要签元数据？因为产物签名只证明
+/// "这段代码是某个可信发布者给的"，不证明"这个名字和版本该指向它"。
+/// 元数据未签名时，攻击者可以把 `install fanqie` 指到一个有效签名但
+/// 有已知漏洞的旧版本，或者把名字重定向到别的插件。
+///
+/// 签名是对 `registry.json` 的**原始字节**，放在旁路的 `registry.json.sig`：
+/// 把签名写进 JSON 内部就成了自指（签名内容含签名），而重新序列化做
+/// 规范化又会引入"两侧算法必须完全一致"的隐式契约。
+fn verify_registry_signature(config: &Config, base: &str, bytes: &[u8]) -> Result<()> {
+    let sig_url = format!("{base}/registry.json.sig");
+    let Some(raw) = crate::http::get_bytes_if_exists(&sig_url)? else {
+        if config.require_registry_signatures {
+            return Err(anyhow!(
+                "registry 元数据没有签名（{sig_url} 不存在），已启用 require_registry_signatures。\
+                 请把镜像升级到带签名的版本，或关闭该开关"
+            ));
+        }
+        tracing::warn!("registry 元数据没有签名，跳过校验（未启用 require_registry_signatures）");
+        return Ok(());
+    };
+    let set: SignatureSet =
+        serde_json::from_slice(&raw).with_context(|| format!("解析 {sig_url} 失败"))?;
+    crate::signing::verify(config, "registry 元数据", bytes, &set)
+}
+
 fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = dest.with_extension("wasm.tmp");
     fs::write(&tmp, bytes)?;
@@ -603,6 +528,8 @@ fn plugin_paths(config: &Config, name: &str) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signing::SignatureEntry;
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
     #[test]
     fn source_accepts_name_and_optional_version() {
@@ -703,6 +630,38 @@ mod tests {
             }"#,
         )
         .expect("样例 registry")
+    }
+
+    /// registry 元数据签名要能自动跟随安装路径校验；这里直接测
+    /// 校验函数本身，避免为它起一个 HTTP 服务。
+    #[test]
+    fn registry_metadata_signature_is_verified() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let key = SigningKey::from_bytes(&[41u8; 32]);
+        let body = br#"{"schema":1,"plugins":[]}"#;
+        let mut config = Config::default();
+        config.plugin_trusted_keys = [(
+            "meta".to_string(),
+            B64.encode(key.verifying_key().to_bytes()),
+        )]
+        .into_iter()
+        .collect();
+        config.require_plugin_signatures = true;
+
+        let good = SignatureSet::One(SignatureEntry {
+            key_id: "meta".into(),
+            signature: B64.encode(key.sign(body).to_bytes()),
+        });
+        crate::signing::verify(&config, "registry 元数据", body, &good).expect("签名应通过");
+
+        // 元数据被改一位就必须拒绝：这正是“元数据未签名能被重定向”的防线。
+        let mut tampered = body.to_vec();
+        tampered[10] ^= 0xff;
+        let err = crate::signing::verify(&config, "registry 元数据", &tampered, &good)
+            .expect_err("篡改必须拒绝");
+        assert!(format!("{err:#}").contains("签名校验失败"), "实得: {err:#}");
     }
 
     #[test]
@@ -843,7 +802,7 @@ mod tests {
             artifacts: HashMap::new(),
             signatures: [(
                 "1".into(),
-                RegistrySignatures::One(RegistrySignature {
+                RegistrySignatures::One(SignatureEntry {
                     key_id: key_id.into(),
                     signature,
                 }),
@@ -870,7 +829,7 @@ mod tests {
     ) -> RegistryPlugin {
         let sigs = signatures
             .into_iter()
-            .map(|(key_id, signing)| RegistrySignature {
+            .map(|(key_id, signing)| SignatureEntry {
                 key_id: key_id.into(),
                 signature: BASE64.encode(ed25519_dalek::Signer::sign(signing, bytes).to_bytes()),
             })

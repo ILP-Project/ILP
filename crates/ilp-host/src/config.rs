@@ -47,12 +47,17 @@ pub struct Config {
     /// 安装时要求多少个“不同密钥”的有效签名。默认 1。
     #[serde(default = "default_signature_threshold")]
     pub plugin_signature_threshold: usize,
+    /// 是否要求 registry 元数据本身带有效签名。
+    ///
+    /// 默认关闭是为了兼容还没发签名的镜像；打开后缺失签名会直接拒绝安装。
+    #[serde(default)]
+    pub require_registry_signatures: bool,
     /// 原始文件内容，仅用于检查未知字段，不参与序列化
     #[serde(skip)]
     raw: String,
 }
 
-const KNOWN_FIELDS: [&str; 15] = [
+const KNOWN_FIELDS: [&str; 16] = [
     "data_folder",
     "novels_folder",
     "logs_folder",
@@ -68,6 +73,7 @@ const KNOWN_FIELDS: [&str; 15] = [
     "plugin_revoked_keys",
     "require_plugin_signatures",
     "plugin_signature_threshold",
+    "require_registry_signatures",
 ];
 
 fn default_signature_threshold() -> usize {
@@ -125,6 +131,7 @@ impl Default for Config {
             plugin_revoked_keys: Vec::new(),
             require_plugin_signatures: false,
             plugin_signature_threshold: default_signature_threshold(),
+            require_registry_signatures: false,
             raw: String::new(),
         }
     }

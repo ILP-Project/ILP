@@ -7,6 +7,7 @@ mod exit;
 mod http;
 mod logging;
 mod plugin_manager;
+mod signing;
 mod storage;
 
 #[cfg(test)]

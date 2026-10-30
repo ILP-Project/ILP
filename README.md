@@ -116,6 +116,24 @@ data/
 | `plugin_revoked_keys` | 已撤销的 `key_id`；撤销优先于验证，命中即拒绝 |
 | `require_plugin_signatures` | 是否拒绝无签名的插件 |
 | `plugin_signature_threshold` | 要求多少个**不同密钥**的有效签名，默认 `1` |
+| `require_registry_signatures` | 是否要求 registry 元数据本身带有效签名，默认 `false` |
+
+签名分两层，防的是两类不同的攻击：
+
+- **产物签名**（`registry.json` 里每个版本的 `signatures`）：证明这段 WASM 出自可信发布者。
+- **元数据签名**（旁路文件 `registry.json.sig`）：证明「`install fanqie` 该落到哪个名字、版本和地址」。
+
+只签产物时，攻击者不需要伪造签名也能把 `latest` 改成某个**有效签名但已知有漏洞**的旧版本，或把名字重定向到别的插件。两层都打开才闭环：
+
+```json
+{
+  "plugin_trusted_keys": { "release-2026": "fCwdShD1t/UBgVqcn/h90gSdhFAvI6ld4EEpYe/HGgc=" },
+  "require_plugin_signatures": true,
+  "require_registry_signatures": true
+}
+```
+
+`registry.json.sig` 签的是 `registry.json` 的**原始字节**，不是重新序列化后的结构——JSON 规范化（键序、空白、数字写法）只要两侧有一点不一致，就会出现「我们签的」和「用户验的」不是同一串字节。签名放在文件旁边而不是写进 JSON 内部，也避免自指。
 
 轮换流程：新密钥加入 `plugin_trusted_keys` 后重新发布；确认旧密钥停用后把它的 `key_id` 加入 `plugin_revoked_keys`，此时带旧签名的元数据即使公钥仍在信任列表里也会被拒绝。
 
