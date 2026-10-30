@@ -25,6 +25,7 @@ fn run() -> anyhow::Result<()> {
     let command = cli::parse();
     let config = config::Config::load("config.json")?;
     let _log_guard = logging::init(&config)?;
+    commands::install_signal_handlers()?;
 
     // 配置里的异常值在日志起来之后重新报一遍，否则早先的告警会丢。
     config.report_problems();

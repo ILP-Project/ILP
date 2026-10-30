@@ -5,10 +5,41 @@ use crate::engine::PluginInstance;
 use crate::storage::{Book, Storage};
 use ilp_types::ChapterContent;
 use std::io::IsTerminal;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Once;
 
 /// 一批最多塞多少章给 plan_fetch。
 /// 批量站点用它摊薄请求数，网页站点自己会一章一任务。
 const BATCH_SIZE: usize = 30;
+
+static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+static SIGNALS_INSTALLED: Once = Once::new();
+
+pub fn install_signal_handlers() -> Result<()> {
+    let mut error = None;
+    SIGNALS_INSTALLED.call_once(|| {
+        if let Err(e) = ctrlc::set_handler(|| {
+            if CANCEL_REQUESTED.swap(true, Ordering::SeqCst) {
+                std::process::exit(130);
+            }
+            eprintln!("收到取消请求，将在当前请求完成后停止...");
+        }) {
+            error = Some(anyhow!("安装 Ctrl-C 处理器失败: {e}"));
+        }
+    });
+    match error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+fn cancellation_requested() -> bool {
+    CANCEL_REQUESTED.load(Ordering::SeqCst)
+}
+
+fn jsonl_enabled() -> bool {
+    std::env::var_os("ILP_JSONL").is_some() || std::env::var_os("ILP_JSON").is_some()
+}
 
 pub fn do_get(
     plugins: &mut [PluginInstance],
@@ -117,6 +148,9 @@ fn fetch_all(
     let mut failed = 0usize;
 
     for chunk in todo.chunks(BATCH_SIZE) {
+        if cancellation_requested() {
+            return Err(anyhow!("下载已取消"));
+        }
         let ids: Vec<String> = chunk.iter().map(|(_, c)| c.id.clone()).collect();
         let tasks = match plugin.plan_fetch(&ids) {
             Ok(t) => t,
@@ -305,8 +339,8 @@ fn persist(
     ) {
         Ok(_) => {
             *done += 1;
-            if std::env::var_os("ILP_JSONL").is_some() {
-                let event = serde_json::json!({"event":"chapter_downloaded","book":book.title,"chapter":item.title,"id":item.id});
+            if jsonl_enabled() {
+                let event = serde_json::json!({"event":"chapter_downloaded","book":book.title,"chapter":item.title,"id":item.id,"status":"ok"});
                 println!("{}", event);
             } else {
                 println!("已下载: {} - {}", book.title, item.title);
