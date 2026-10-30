@@ -1,0 +1,12 @@
+name = "template"
+site_name = "Example Site"
+site_id = "example"
+site_domain = "example.com"
+description = "用于开发和测试的 ILP 插件模板。"
+author = "Plugin Author"
+license = "MIT"
+data_source = "Example Site 公开可访问内容"
+authorization_boundary = "仅用于公开内容测试；不实现账号密码登录，不绕过付费或访问控制"
+maintenance = "active"
+known_limitations = ["模板不实现真实站点抓取"]
+abi = "0.2.0"

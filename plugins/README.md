@@ -21,6 +21,18 @@ cargo build --manifest-path plugins/my-site/Cargo.toml \
 
 宿主安装前会校验 ABI、WASM component、大小、SHA-256 和签名。
 
+## 元数据治理
+
+每个插件必须在 `plugin.toml` 中声明：
+
+- `license`：代码许可证；
+- `data_source`：数据来源；
+- `authorization_boundary`：授权边界与不支持的行为；
+- `maintenance`：`active`、`limited`、`unmaintained` 或 `archived`；
+- `known_limitations`：已知限制列表。
+
+发布脚本会拒绝缺少这些字段或维护状态无效的插件，并将元数据写入 registry 和插件页面。
+
 ## 测试与发布门禁
 
 ```bash
