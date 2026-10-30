@@ -16,7 +16,13 @@ pub struct StorageCapability;
 pub struct SecretCapability;
 
 const MAX_PLUGIN_MEMORY: usize = 64 * 1024 * 1024;
-const MAX_PLUGIN_FUEL: u64 = 50_000_000;
+/// 单次插件调用的算力预算。
+///
+/// 这是“每次调用”的量，不是进程总量。实测一次 `consume-fetch` 解密 30 章
+/// 峰值约 1.7 亿条指令（番茄的 AES + gzip），所以留约 6 倍余量。
+/// 定得太小会在正常批量解密时误杀，而一次 trap 之后组件实例不可再用，
+/// 表现为后续调用全部报 “cannot enter component instance”。
+const MAX_PLUGIN_FUEL: u64 = 1_000_000_000;
 /// 墙钟预算：单次插件调用里**真正在跑 WebAssembly** 的时间上限。
 /// 宿主函数里的等待（网络、磁盘）不计入——否则一次 30 秒的 HTTP 重试
 /// 就能把一个规规矩矩的插件判成超时。
@@ -124,12 +130,18 @@ fn arm_deadline(store: &mut Store<HostState>) {
     state.timed_out = false;
     state.interrupted = false;
     store.set_epoch_deadline(deadline_ticks(limit).max(1));
+    // fuel 也是“每次调用”的预算，不是整个进程的总量。
+    // 不补充的话，第一个大章节批次就会烧完燃料，之后每次调用都直接
+    // trap 成 “cannot enter component instance”。
+    if let Err(e) = store.set_fuel(MAX_PLUGIN_FUEL) {
+        tracing::warn!("补充插件 fuel 失败: {e}");
+    }
 }
 
 /// 把 wasm trap 翻译成人能读的错误。
 ///
-/// 超时和插件自己报错是两回事：前者是宿主主动终止（插件死循环、算力卡死），
-/// 后者是插件返回了业务错误。混淆它们会让用户去查一个根本不存在的 bug。
+/// 超时、取消、算力耗尽和插件自己报错是四件不同的事：都是“运行没成功”，
+/// 但原因与处置方式完全不同。混在一起会让用户去查一个根本不存在的 bug。
 fn guest_error(store: &Store<HostState>, e: wasmtime::Error) -> anyhow::Error {
     if store.data().interrupted || crate::cancel::requested() {
         anyhow::Error::new(crate::cancel::Cancelled)
@@ -138,8 +150,15 @@ fn guest_error(store: &Store<HostState>, e: wasmtime::Error) -> anyhow::Error {
             "plugin::timeout: 插件执行超过 {} 秒被中止",
             store.data().call_limit.as_secs()
         )
+    } else if format!("{e:?}").contains("cannot enter component instance") {
+        anyhow!("plugin::poisoned: 插件实例因上一次调用中止而不可再用，请重试")
+    } else if store.get_fuel().is_ok_and(|f| f == 0) {
+        anyhow!(
+            "plugin::fuel: 单次调用耗尽算力预算（{} 条指令），已中止",
+            MAX_PLUGIN_FUEL
+        )
     } else {
-        anyhow!("plugin::{e}")
+        anyhow!("plugin::{e:?}")
     }
 }
 
@@ -1138,7 +1157,8 @@ fn guest_call<T>(
     f: impl FnOnce(&mut Store<HostState>) -> wasmtime::Result<T>,
 ) -> Result<T> {
     arm_deadline(store);
-    match f(store) {
+    let out = f(store);
+    match out {
         Ok(v) => Ok(v),
         Err(e) => Err(guest_error(store, e)),
     }
@@ -1427,6 +1447,40 @@ mod tests {
         store.data_mut().timed_out = true;
         guest_call(&mut store, |s| noop.call(s, ())).expect("第二次调用不应超时");
         assert!(!store.data().timed_out);
+
+        let _ = std::fs::remove_dir_all(&storage);
+    }
+
+    /// fuel 是“每次调用”的预算。不补充的话，第一个大章节批次就烧光了，
+    /// 之后每次调用都 trap——这正是吞掉整个下载的 bug。
+    #[test]
+    fn fuel_is_replenished_before_every_call() {
+        let engine = shared_engine();
+        let module = wasmtime::Module::new(
+            engine,
+            r#"(module (func (export "burn") (local i32)
+                 (local.set 0 (i32.const 200000))
+                 (loop $l
+                   (local.set 0 (i32.sub (local.get 0) (i32.const 1)))
+                   (br_if $l (local.get 0)))))"#,
+        )
+        .expect("编译耗算力模块");
+        let storage = std::env::temp_dir().join(format!("ilp-fuel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&storage);
+        let mut store =
+            new_store(engine, HostState::new("fuel".to_string(), storage.clone())).unwrap();
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).expect("实例化");
+        let burn = instance
+            .get_typed_func::<(), ()>(&mut store, "burn")
+            .expect("取 burn");
+
+        // 空转换器都不剩多少燃料，足以证明“下次调用还能继续跑”。
+        for round in 0..3 {
+            guest_call(&mut store, |s| burn.call(s, ()))
+                .unwrap_or_else(|e| panic!("第 {round} 次调用不该缺燃料: {e}"));
+            let left = store.get_fuel().expect("启用了 fuel");
+            assert!(left > 0, "第 {round} 次调用后燃料应为正数，实际 {left}");
+        }
 
         let _ = std::fs::remove_dir_all(&storage);
     }

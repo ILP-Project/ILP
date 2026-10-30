@@ -3,10 +3,11 @@ use reqwest::blocking::{Client, ClientBuilder};
 use reqwest::{redirect::Policy, Method, NoProxy, Proxy};
 
 use crate::engine::wit_types::{HttpHeader, HttpRequest, HttpResponse};
+use std::collections::HashMap;
 use std::io::Read;
-use std::net::IpAddr;
-use std::sync::OnceLock;
-use std::sync::{mpsc, Arc, Mutex};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,17 @@ const RETRY_BASE_MS: u64 = 500;
 /// 全局客户端：代理与 UA 只解析一次，避免每个请求都建连接池。
 static CLIENT: OnceLock<Client> = OnceLock::new();
 static INIT: OnceLock<()> = OnceLock::new();
+/// 初始化时用的代理配置，后续构建“钉死 IP”的客户端要复制它。
+static PROXY_CONFIG: OnceLock<(Option<String>, Vec<String>)> = OnceLock::new();
+/// 按 (host, ip) 缓存的客户端。同一目标反复请求时靠它复用连接池。
+type PinnedClients = Mutex<HashMap<(String, SocketAddr), Arc<Client>>>;
+static PINNED: OnceLock<PinnedClients> = OnceLock::new();
+
+/// 钉 IP 客户端的缓存上限。
+///
+/// 缓存是“主机 + 具体 IP”维度的，插件可以拿大量不同域名把它撞大；
+/// 满额时整表清空比 LRU 简单，代价只是丢一次连接池。
+const MAX_PINNED_CLIENTS: usize = 64;
 
 /// 用配置初始化全局客户端，必须在任何请求前调用一次。
 pub fn init(proxy: Option<&str>, no_proxy: &[String]) -> Result<()> {
@@ -33,12 +45,22 @@ pub fn init(proxy: Option<&str>, no_proxy: &[String]) -> Result<()> {
         return Ok(());
     }
     let client = build_client(proxy, no_proxy)?;
+    let _ = PROXY_CONFIG.set((proxy.map(str::to_string), no_proxy.to_vec()));
     let _ = CLIENT.set(client);
     let _ = INIT.set(());
     Ok(())
 }
 
 fn build_client(proxy: Option<&str>, no_proxy: &[String]) -> Result<Client> {
+    build_pinned(proxy, no_proxy, None)
+}
+
+/// `pin` 为 `Some((host, addr))` 时把该主机的解析结果钉死到 `addr`。
+fn build_pinned(
+    proxy: Option<&str>,
+    no_proxy: &[String],
+    pin: Option<(&str, &[SocketAddr])>,
+) -> Result<Client> {
     let mut builder: ClientBuilder = Client::builder()
         .timeout(Duration::from_secs(TIMEOUT_SECS))
         .redirect(Policy::none())
@@ -60,6 +82,12 @@ fn build_client(proxy: Option<&str>, no_proxy: &[String]) -> Result<Client> {
             builder = builder.proxy(px);
         }
         None => builder = builder.no_proxy(),
+    }
+
+    if let Some((host, addrs)) = pin {
+        // 一次钉上整个解析结果：某条地址连不通时 reqwest 还能换下一条，
+        // 同时保留“每条都被校验过”这个前提。
+        builder = builder.resolve_to_addrs(host, addrs);
     }
 
     builder.build().context("构建 HTTP 客户端失败")
@@ -88,9 +116,123 @@ fn client() -> &'static Client {
     })
 }
 
+/// 一个 IP 是否属于绝不允许插件访问的范围。
+///
+/// 单独抽出来，是因为它同时服务两个阶段：URL 字面量检查，
+/// 以及 DNS 解析后的每一个结果。
+fn is_forbidden_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                // 0.0.0.0/8 在很多系统上指向本机
+                || ip.octets()[0] == 0
+        }
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                // IPv4-mapped：`::ffff:127.0.0.1` 必须按 v4 规则判
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| is_forbidden_ip(IpAddr::V4(v4)))
+        }
+    }
+}
+
+/// 解析目标主机，返回所有通过校验的地址。
+///
+/// 这是堵 DNS rebinding 的关键：只在 URL 里看到主机名就放行，等于让攻击者
+/// 把 `evil.example` 先解析成公网 IP 骗过检查，再让它指向 127.0.0.1。
+/// 所以必须**自己解析一次**、逐条校验，再把结果钉给 reqwest——
+/// 让真正建立连接用的 IP 就是我检查过的那些。
+pub fn resolve_checked(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+    resolve_with(host, port, |host, port| {
+        (host, port)
+            .to_socket_addrs()
+            .map(|addrs| addrs.collect::<Vec<_>>())
+            .with_context(|| format!("解析域名失败: {host}"))
+    })
+}
+
+/// `resolve_checked` 的实现，查找函数可注入以便离线测试。
+fn resolve_with<F>(host: &str, port: u16, lookup: F) -> Result<Vec<SocketAddr>>
+where
+    F: Fn(&str, u16) -> Result<Vec<SocketAddr>>,
+{
+    // 字面量 IP 不需要解析，但同样要校验。
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_forbidden_ip(ip) {
+            return Err(anyhow!("禁止访问内网或特殊 IP: {host}"));
+        }
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    let addrs = lookup(host, port)?;
+    if addrs.is_empty() {
+        return Err(anyhow!("域名无解析结果: {host}"));
+    }
+    // 任何一条落到内网就整体拒绝：攻击者可以拿一条合法记录当门面，
+    // 真正被连中的却是另一条。
+    if let Some(bad) = addrs.iter().find(|a| is_forbidden_ip(a.ip())) {
+        return Err(anyhow!("域名 {host} 解析到禁止访问的地址 {}", bad.ip()));
+    }
+    Ok(addrs)
+}
+
+/// 取一个把 `host` 钉死到指定地址的客户端。
+///
+/// 已知限制：配了代理时，连接是发给代理的，域名由代理侧解析，
+/// 这里的钉 IP 不生效。所以代理场景下防线只剩 `resolve_checked`
+/// 本次解析的校验（TOCTOU 窗口依赖代理自己的解析策略）。
+/// 对敏感目标请同时把它放进 `no_proxy`，走直连钉 IP 路径。
+fn pinned_client(host: &str, addrs: &[SocketAddr]) -> Result<Arc<Client>> {
+    let cache = PINNED.get_or_init(|| Mutex::new(HashMap::new()));
+    // 缓存键用第一条地址即可：同一次解析的多条地址总是一起出现。
+    let key = (host.to_string(), addrs[0]);
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = guard.get(&key).cloned() {
+            return Ok(c);
+        }
+    }
+    let (proxy, no_proxy) = PROXY_CONFIG
+        .get()
+        .cloned()
+        .unwrap_or_else(|| (None, Vec::new()));
+    let client = Arc::new(build_pinned(
+        proxy.as_deref(),
+        &no_proxy,
+        Some((host, addrs)),
+    )?);
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    // 满额就整表清空，只丢一次连接池，不报错。
+    if guard.len() >= MAX_PINNED_CLIENTS {
+        guard.clear();
+    }
+    guard.insert(key, Arc::clone(&client));
+    Ok(client)
+}
+
+/// 发请求时用的客户端：能钉就钉，恒量目标（字面量 IP）直接复用全局客户端。
+fn client_for(url: &reqwest::Url) -> Result<Arc<Client>> {
+    let host = url.host_str().ok_or_else(|| anyhow!("URL 缺少主机名"))?;
+    let port = url.port_or_known_default().unwrap_or(443);
+    if host.parse::<IpAddr>().is_ok() {
+        return Ok(Arc::new(client().clone()));
+    }
+    let addrs = resolve_checked(host, port)?;
+    pinned_client(host, &addrs)
+}
+
 pub fn get_text(url: &str) -> Result<String> {
     crate::cancel::check()?;
-    let resp = client()
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("无效 URL: {url}"))?;
+    let resp = client_for(&parsed)?
         .get(url)
         .send()
         .with_context(|| format!("请求失败: {url}"))?;
@@ -104,7 +246,8 @@ pub fn get_text(url: &str) -> Result<String> {
 
 pub fn get_bytes(url: &str) -> Result<Vec<u8>> {
     crate::cancel::check()?;
-    let resp = client()
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("无效 URL: {url}"))?;
+    let resp = client_for(&parsed)?
         .get(url)
         .send()
         .with_context(|| format!("请求失败: {url}"))?;
@@ -122,7 +265,11 @@ pub fn send(request: &HttpRequest) -> Result<HttpResponse> {
     crate::cancel::check()?;
     let method = Method::from_bytes(request.method.as_bytes())
         .map_err(|_| anyhow!("非法 HTTP 方法: {}", request.method))?;
-    let mut req = client()
+    // 这里再解析一次 DNS 并把结果钉给客户端：上层的白名单只看了主机名，
+    // 真正决定连到哪里的是解析结果。
+    let parsed =
+        reqwest::Url::parse(&request.url).with_context(|| format!("无效 URL: {}", request.url))?;
+    let mut req = client_for(&parsed)?
         .request(method, &request.url)
         .timeout(Duration::from_secs(TIMEOUT_SECS));
 
@@ -184,23 +331,7 @@ pub fn validate_plugin_url(url: &str) -> Result<()> {
         return Err(anyhow!("禁止访问 localhost"));
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
-        let forbidden = match ip {
-            IpAddr::V4(ip) => {
-                ip.is_loopback()
-                    || ip.is_private()
-                    || ip.is_link_local()
-                    || ip.is_unspecified()
-                    || ip.is_broadcast()
-                    || ip.is_documentation()
-            }
-            IpAddr::V6(ip) => {
-                ip.is_loopback()
-                    || ip.is_unspecified()
-                    || ip.is_unique_local()
-                    || ip.is_unicast_link_local()
-            }
-        };
-        if forbidden {
+        if is_forbidden_ip(ip) {
             return Err(anyhow!("禁止访问内网或特殊 IP"));
         }
     }
@@ -347,6 +478,78 @@ mod tests {
         assert!(validate_plugin_url("https://localhost/api").is_err());
         assert!(validate_plugin_url("http://example.com").is_err());
         assert!(validate_plugin_url("https://example.com/api").is_ok());
+    }
+
+    #[test]
+    fn forbidden_ip_ranges_are_rejected() {
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.1.1",
+            "172.16.0.1",
+            "169.254.1.1",
+            "0.0.0.0",
+            "0.1.2.3",
+            "255.255.255.255",
+            "192.0.2.1",
+            "::1",
+            "::",
+            "fd00::1",
+            "fe80::1",
+            // IPv4-mapped 是最容易被漏掉的一种写法。
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert!(
+                is_forbidden_ip(ip.parse().expect("测试 IP 合法")),
+                "{ip} 应该被拒绝"
+            );
+        }
+        for ip in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
+            assert!(
+                !is_forbidden_ip(ip.parse().expect("测试 IP 合法")),
+                "{ip} 应该放行"
+            );
+        }
+    }
+
+    /// DNS rebinding 的核心用例：主机名本身没问题，解析结果才暴露攻击。
+    #[test]
+    fn rebinding_domain_resolving_to_loopback_is_rejected() {
+        let err = resolve_with("evil.example", 443, |_, port| {
+            Ok(vec![SocketAddr::from(([93, 184, 216, 34], port))])
+        });
+        assert!(err.is_ok(), "公网地址应通过");
+
+        let err = resolve_with("rebind.example", 443, |_, port| {
+            Ok(vec![
+                SocketAddr::from(([93, 184, 216, 34], port)),
+                SocketAddr::from(([127, 0, 0, 1], port)),
+            ])
+        })
+        .expect_err("解析到回环必须拒绝");
+        assert!(format!("{err:#}").contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn empty_resolution_is_rejected() {
+        let err = resolve_with("empty.example", 443, |_, _| Ok(Vec::new()))
+            .expect_err("无解析结果必须拒绝");
+        assert!(format!("{err:#}").contains("无解析结果"));
+    }
+
+    #[test]
+    fn literal_private_ip_skips_lookup_and_is_rejected() {
+        let err = resolve_with("10.0.0.5", 443, |_, _| {
+            panic!("字面量 IP 不应该触发 DNS 查询")
+        })
+        .expect_err("字面量内网 IP 必须拒绝");
+        assert!(format!("{err:#}").contains("内网"));
+        let ok = resolve_with("1.1.1.1", 443, |_, _| {
+            panic!("字面量 IP 不应该触发 DNS 查询")
+        })
+        .expect("公网字面量 IP 应通过");
+        assert_eq!(ok[0].port(), 443);
     }
 
     #[test]
