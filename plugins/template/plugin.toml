@@ -15,4 +15,9 @@ known_limitations = ["模板不实现真实站点抓取"]
 permissions = ["http", "clock"]
 allowed_domains = ["example.com"]
 
+# 宿主兼容范围（闭区间）。ABI 只锁接口形状；燃料预算、限流、落盘语义
+# 这些行为变化只能靠版本范围表达。
+min_host_version = "0.1.0"
+max_host_version = "0.1.99"
+
 abi = "0.2.0"

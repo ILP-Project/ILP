@@ -33,7 +33,8 @@ cargo build --manifest-path plugins/my-site/Cargo.toml \
 - `permissions`：插件实际申请的宿主能力（`http`、`clock`、`storage-read`、
   `storage-write`、`secret-read`、`secret-write`）；
 - `allowed_domains`：插件实际访问的域名。申请了 `http` 就必须写，且不允许通配；
-  站点主域名必须被它覆盖。
+  站点主域名必须被它覆盖；
+- `min_host_version` / `max_host_version`：宿主兼容区间（闭区间，`x.y.z`）。
 
 发布脚本会拒绝缺少这些字段、维护状态无效、许可证不在允许列表、或
 `Cargo.toml` 与 `plugin.toml` 许可证不一致的插件，并把元数据写入 registry 与插件页面。
@@ -44,6 +45,11 @@ cargo build --manifest-path plugins/my-site/Cargo.toml \
 安全策略取的是 WASM 自己那份，registry 这份只用于展示与审核，因此宿主在
 **安装时**还会再比对一次：WASM 比 registry 多申请一项能力就拒绝安装（注册表
 隐瞒了插件真实能力），registry 多写则只告警（文档过错，不影响安全）。
+
+`min_host_version`/`max_host_version` 与 ABI 是两件事：ABI 只锁接口形状，
+管不了燃料预算、限流策略、章节落盘语义这些行为差异。宿主安装时校验自己的
+版本是否落在区间内，不在就拒绝——否则一次宿主升级会让插件静默变慢或变错，
+用户只看到“下载失败”。缺这两个字段（旧 registry）视为未声明，一律放行。
 
 ## 离线回放与录制
 

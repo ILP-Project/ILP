@@ -22,6 +22,57 @@ fn is_supported_abi(abi: &str) -> bool {
     SUPPORTED_ABIS.contains(&abi)
 }
 
+/// 宿主自身版本。插件用 `min_host_version`/`max_host_version` 声明兼容区间。
+pub const HOST_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// 把 `x.y.z` 解析成可比较的三元组；多段或非数字返回 None。
+///
+/// 只接受三段：补零对齐的区间比较在段数不一致时会算错
+/// （`1.2` 到底相当于 `1.2.0` 还是 `1.2.*`？两种都有实现，不如不支持）。
+fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
+    let core = v.split('-').next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// 宿主版本是否落在插件声明的兼容区间内。
+///
+/// 缺字段视为“未声明”，一律放行：旧 registry 里没有这些字段，
+/// 把它们当成“不兼容任何宿主”会让所有已发布插件都装不上。
+/// 预发布后缀在比较时被忽略，理由与发布侧 build_site.py 一致。
+fn host_version_compatible(min: Option<&str>, max: Option<&str>) -> Result<()> {
+    let Some(this) = parse_version(HOST_VERSION) else {
+        // 宿主版本号本身有问题，属于打包错误，不该归咎于插件。
+        return Ok(());
+    };
+    if let Some(min) = min {
+        let bound = parse_version(min)
+            .ok_or_else(|| anyhow!("插件声明 min_host_version={min} 不是合法的 x.y.z"))?;
+        if this < bound {
+            return Err(anyhow!(
+                "插件要求 ilp >= {min}，当前是 {HOST_VERSION}。请升级 ilp"
+            ));
+        }
+    }
+    if let Some(max) = max {
+        let bound = parse_version(max)
+            .ok_or_else(|| anyhow!("插件声明 max_host_version={max} 不是合法的 x.y.z"))?;
+        if this > bound {
+            return Err(anyhow!(
+                "插件只支持到 ilp {max}，当前是 {HOST_VERSION}。\n\
+                 ABI 兼容不代表行为兼容——请升级插件，或安装更旧的 ilp"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// 插件 registry（`registry.json`）。
 ///
 /// 只取用得到的字段：宿主不该因为 registry 多了个新字段就装不了插件。
@@ -50,6 +101,11 @@ struct RegistryPlugin {
     artifacts: HashMap<String, RegistryArtifact>,
     #[serde(default)]
     signatures: HashMap<String, RegistrySignatures>,
+    /// 插件声明的宿主兼容范围（闭区间）。旧 registry 没有这两个字段。
+    #[serde(default)]
+    min_host_version: Option<String>,
+    #[serde(default)]
+    max_host_version: Option<String>,
     /// registry 声称插件申请哪些权限。
     ///
     /// 这只是**声明**，安装时会与 WASM 自己的 metadata 逐项比对：
@@ -163,6 +219,8 @@ fn info(config: &Config, name: &str) -> Result<()> {
             signatures: HashMap::new(),
             permissions: Vec::new(),
             allowed_domains: Vec::new(),
+            min_host_version: None,
+            max_host_version: None,
         },
     )?;
     let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
@@ -311,6 +369,8 @@ fn clone_registry_plugin(p: &RegistryPlugin) -> RegistryPlugin {
         signatures: p.signatures.clone(),
         permissions: p.permissions.clone(),
         allowed_domains: p.allowed_domains.clone(),
+        min_host_version: p.min_host_version.clone(),
+        max_host_version: p.max_host_version.clone(),
     }
 }
 
@@ -397,6 +457,9 @@ fn install(config: &Config, source: &str) -> Result<()> {
             p.abi
         );
     }
+    // 宿主版本范围与 ABI 是两件事：ABI 锁接口形状，范围锁行为。
+    host_version_compatible(p.min_host_version.as_deref(), p.max_host_version.as_deref())
+        .with_context(|| format!("插件 {name} 与当前 ilp 版本不兼容"))?;
 
     let want = if version == "latest" {
         p.latest.clone()
@@ -905,6 +968,8 @@ mod tests {
             signatures: HashMap::new(),
             permissions: Vec::new(),
             allowed_domains: Vec::new(),
+            min_host_version: None,
+            max_host_version: None,
         };
         let err = format!("{:#}", verify_artifact(&bytes, &p).expect_err("应拒绝"));
         assert!(err.contains("大小不符"), "实得: {err}");
@@ -926,6 +991,8 @@ mod tests {
             signatures: HashMap::new(),
             permissions: Vec::new(),
             allowed_domains: Vec::new(),
+            min_host_version: None,
+            max_host_version: None,
         };
         let err = format!("{:#}", verify_artifact(&bytes, &p).expect_err("应拒绝"));
         assert!(err.contains("校验和不符"), "实得: {err}");
@@ -950,6 +1017,8 @@ mod tests {
             artifacts: HashMap::new(),
             permissions: Vec::new(),
             allowed_domains: Vec::new(),
+            min_host_version: None,
+            max_host_version: None,
             signatures: [(
                 "1".into(),
                 RegistrySignatures::One(SignatureEntry {
@@ -999,6 +1068,8 @@ mod tests {
                 .collect(),
             permissions: Vec::new(),
             allowed_domains: Vec::new(),
+            min_host_version: None,
+            max_host_version: None,
         }
     }
 
@@ -1107,8 +1178,58 @@ mod tests {
             signatures: HashMap::new(),
             permissions: Vec::new(),
             allowed_domains: Vec::new(),
+            min_host_version: None,
+            max_host_version: None,
         };
         assert!(verify_artifact(&bytes, &p).is_ok());
+    }
+
+    #[test]
+    fn version_parsing_rejects_ambiguous_shapes() {
+        assert_eq!(parse_version("0.1.0"), Some((0, 1, 0)));
+        assert_eq!(parse_version("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_version("1.2.3-rc1"), Some((1, 2, 3)));
+        // 两段和四段都不接受：补零对齐的区间比较在段数不一致时会有歧义。
+        assert_eq!(parse_version("1.2"), None);
+        assert_eq!(parse_version("1.2.3.4"), None);
+        assert_eq!(parse_version("1.2.x"), None);
+        assert_eq!(parse_version(""), None);
+        // 字典序会把 1.10.0 排在 1.9.0 前面，数值比较才正确。
+        assert!(parse_version("1.10.0") > parse_version("1.9.0"));
+    }
+
+    #[test]
+    fn host_version_outside_declared_range_is_rejected() {
+        // 上限低于当前宿主：插件只支持到旧版本，装上去就会静默失效。
+        let err = format!(
+            "{:#}",
+            host_version_compatible(Some("0.1.0"), Some("0.0.99")).expect_err("应拒绝")
+        );
+        assert!(err.contains("只支持到"), "实得: {err}");
+
+        // 下限高于当前宿主：插件用到了更新的宿主行为。
+        let err = format!(
+            "{:#}",
+            host_version_compatible(Some("99.0.0"), None).expect_err("应拒绝")
+        );
+        assert!(err.contains("要求 ilp >="), "实得: {err}");
+    }
+
+    #[test]
+    fn missing_version_bounds_are_permissive() {
+        // 旧 registry 没有这两个字段。若当成“不兼容任何宿主”，
+        // 所有已发布插件都会装不上。
+        assert!(host_version_compatible(None, None).is_ok());
+        assert!(host_version_compatible(Some("0.1.0"), None).is_ok());
+        // 当前宿主是 0.1.0，落在任意宽松上限内。
+        assert!(host_version_compatible(None, Some("99.0.0")).is_ok());
+    }
+
+    #[test]
+    fn malformed_bounds_are_reported_not_ignored() {
+        // 写错版本号时静默放行，等于这道门禁不存在。
+        assert!(host_version_compatible(Some("1.2"), None).is_err());
+        assert!(host_version_compatible(None, Some("latest")).is_err());
     }
 
     fn meta(permissions: &[&str], domains: &[&str]) -> PluginMetadata {
