@@ -169,6 +169,58 @@ impl Storage {
         ))
     }
 
+    /// 读取并校验 manifest。损坏的 manifest 必须被识别出来，
+    /// 否则它会被当作可信的审计副本一直留在磁盘上。
+    fn read_manifest(&self, site_id: &str, book_id: &str) -> Result<Option<Manifest>> {
+        let path = self.manifest_path(site_id, book_id);
+        let data = match std::fs::read(&path) {
+            Ok(data) => data,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("读取 {} 失败", path.display())),
+        };
+        let manifest: Manifest = serde_json::from_slice(&data)
+            .with_context(|| format!("命中损坏的 manifest: {}", path.display()))?;
+        if manifest.schema_version != MANIFEST_VERSION {
+            anyhow::bail!(
+                "manifest {} 的 schema_version={} 不受支持",
+                path.display(),
+                manifest.schema_version
+            );
+        }
+        Ok(Some(manifest))
+    }
+
+    /// 校验 manifest，损坏时改名保存并从数据库重建。
+    ///
+    /// 直接覆盖会丢掉唯一的现场证据；保留 `.corrupt` 才能事后判断
+    /// 是磁盘故障、并发写，还是序列化格式变更。
+    pub fn repair_manifest(&self, site_id: &str, book_id: &str) -> Result<bool> {
+        match self.read_manifest(site_id, book_id) {
+            Ok(_) => Ok(false),
+            Err(err) => {
+                let path = self.manifest_path(site_id, book_id);
+                if path.exists() {
+                    let backup = corrupt_path(&path);
+                    std::fs::rename(&path, &backup).with_context(|| {
+                        format!(
+                            "保留损坏 manifest 失败: {} -> {}",
+                            path.display(),
+                            backup.display()
+                        )
+                    })?;
+                    tracing::warn!(
+                        manifest = %path.display(),
+                        backup = %backup.display(),
+                        error = %err,
+                        "manifest 损坏，已改名保留并从数据库重建"
+                    );
+                }
+                self.rebuild_manifest(site_id, book_id)?;
+                Ok(true)
+            }
+        }
+    }
+
     fn write_manifest(
         &self,
         site_id: &str,
@@ -466,6 +518,20 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     }
 }
 
+/// 损坏文件的保留路径：`x.manifest.json` → `x.manifest.json.corrupt`。
+/// 已存在同名备份时追加时间戳，绝不覆盖上一份证据。
+fn corrupt_path(path: &Path) -> PathBuf {
+    let base = path.with_extension("json.corrupt");
+    if !base.exists() {
+        return base;
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    path.with_extension(format!("json.{nanos}.corrupt"))
+}
+
 /// 临时文件名带进程号与纳秒计数，避免并发章节互相覆盖同一个 `.tmp`。
 fn unique_tmp(dir: &Path, target: &Path) -> PathBuf {
     let stem = target
@@ -672,6 +738,40 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .is_empty());
+    }
+
+    #[test]
+    fn corrupt_manifest_is_preserved_and_rebuilt() {
+        let dir = TempDir::new("manifest-corrupt");
+        let s = storage_in(&dir.0);
+        let book = Book {
+            title: "书".into(),
+            author: "作者".into(),
+            cover_url: "u".into(),
+            chapters: vec![ChapterEntry {
+                id: "ch1".into(),
+                title: "第1章".into(),
+                url: "a".into(),
+                fetch_url: "b".into(),
+                update_time: 0,
+            }],
+        };
+        s.save_book("fanqie", "42", &book).expect("保存书籍");
+        write_chapter(&s, "正文");
+
+        let path = s.manifest_path("fanqie", "42");
+        std::fs::write(&path, b"{ not json").expect("写入损坏 manifest");
+
+        assert!(s.repair_manifest("fanqie", "42").expect("修复 manifest"));
+        assert!(
+            path.with_extension("json.corrupt").exists(),
+            "损坏文件必须保留"
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("读取重建后的 manifest"))
+                .expect("重建后的 manifest 必须可解析");
+        assert_eq!(manifest["chapters"][0]["status"], "ok");
+        assert!(!s.repair_manifest("fanqie", "42").expect("再次校验"));
     }
 
     #[test]

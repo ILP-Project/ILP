@@ -118,6 +118,8 @@ fn do_chapters(
     }
 
     let _lock = storage.lock_book(site_id, book_id)?;
+    // 拿到书级锁之后再修 manifest：损坏的审计副本不应在并发写入中途被重建。
+    storage.repair_manifest(site_id, book_id)?;
     fetch_all(plugin, storage, config, site_id, book_id, &book)
 }
 
