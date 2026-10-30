@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "request": {
+    "method": "GET",
+    "url": "https://example.com/api/catalog",
+    "headers": {
+      "accept": "application/json"
+    },
+    "body_base64": null
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body_base64": "eyJjaGFwdGVycyI6W119"
+  },
+  "notes": "脱敏 fixture；不得提交 Cookie、Token 或设备密钥"
+}

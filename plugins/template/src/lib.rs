@@ -1,3 +1,5 @@
+pub mod fixture;
+
 use ilp_plugin_wit::exports::ilp::plugin::plugin::Guest;
 use ilp_plugin_wit::ilp::plugin::types::{ChapterEntry, ChapterResult, FetchTask, HttpResponse, Permission, PluginMetadata, SearchPage};
 
