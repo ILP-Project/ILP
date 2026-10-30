@@ -670,12 +670,17 @@ mod tests {
     fn real_built_plugin_passes_validation() {
         // 用真实构建出的插件产物做一次整体校验，
         // 防止"校验逻辑和实际产物头部不一致"这类问题再次漏过去。
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/wasm32-wasip2/release/ilp_plugin_fanqie.wasm");
-        let Ok(bytes) = std::fs::read(&path) else {
-            eprintln!("跳过：未找到 {}（先构建 wasm）", path.display());
+        // 插件已迁到兄弟仓库，优先看那边的产物。
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let candidates = [
+            root.join("../plugins/target/wasm32-wasip2/release/ilp_plugin_fanqie.wasm"),
+            root.join("target/wasm32-wasip2/release/ilp_plugin_fanqie.wasm"),
+        ];
+        let Some(path) = candidates.iter().find(|p| p.exists()) else {
+            eprintln!("跳过：未找到 wasm 产物（先构建 wasm）");
             return;
         };
+        let bytes = std::fs::read(path).expect("读取 wasm");
         assert!(
             validate_wasm(&bytes).is_ok(),
             "真实插件产物必须通过校验，头部 {:02x?}",
