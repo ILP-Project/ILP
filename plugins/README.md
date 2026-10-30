@@ -1,13 +1,33 @@
-# plugins/
+# ILP 插件开发
 
-插件产物放在这里，格式为 `<name>.wasm`。
+插件使用 ABI `0.2.0`，共享接口定义位于 `crates/ilp-plugin-wit/wit/v2/plugin.wit`。
 
-本仓库不再包含插件源码——站点插件在 `ILP-Project/plugins`（一站点一子目录），
-产物经 Cloudflare Pages 的静态 registry 分发，默认地址 `https://ilp.elysola.org`。
+## 快速开始
 
-手动安装：
+从模板复制一个插件：
 
 ```bash
-cargo build --target wasm32-wasip2 --release   # 在 ILP-Project/plugins 里
-cp target/wasm32-wasip2/release/ilp_plugin_fanqie.wasm <宿主>/plugins/fanqie.wasm
+cp -R plugins/template plugins/my-site
 ```
+
+然后修改 `plugins/my-site/Cargo.toml` 的 package 名称，以及 `src/lib.rs` 中的 metadata 和业务逻辑。
+
+## 构建
+
+```bash
+cargo build --manifest-path plugins/my-site/Cargo.toml \
+  --target wasm32-wasip2 --release
+```
+
+宿主安装前会校验 ABI、WASM component、大小、SHA-256 和签名。
+
+## 测试与发布门禁
+
+```bash
+cargo fmt --check
+cargo clippy --manifest-path plugins/my-site/Cargo.toml \
+  --target wasm32-wasip2 -- -D warnings
+cargo test --manifest-path plugins/my-site/Cargo.toml
+```
+
+模板插件位于 `plugins/template`，用于验证最小 ABI 实现和构建路径。
