@@ -1,10 +1,14 @@
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use wasmtime::component::{Component, Linker, Resource};
-use wasmtime::{Config as WasmtimeConfig, Engine, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{
+    Config as WasmtimeConfig, Engine, Store, StoreContextMut, StoreLimits, StoreLimitsBuilder,
+    UpdateDeadline,
+};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxView, WasiView};
 
 pub struct HttpCapability;
@@ -13,6 +17,12 @@ pub struct SecretCapability;
 
 const MAX_PLUGIN_MEMORY: usize = 64 * 1024 * 1024;
 const MAX_PLUGIN_FUEL: u64 = 50_000_000;
+/// 墙钟预算：单次插件调用里**真正在跑 WebAssembly** 的时间上限。
+/// 宿主函数里的等待（网络、磁盘）不计入——否则一次 30 秒的 HTTP 重试
+/// 就能把一个规规矩矩的插件判成超时。
+const MAX_PLUGIN_CALL: Duration = Duration::from_secs(60);
+/// epoch 推进间隔，决定超时判定的粒度。
+const EPOCH_TICK: Duration = Duration::from_millis(100);
 const MAX_HTTP_BODY: usize = 2 * 1024 * 1024;
 const MAX_HTTP_RESPONSE: usize = 16 * 1024 * 1024;
 const MAX_HTTP_HEADERS: usize = 128;
@@ -20,6 +30,109 @@ const MAX_HTTP_HEADER_VALUE: usize = 16 * 1024;
 const MAX_FETCH_TASKS: usize = 128;
 const MAX_STORAGE_VALUE: usize = 4 * 1024 * 1024;
 const MAX_LOG_MESSAGE: usize = 16 * 1024;
+
+/// 单次插件调用的时间预算是否已经耗尽。
+/// 只看 WebAssembly 自己的执行时间，减掉宿主函数阻塞的部分。
+fn call_budget_exhausted(
+    started: Instant,
+    host_wait: Duration,
+    now: Instant,
+    limit: Duration,
+) -> bool {
+    now.duration_since(started)
+        .saturating_sub(host_wait)
+        .gt(&limit)
+}
+
+/// 把时间预算换算成 epoch 刻度数（向上取整，避免 0 预算被判为无限）。
+fn deadline_ticks(limit: Duration) -> u64 {
+    let tick = EPOCH_TICK.as_millis().max(1);
+    let ms = limit.as_millis();
+    let ticks = ms.div_ceil(tick);
+    u64::try_from(ticks).unwrap_or(u64::MAX)
+}
+
+/// 进程内共享的 Wasmtime engine。
+///
+/// 每次加载插件都新建 engine 会重复编译期开销、重复分配线程池，也会让
+/// “全局资源上限”变成“每实例上限”。engine 无状态，共享是安全的。
+fn shared_engine() -> &'static Engine {
+    static ENGINE: OnceLock<Engine> = OnceLock::new();
+    ENGINE.get_or_init(|| {
+        let mut config = WasmtimeConfig::new();
+        config.consume_fuel(true);
+        // epoch 只能被外部递增，它是墙钟时间进入沙箱的唯一入口。
+        config.epoch_interruption(true);
+        let engine = Engine::new(&config).expect("创建 Wasmtime engine 失败");
+        let ticker = engine.clone();
+        std::thread::Builder::new()
+            .name("ilp-epoch".into())
+            .spawn(move || loop {
+                std::thread::sleep(EPOCH_TICK);
+                ticker.increment_epoch();
+            })
+            .expect("启动 epoch 线程失败");
+        engine
+    })
+}
+
+/// epoch 到期时的判定。
+///
+/// 到期只证明「墙钟时间过了」，还需要再减掉宿主函数阻塞的时长，
+/// 否则一次正常重试的 30 秒 HTTP 就会被当成插件死循环。
+fn epoch_deadline(mut cx: StoreContextMut<'_, HostState>) -> wasmtime::Result<UpdateDeadline> {
+    let now = Instant::now();
+    let state = cx.data_mut();
+    if call_budget_exhausted(state.call_started, state.host_wait, now, state.call_limit) {
+        state.timed_out = true;
+        return Ok(UpdateDeadline::Interrupt);
+    }
+    let spent = now
+        .duration_since(state.call_started)
+        .saturating_sub(state.host_wait);
+    let remaining = state.call_limit.saturating_sub(spent);
+    // 至少推进 1 个 tick：返回 0 会让 deadline 永远停在当前时刻，
+    // 之后每次检查都立即到期。
+    Ok(UpdateDeadline::Continue(deadline_ticks(remaining).max(1)))
+}
+
+/// 建立一个带资源上限与墙钟预算的 store。
+fn new_store(engine: &Engine, state: HostState) -> Result<Store<HostState>> {
+    let mut store = Store::new(engine, state);
+    store.limiter(|state| &mut state.limits);
+    store
+        .set_fuel(MAX_PLUGIN_FUEL)
+        .map_err(|e| anyhow!("设置插件 fuel 失败: {e}"))?;
+    store.epoch_deadline_callback(epoch_deadline);
+    arm_deadline(&mut store);
+    Ok(store)
+}
+
+/// 每次进入插件调用前重置预算。
+/// 不重置的话，第二次调用的起点还是加载时刻，插件用得越久越容易被误杀。
+fn arm_deadline(store: &mut Store<HostState>) {
+    let limit = store.data().call_limit;
+    let state = store.data_mut();
+    state.call_started = Instant::now();
+    state.host_wait = Duration::ZERO;
+    state.timed_out = false;
+    store.set_epoch_deadline(deadline_ticks(limit).max(1));
+}
+
+/// 把 wasm trap 翻译成人能读的错误。
+///
+/// 超时和插件自己报错是两回事：前者是宿主主动终止（插件死循环、算力卡死），
+/// 后者是插件返回了业务错误。混淆它们会让用户去查一个根本不存在的 bug。
+fn guest_error(store: &Store<HostState>, e: wasmtime::Error) -> anyhow::Error {
+    if store.data().timed_out {
+        anyhow!(
+            "plugin::timeout: 插件执行超过 {} 秒被中止",
+            store.data().call_limit.as_secs()
+        )
+    } else {
+        anyhow!("plugin::{e}")
+    }
+}
 
 #[derive(Clone, Debug)]
 struct CapabilityPolicy {
@@ -131,6 +244,13 @@ pub struct HostState {
     cache: HashMap<String, Vec<u8>>,
     policy: CapabilityPolicy,
     limits: StoreLimits,
+    /// 本次插件调用的起点，epoch 回调用它算墙钟预算。
+    call_started: Instant,
+    /// 本次调用里宿主函数（网络、磁盘）已经消耗的时间，不计入预算。
+    host_wait: Duration,
+    call_limit: Duration,
+    /// epoch 回调因预算耗尽而中断过当前调用。
+    timed_out: bool,
 }
 
 impl HostState {
@@ -180,7 +300,20 @@ impl HostState {
                 .memories(4)
                 .trap_on_grow_failure(true)
                 .build(),
+            call_started: Instant::now(),
+            host_wait: Duration::ZERO,
+            call_limit: MAX_PLUGIN_CALL,
+            timed_out: false,
         }
+    }
+
+    /// 把一次阻塞的宿主操作从墙钟预算里扣除。
+    /// 前提：宿主函数里不会重入 wasm，因此调用期间的耗时全部属于宿主。
+    fn time_host_call<T>(&mut self, f: impl FnOnce() -> T) -> T {
+        let started = Instant::now();
+        let out = f();
+        self.host_wait += started.elapsed();
+        out
     }
 }
 
@@ -227,7 +360,9 @@ impl HostTrait for HostState {
     ) -> Result<ilp::plugin::types::HttpResponse, String> {
         validate_http_request(&request)?;
         self.policy.allows_url(&request.url)?;
-        let response = crate::http::send(&request).map_err(|e| format!("{e:#}"))?;
+        let response = self
+            .time_host_call(|| crate::http::send(&request))
+            .map_err(|e| format!("{e:#}"))?;
         validate_http_response(&response)?;
         Ok(response)
     }
@@ -336,7 +471,9 @@ impl legacy::ilp::plugin::host::Host for HostState {
                 .collect(),
             body: request.body,
         };
-        let resp = crate::http::send(&request).map_err(|e| format!("{e:#}"))?;
+        let resp = self
+            .time_host_call(|| crate::http::send(&request))
+            .map_err(|e| format!("{e:#}"))?;
         validate_http_response(&resp)?;
         Ok(legacy::ilp::plugin::host::HttpResponse {
             status: resp.status,
@@ -380,7 +517,9 @@ impl ilp::plugin::host::HostHttpHandle for HostState {
         crate::http::validate_plugin_url(&request.url).map_err(|e| format!("{e:#}"))?;
         validate_http_request(&request)?;
         self.policy.allows_url(&request.url)?;
-        let response = crate::http::send(&request).map_err(|e| format!("{e:#}"))?;
+        let response = self
+            .time_host_call(|| crate::http::send(&request))
+            .map_err(|e| format!("{e:#}"))?;
         validate_http_response(&response)?;
         Ok(response)
     }
@@ -714,15 +853,12 @@ enum PluginBackend {
 
 impl PluginInstance {
     pub fn load(path: &Path, storage_root: &Path) -> Result<Self> {
-        let mut engine_config = WasmtimeConfig::new();
-        engine_config.consume_fuel(true);
-        let engine =
-            Engine::new(&engine_config).map_err(|e| anyhow!("创建 Wasmtime engine 失败: {e}"))?;
-        let component = Component::from_file(&engine, path)
+        let engine = shared_engine();
+        let component = Component::from_file(engine, path)
             .map_err(|e| anyhow!("读取组件失败 {}: {e}", path.display()))?;
         let version = component
             .component_type()
-            .exports(&engine)
+            .exports(engine)
             .find_map(|(name, _)| name.strip_prefix("ilp:plugin/plugin@").map(str::to_string))
             .ok_or_else(|| anyhow!("组件 {} 没有导出 ilp:plugin/plugin", path.display()))?;
         let name = path
@@ -732,21 +868,17 @@ impl PluginInstance {
             .to_string();
         match version.as_str() {
             "0.2.0" => {
-                let mut linker = Linker::new(&engine);
+                let mut linker = Linker::new(engine);
                 wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
                     .map_err(|e| anyhow!("注册 WASI p2 失败: {e}"))?;
                 current::NovelPlugin::add_to_linker::<
                     HostState,
                     wasmtime::component::HasSelf<HostState>,
                 >(&mut linker, |s| s)?;
-                let mut store = Store::new(
-                    &engine,
+                let mut store = new_store(
+                    engine,
                     HostState::new(name.clone(), storage_root.join(&name)),
-                );
-                store.limiter(|state| &mut state.limits);
-                store
-                    .set_fuel(MAX_PLUGIN_FUEL)
-                    .map_err(|e| anyhow!("设置插件 fuel 失败: {e}"))?;
+                )?;
                 let bindings = current::NovelPlugin::instantiate(&mut store, &component, &linker)
                     .map_err(|e| anyhow!("实例化插件失败 {}: {e}", path.display()))?;
                 let raw = bindings
@@ -771,21 +903,17 @@ impl PluginInstance {
                 Self::finish(metadata, PluginBackend::Current { store, bindings })
             }
             "0.1.0" => {
-                let mut linker = Linker::new(&engine);
+                let mut linker = Linker::new(engine);
                 wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
                     .map_err(|e| anyhow!("注册 WASI p2 失败: {e}"))?;
                 legacy::NovelPlugin::add_to_linker::<
                     HostState,
                     wasmtime::component::HasSelf<HostState>,
                 >(&mut linker, |s| s)?;
-                let mut store = Store::new(
-                    &engine,
+                let mut store = new_store(
+                    engine,
                     HostState::new(name.clone(), storage_root.join(&name)),
-                );
-                store.limiter(|state| &mut state.limits);
-                store
-                    .set_fuel(MAX_PLUGIN_FUEL)
-                    .map_err(|e| anyhow!("设置插件 fuel 失败: {e}"))?;
+                )?;
                 let bindings = legacy::NovelPlugin::instantiate(&mut store, &component, &linker)
                     .map_err(|e| anyhow!("实例化旧版插件失败 {}: {e}", path.display()))?;
                 let raw = bindings
@@ -826,115 +954,105 @@ impl PluginInstance {
 
     pub fn init(&mut self, book_id: &str, force_update: bool) -> Result<()> {
         match &mut self.backend {
-            PluginBackend::Current { store, bindings } => bindings
-                .ilp_plugin_plugin()
-                .call_init(store, book_id, force_update)
-                .map_err(|e| anyhow!("plugin::{e}"))?
-                .map_err(|e| anyhow!("plugin::{e}")),
-            PluginBackend::Legacy { store, bindings } => bindings
-                .ilp_plugin_plugin()
-                .call_init(store, book_id, force_update)
-                .map_err(|e| anyhow!("plugin::{e}"))?
-                .map_err(|e| anyhow!("plugin::{e}")),
+            PluginBackend::Current { store, bindings } => guest_call(store, |s| {
+                bindings
+                    .ilp_plugin_plugin()
+                    .call_init(s, book_id, force_update)
+            })?
+            .map_err(|e| anyhow!("plugin::{e}")),
+            PluginBackend::Legacy { store, bindings } => guest_call(store, |s| {
+                bindings
+                    .ilp_plugin_plugin()
+                    .call_init(s, book_id, force_update)
+            })?
+            .map_err(|e| anyhow!("plugin::{e}")),
         }
     }
 
     pub fn title(&mut self) -> Result<String> {
         match &mut self.backend {
-            PluginBackend::Current { store, bindings } => bindings
-                .ilp_plugin_plugin()
-                .call_title(store)
-                .map_err(|e| anyhow!("plugin::{e}"))?
-                .map_err(|e| anyhow!("plugin::{e}")),
-            PluginBackend::Legacy { store, bindings } => bindings
-                .ilp_plugin_plugin()
-                .call_title(store)
-                .map_err(|e| anyhow!("plugin::{e}"))?
-                .map_err(|e| anyhow!("plugin::{e}")),
+            PluginBackend::Current { store, bindings } => {
+                guest_call(store, |s| bindings.ilp_plugin_plugin().call_title(s))?
+                    .map_err(|e| anyhow!("plugin::{e}"))
+            }
+            PluginBackend::Legacy { store, bindings } => {
+                guest_call(store, |s| bindings.ilp_plugin_plugin().call_title(s))?
+                    .map_err(|e| anyhow!("plugin::{e}"))
+            }
         }
     }
 
     pub fn author(&mut self) -> Result<String> {
         match &mut self.backend {
-            PluginBackend::Current { store, bindings } => bindings
-                .ilp_plugin_plugin()
-                .call_author(store)
-                .map_err(|e| anyhow!("plugin::{e}"))?
-                .map_err(|e| anyhow!("plugin::{e}")),
-            PluginBackend::Legacy { store, bindings } => bindings
-                .ilp_plugin_plugin()
-                .call_author(store)
-                .map_err(|e| anyhow!("plugin::{e}"))?
-                .map_err(|e| anyhow!("plugin::{e}")),
+            PluginBackend::Current { store, bindings } => {
+                guest_call(store, |s| bindings.ilp_plugin_plugin().call_author(s))?
+                    .map_err(|e| anyhow!("plugin::{e}"))
+            }
+            PluginBackend::Legacy { store, bindings } => {
+                guest_call(store, |s| bindings.ilp_plugin_plugin().call_author(s))?
+                    .map_err(|e| anyhow!("plugin::{e}"))
+            }
         }
     }
 
     pub fn cover_url(&mut self) -> Result<String> {
         match &mut self.backend {
-            PluginBackend::Current { store, bindings } => bindings
-                .ilp_plugin_plugin()
-                .call_cover_url(store)
-                .map_err(|e| anyhow!("plugin::{e}"))?
-                .map_err(|e| anyhow!("plugin::{e}")),
-            PluginBackend::Legacy { store, bindings } => bindings
-                .ilp_plugin_plugin()
-                .call_cover_url(store)
-                .map_err(|e| anyhow!("plugin::{e}"))?
-                .map_err(|e| anyhow!("plugin::{e}")),
+            PluginBackend::Current { store, bindings } => {
+                guest_call(store, |s| bindings.ilp_plugin_plugin().call_cover_url(s))?
+                    .map_err(|e| anyhow!("plugin::{e}"))
+            }
+            PluginBackend::Legacy { store, bindings } => {
+                guest_call(store, |s| bindings.ilp_plugin_plugin().call_cover_url(s))?
+                    .map_err(|e| anyhow!("plugin::{e}"))
+            }
         }
     }
 
     pub fn description(&mut self) -> Result<String> {
         match &mut self.backend {
-            PluginBackend::Current { store, bindings } => bindings
-                .ilp_plugin_plugin()
-                .call_description(store)
-                .map_err(|e| anyhow!("plugin::{e}"))?
-                .map_err(|e| anyhow!("plugin::{e}")),
-            PluginBackend::Legacy { store, bindings } => bindings
-                .ilp_plugin_plugin()
-                .call_description(store)
-                .map_err(|e| anyhow!("plugin::{e}"))?
-                .map_err(|e| anyhow!("plugin::{e}")),
+            PluginBackend::Current { store, bindings } => {
+                guest_call(store, |s| bindings.ilp_plugin_plugin().call_description(s))?
+                    .map_err(|e| anyhow!("plugin::{e}"))
+            }
+            PluginBackend::Legacy { store, bindings } => {
+                guest_call(store, |s| bindings.ilp_plugin_plugin().call_description(s))?
+                    .map_err(|e| anyhow!("plugin::{e}"))
+            }
         }
     }
 
     pub fn catalog(&mut self, force: bool) -> Result<Vec<ChapterEntry>> {
         match &mut self.backend {
-            PluginBackend::Current { store, bindings } => Ok(bindings
-                .ilp_plugin_plugin()
-                .call_catalog(store, force)
-                .map_err(|e| anyhow!("plugin::{e}"))?
-                .map_err(|e| anyhow!("plugin::{e}"))?
-                .into_iter()
-                .map(convert_entry)
-                .collect()),
-            PluginBackend::Legacy { store, bindings } => Ok(bindings
-                .ilp_plugin_plugin()
-                .call_catalog(store, force)
-                .map_err(|e| anyhow!("plugin::{e}"))?
-                .map_err(|e| anyhow!("plugin::{e}"))?
-                .into_iter()
-                .map(convert_legacy_entry)
-                .collect()),
+            PluginBackend::Current { store, bindings } => Ok(guest_call(store, |s| {
+                bindings.ilp_plugin_plugin().call_catalog(s, force)
+            })?
+            .map_err(|e| anyhow!("plugin::{e}"))?
+            .into_iter()
+            .map(convert_entry)
+            .collect()),
+            PluginBackend::Legacy { store, bindings } => Ok(guest_call(store, |s| {
+                bindings.ilp_plugin_plugin().call_catalog(s, force)
+            })?
+            .map_err(|e| anyhow!("plugin::{e}"))?
+            .into_iter()
+            .map(convert_legacy_entry)
+            .collect()),
         }
     }
 
     pub fn search(&mut self, keyword: &str, cursor: &str) -> Result<ilp_types::SearchPage> {
         match &mut self.backend {
             PluginBackend::Current { store, bindings } => convert_search(
-                bindings
-                    .ilp_plugin_plugin()
-                    .call_search(store, keyword, cursor)
-                    .map_err(|e| anyhow!("plugin::{e}"))?
-                    .map_err(|e| anyhow!("plugin::{e}"))?,
+                guest_call(store, |s| {
+                    bindings.ilp_plugin_plugin().call_search(s, keyword, cursor)
+                })?
+                .map_err(|e| anyhow!("plugin::{e}"))?,
             ),
             PluginBackend::Legacy { store, bindings } => convert_legacy_search(
-                bindings
-                    .ilp_plugin_plugin()
-                    .call_search(store, keyword, cursor)
-                    .map_err(|e| anyhow!("plugin::{e}"))?
-                    .map_err(|e| anyhow!("plugin::{e}"))?,
+                guest_call(store, |s| {
+                    bindings.ilp_plugin_plugin().call_search(s, keyword, cursor)
+                })?
+                .map_err(|e| anyhow!("plugin::{e}"))?,
             ),
         }
     }
@@ -947,19 +1065,17 @@ impl PluginInstance {
             ));
         }
         match &mut self.backend {
-            PluginBackend::Current { store, bindings } => Ok(bindings
-                .ilp_plugin_plugin()
-                .call_plan_fetch(store, ids)
-                .map_err(|e| anyhow!("plugin::{e}"))?
-                .map_err(|e| anyhow!("plugin::{e}"))?),
-            PluginBackend::Legacy { store, bindings } => Ok(bindings
-                .ilp_plugin_plugin()
-                .call_plan_fetch(store, ids)
-                .map_err(|e| anyhow!("plugin::{e}"))?
-                .map_err(|e| anyhow!("plugin::{e}"))?
-                .into_iter()
-                .map(convert_legacy_task)
-                .collect()),
+            PluginBackend::Current { store, bindings } => Ok(guest_call(store, |s| {
+                bindings.ilp_plugin_plugin().call_plan_fetch(s, ids)
+            })?
+            .map_err(|e| anyhow!("plugin::{e}"))?),
+            PluginBackend::Legacy { store, bindings } => Ok(guest_call(store, |s| {
+                bindings.ilp_plugin_plugin().call_plan_fetch(s, ids)
+            })?
+            .map_err(|e| anyhow!("plugin::{e}"))?
+            .into_iter()
+            .map(convert_legacy_task)
+            .collect()),
         }
     }
 
@@ -969,36 +1085,50 @@ impl PluginInstance {
         resp: HttpResponse,
     ) -> Result<Vec<ChapterContent>> {
         match &mut self.backend {
-            PluginBackend::Current { store, bindings } => Ok(bindings
-                .ilp_plugin_plugin()
-                .call_consume_fetch(store, task_id, &resp)
-                .map_err(|e| anyhow!("plugin::{e}"))?
-                .map_err(|e| anyhow!("plugin::{e}"))?
-                .into_iter()
-                .filter_map(|c| {
-                    c.text.map(|text| ChapterContent {
-                        id: c.id,
-                        title: c.title,
-                        text,
-                    })
+            PluginBackend::Current { store, bindings } => Ok(guest_call(store, |s| {
+                bindings
+                    .ilp_plugin_plugin()
+                    .call_consume_fetch(s, task_id, &resp)
+            })?
+            .map_err(|e| anyhow!("plugin::{e}"))?
+            .into_iter()
+            .filter_map(|c| {
+                c.text.map(|text| ChapterContent {
+                    id: c.id,
+                    title: c.title,
+                    text,
                 })
-                .collect()),
+            })
+            .collect()),
             PluginBackend::Legacy { store, bindings } => {
                 let resp = convert_legacy_response(resp);
-                Ok(bindings
-                    .ilp_plugin_plugin()
-                    .call_consume_fetch(store, task_id, &resp)
-                    .map_err(|e| anyhow!("plugin::{e}"))?
-                    .map_err(|e| anyhow!("plugin::{e}"))?
-                    .into_iter()
-                    .map(|c| ChapterContent {
-                        id: c.id,
-                        title: c.title,
-                        text: c.text,
-                    })
-                    .collect())
+                Ok(guest_call(store, |s| {
+                    bindings
+                        .ilp_plugin_plugin()
+                        .call_consume_fetch(s, task_id, &resp)
+                })?
+                .map_err(|e| anyhow!("plugin::{e}"))?
+                .into_iter()
+                .map(|c| ChapterContent {
+                    id: c.id,
+                    title: c.title,
+                    text: c.text,
+                })
+                .collect())
             }
         }
+    }
+}
+
+/// 进入一次插件调用：重置墙钟预算，并把宿主主动中断和插件自报错误分开。
+fn guest_call<T>(
+    store: &mut Store<HostState>,
+    f: impl FnOnce(&mut Store<HostState>) -> wasmtime::Result<T>,
+) -> Result<T> {
+    arm_deadline(store);
+    match f(store) {
+        Ok(v) => Ok(v),
+        Err(e) => Err(guest_error(store, e)),
     }
 }
 
@@ -1204,5 +1334,88 @@ mod tests {
         atomic_write(&p, b"second").unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"second");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deadline_ticks_round_up_and_never_reach_zero() {
+        assert_eq!(deadline_ticks(Duration::ZERO), 0);
+        assert_eq!(deadline_ticks(Duration::from_millis(1)), 1);
+        assert_eq!(deadline_ticks(Duration::from_millis(100)), 1);
+        assert_eq!(deadline_ticks(Duration::from_millis(101)), 2);
+        assert_eq!(deadline_ticks(MAX_PLUGIN_CALL), 600);
+    }
+
+    #[test]
+    fn host_wait_does_not_consume_the_call_budget() {
+        // 插件里合法的重试会花掉几十秒网络时间。把宿主阻塞算进预算，
+        // 一个规规矩矩的插件就会在慢网下被判成死循环。
+        let started = Instant::now();
+        let now = started + Duration::from_secs(40);
+        let limit = Duration::from_secs(10);
+        assert!(call_budget_exhausted(started, Duration::ZERO, now, limit));
+        assert!(!call_budget_exhausted(
+            started,
+            Duration::from_secs(35),
+            now,
+            limit
+        ));
+    }
+
+    #[test]
+    fn infinite_loop_is_interrupted_and_reported_as_timeout() {
+        let engine = shared_engine();
+        let module =
+            wasmtime::Module::new(engine, r#"(module (func (export "spin") (loop $l br $l)))"#)
+                .expect("编译死循环模块");
+        let storage = std::env::temp_dir().join(format!("ilp-spin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&storage);
+        let mut store =
+            new_store(engine, HostState::new("spin".to_string(), storage.clone())).unwrap();
+        // 关掉 fuel，否则先撞 fuel 而不是墙钟。
+        store.set_fuel(u64::MAX).unwrap();
+        store.data_mut().call_limit = Duration::from_millis(300);
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).expect("实例化");
+        let spin = instance
+            .get_typed_func::<(), ()>(&mut store, "spin")
+            .expect("取 spin");
+
+        let started = Instant::now();
+        let err = guest_call(&mut store, |s| spin.call(s, ())).expect_err("死循环必须被中断");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "中断得太慢: {:?}",
+            started.elapsed()
+        );
+        assert!(store.data().timed_out, "应标记为超时而非插件错误");
+        assert!(
+            err.to_string().contains("timeout"),
+            "错误信息应标明超时: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&storage);
+    }
+
+    #[test]
+    fn normal_call_does_not_trip_the_deadline() {
+        let engine = shared_engine();
+        let module = wasmtime::Module::new(engine, r#"(module (func (export "noop")))"#)
+            .expect("编译空模块");
+        let storage = std::env::temp_dir().join(format!("ilp-noop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&storage);
+        let mut store =
+            new_store(engine, HostState::new("noop".to_string(), storage.clone())).unwrap();
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).expect("实例化");
+        let noop = instance
+            .get_typed_func::<(), ()>(&mut store, "noop")
+            .expect("取 noop");
+
+        guest_call(&mut store, |s| noop.call(s, ())).expect("正常调用不应超时");
+        assert!(!store.data().timed_out);
+        // 预算必须被重新武装，否则第二次调用一进去就超时。
+        store.data_mut().timed_out = true;
+        guest_call(&mut store, |s| noop.call(s, ())).expect("第二次调用不应超时");
+        assert!(!store.data().timed_out);
+
+        let _ = std::fs::remove_dir_all(&storage);
     }
 }
