@@ -143,6 +143,13 @@
 
 - CLI 用户交互字符串与注释用中文；代码不加多余注释（见全局 AGENTS.md）。
 - 依赖/开发环境优先 Nix flake devShell。
+- **不要提交 `target/`。** 曾经有一次 `plugins/template` 开发时把整个构建目录
+  提交进去（873 MB 的 `.so`），事后只能改写历史清掉：仓库 293 MB → 572 KB。
+  `.gitignore` 已覆盖，但新目录别忘了检查。
+- 改写历史会让 **tag 指向的提交哈希全变**。插件仓库通过
+  `ilp-plugin-wit = { git = ..., tag = "abi-v0.2.0" }` 拉依赖，所以 tag 必须
+  一起重推（annotated tag 要先删远端再推）。改写后务必用干净的
+  `cargo build --target wasm32-wasip2 --release`（不带本地 patch）验证一次。
 
 ## 参考
 
