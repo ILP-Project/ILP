@@ -106,6 +106,20 @@ data/
   宿主通过 `CURRENT_ABI` 和 `SUPPORTED_ABIS` 管理 ABI 兼容性：当前 ABI 为 `0.2.0`，目前支持 `0.1.0` 与 `0.2.0`。ABI `0.1.0` 仍可加载，但安装时会发出弃用警告；不在支持列表中的 ABI 会在下载前拒绝。旧的 `SUPPORTED_ABI` 常量仅作为兼容别名保留。
 - 搜索是游标分页，无法跳到指定页。
 
+## 插件开发的离线回放
+
+插件所有网络都走宿主，所以宿主可以在 HTTP 层拦截：
+
+```bash
+ILP_RECORD_DIR=fixtures/live ilp get all <book-id> -s <site>   # 真实联网跑一遍并录像
+ILP_REPLAY_DIR=fixtures/live ilp get all <book-id> -s <site>   # 完全离线重放
+```
+
+回放未命中会**报错而不是回退到网络**：一个本该离线的测试静默打到真实站点，
+既不可复现，也可能触发风控。录制产物落盘前会被脱敏（Cookie/Token/设备 ID/
+签名密钥），脱敏后的录像能直接进 git。手工编写的 fixture 不走宿主，
+所以插件仓库 CI 会跑 `tools/scan_fixtures.py` 再扫一遍。
+
 ## 插件签名与信任治理
 
 配置项（`config.json`）：

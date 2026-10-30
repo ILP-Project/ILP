@@ -86,6 +86,7 @@ mod tests {
 
     #[test]
     fn request_is_sticky_and_idempotent() {
+        let _guard = test_guard();
         reset();
         assert!(!requested());
         assert!(check().is_ok());
@@ -98,6 +99,9 @@ mod tests {
 
     #[test]
     fn sleep_wakes_up_early_when_cancelled() {
+        // 取消是进程级全局状态。不拿守卫的话，并行跑的其它测试
+        // 一旦调用 request()，这里的第一次断言就会莫名其妙地失败。
+        let _guard = test_guard();
         reset();
         let started = std::time::Instant::now();
         assert!(!sleep(std::time::Duration::from_millis(5)));

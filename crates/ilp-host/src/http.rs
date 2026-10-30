@@ -269,6 +269,17 @@ pub fn get_bytes_if_exists(url: &str) -> Result<Option<Vec<u8>>> {
 pub fn send(request: &HttpRequest) -> Result<HttpResponse> {
     // 取消后不再发起新请求：已经排队的任务没必要再把请求打出去。
     crate::cancel::check()?;
+    // 回放模式下完全离线：命中录像就返回，未命中直接报错（不偷偷联网）。
+    if let Some(replayed) = crate::replay::try_replay(request) {
+        return replayed;
+    }
+    let response = send_live(request)?;
+    crate::replay::record(request, &response);
+    Ok(response)
+}
+
+/// 真正发一次网络请求。
+fn send_live(request: &HttpRequest) -> Result<HttpResponse> {
     let method = Method::from_bytes(request.method.as_bytes())
         .map_err(|_| anyhow!("非法 HTTP 方法: {}", request.method))?;
     // 这里再解析一次 DNS 并把结果钉给客户端：上层的白名单只看了主机名，
@@ -300,7 +311,6 @@ pub fn send(request: &HttpRequest) -> Result<HttpResponse> {
         .collect();
     let body = read_limited(resp, MAX_RESPONSE_BYTES)
         .with_context(|| format!("读取响应失败: {}", request.url))?;
-
     Ok(HttpResponse {
         status,
         headers,
@@ -367,8 +377,14 @@ fn is_retryable(err: &anyhow::Error) -> bool {
 
 /// 发送并重试。退避是 BASE * 2^attempt，最后一次失败原样返回。
 fn send_with_retry(request: &HttpRequest) -> Result<HttpResponse> {
+    // 回放模式下“失败”是确定性的（录像就是缺），重试三次只会得到三个同样错误。
+    let retries = if crate::replay::is_replaying() {
+        0
+    } else {
+        MAX_RETRIES
+    };
     let mut last: Option<anyhow::Error> = None;
-    for attempt in 0..=MAX_RETRIES {
+    for attempt in 0..=retries {
         if attempt > 0 {
             let backoff = RETRY_BASE_MS * (1u64 << (attempt - 1));
             if crate::cancel::sleep(Duration::from_millis(backoff)) {
