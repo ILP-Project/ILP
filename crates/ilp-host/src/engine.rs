@@ -83,6 +83,12 @@ fn shared_engine() -> &'static Engine {
 fn epoch_deadline(mut cx: StoreContextMut<'_, HostState>) -> wasmtime::Result<UpdateDeadline> {
     let now = Instant::now();
     let state = cx.data_mut();
+    // 用户按了 Ctrl-C：正在沙箱里跑的插件不该继续算下去。
+    // 检查点在 epoch 上，粒度就是一个 EPOCH_TICK。
+    if crate::cancel::requested() {
+        state.interrupted = true;
+        return Ok(UpdateDeadline::Interrupt);
+    }
     if call_budget_exhausted(state.call_started, state.host_wait, now, state.call_limit) {
         state.timed_out = true;
         return Ok(UpdateDeadline::Interrupt);
@@ -116,6 +122,7 @@ fn arm_deadline(store: &mut Store<HostState>) {
     state.call_started = Instant::now();
     state.host_wait = Duration::ZERO;
     state.timed_out = false;
+    state.interrupted = false;
     store.set_epoch_deadline(deadline_ticks(limit).max(1));
 }
 
@@ -124,7 +131,9 @@ fn arm_deadline(store: &mut Store<HostState>) {
 /// 超时和插件自己报错是两回事：前者是宿主主动终止（插件死循环、算力卡死），
 /// 后者是插件返回了业务错误。混淆它们会让用户去查一个根本不存在的 bug。
 fn guest_error(store: &Store<HostState>, e: wasmtime::Error) -> anyhow::Error {
-    if store.data().timed_out {
+    if store.data().interrupted || crate::cancel::requested() {
+        anyhow::Error::new(crate::cancel::Cancelled)
+    } else if store.data().timed_out {
         anyhow!(
             "plugin::timeout: 插件执行超过 {} 秒被中止",
             store.data().call_limit.as_secs()
@@ -251,6 +260,8 @@ pub struct HostState {
     call_limit: Duration,
     /// epoch 回调因预算耗尽而中断过当前调用。
     timed_out: bool,
+    /// epoch 回调因用户取消而中断过当前调用。
+    interrupted: bool,
 }
 
 impl HostState {
@@ -304,6 +315,7 @@ impl HostState {
             host_wait: Duration::ZERO,
             call_limit: MAX_PLUGIN_CALL,
             timed_out: false,
+            interrupted: false,
         }
     }
 

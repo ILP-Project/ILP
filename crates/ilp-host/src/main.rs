@@ -1,3 +1,4 @@
+mod cancel;
 mod cli;
 mod commands;
 mod config;

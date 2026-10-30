@@ -89,6 +89,7 @@ fn client() -> &'static Client {
 }
 
 pub fn get_text(url: &str) -> Result<String> {
+    crate::cancel::check()?;
     let resp = client()
         .get(url)
         .send()
@@ -102,6 +103,7 @@ pub fn get_text(url: &str) -> Result<String> {
 }
 
 pub fn get_bytes(url: &str) -> Result<Vec<u8>> {
+    crate::cancel::check()?;
     let resp = client()
         .get(url)
         .send()
@@ -116,6 +118,8 @@ pub fn get_bytes(url: &str) -> Result<Vec<u8>> {
 
 /// 把插件给的请求发给对端，返回 WIT 形状的响应。
 pub fn send(request: &HttpRequest) -> Result<HttpResponse> {
+    // 取消后不再发起新请求：已经排队的任务没必要再把请求打出去。
+    crate::cancel::check()?;
     let method = Method::from_bytes(request.method.as_bytes())
         .map_err(|_| anyhow!("非法 HTTP 方法: {}", request.method))?;
     let mut req = client()
@@ -208,6 +212,10 @@ pub fn validate_plugin_url(url: &str) -> Result<()> {
 /// 4xx（除 408/429）是我们发错了，重试没有意义；
 /// 网络错误、超时、5xx、429 都是瞬时问题，值得再试。
 fn is_retryable(err: &anyhow::Error) -> bool {
+    // 用户取消不是瞬时故障，重试只会拖慢退出。
+    if err.downcast_ref::<crate::cancel::Cancelled>().is_some() {
+        return false;
+    }
     let text = format!("{err:#}");
     if let Some(code) = text.split("HTTP 状态码 ").nth(1).and_then(|rest| {
         // 状态码后面紧跟冒号，所以只取连续数字。
@@ -226,7 +234,9 @@ fn send_with_retry(request: &HttpRequest) -> Result<HttpResponse> {
     for attempt in 0..=MAX_RETRIES {
         if attempt > 0 {
             let backoff = RETRY_BASE_MS * (1u64 << (attempt - 1));
-            thread::sleep(Duration::from_millis(backoff));
+            if crate::cancel::sleep(Duration::from_millis(backoff)) {
+                return Err(anyhow::Error::new(crate::cancel::Cancelled));
+            }
         }
         match send(request) {
             Ok(resp) if resp.status < 400 => return Ok(resp),
@@ -287,12 +297,20 @@ pub fn fetch_requests(
                         Err(_) => break,
                     }
                 };
+                // 取消后还没开跑的任务直接记成取消，不再占着连接。
+                if crate::cancel::requested() {
+                    results.lock().unwrap()[idx] =
+                        Some(Err(anyhow::Error::new(crate::cancel::Cancelled)));
+                    continue;
+                }
                 if sleep_ms > 0 {
                     if let Some(prev) = last {
                         let elapsed = prev.elapsed();
                         let gap = Duration::from_millis(sleep_ms);
-                        if elapsed < gap {
-                            thread::sleep(gap - elapsed);
+                        if elapsed < gap && crate::cancel::sleep(gap - elapsed) {
+                            results.lock().unwrap()[idx] =
+                                Some(Err(anyhow::Error::new(crate::cancel::Cancelled)));
+                            break;
                         }
                     }
                 }
@@ -384,6 +402,8 @@ mod tests {
 
     #[test]
     fn wiremock_5xx_is_retried_then_succeeds() {
+        // 取消标志是进程级的，碰请求的用例必须串行。
+        let _guard = crate::cancel::test_guard();
         let rt = rt();
         let server = start_server(&rt, |server| {
             Box::pin(async move {
@@ -421,6 +441,8 @@ mod tests {
 
     #[test]
     fn wiremock_4xx_is_not_retried() {
+        // 取消标志是进程级的，碰请求的用例必须串行。
+        let _guard = crate::cancel::test_guard();
         let rt = rt();
         let server = start_server(&rt, |server| {
             Box::pin(async move {
@@ -452,6 +474,8 @@ mod tests {
 
     #[test]
     fn wiremock_persistent_5xx_gives_up_after_retries() {
+        // 取消标志是进程级的，碰请求的用例必须串行。
+        let _guard = crate::cancel::test_guard();
         let rt = rt();
         let server = start_server(&rt, |server| {
             Box::pin(async move {
@@ -482,6 +506,8 @@ mod tests {
 
     #[test]
     fn wiremock_fetch_requests_keeps_input_order() {
+        // 取消标志是进程级的，碰请求的用例必须串行。
+        let _guard = crate::cancel::test_guard();
         let rt = rt();
         let server = start_server(&rt, |server| {
             Box::pin(async move {
@@ -518,6 +544,8 @@ mod tests {
 
     #[test]
     fn wiremock_post_body_and_headers_round_trip() {
+        // 取消标志是进程级的，碰请求的用例必须串行。
+        let _guard = crate::cancel::test_guard();
         let rt = rt();
         let server = start_server(&rt, |server| {
             Box::pin(async move {
@@ -566,5 +594,47 @@ mod tests {
         // 4xx 是请求本身有问题，重试无用
         assert!(!is_retryable(&anyhow!("HTTP 状态码 404: u")));
         assert!(!is_retryable(&anyhow!("HTTP 状态码 401: u")));
+        // 用户取消不是瞬时故障，不能拿去重试
+        assert!(!is_retryable(&anyhow::Error::new(crate::cancel::Cancelled)));
+    }
+
+    #[test]
+    fn cancelled_request_is_not_sent() {
+        // 取消标志是进程级的，碰请求的用例必须串行。
+        let _guard = crate::cancel::test_guard();
+        crate::cancel::request();
+        let request = HttpRequest {
+            method: "GET".into(),
+            url: "https://example.com/a".into(),
+            headers: Vec::new(),
+            body: None,
+        };
+        let err = send(&request).expect_err("取消后不应再发请求");
+        assert!(err.downcast_ref::<crate::cancel::Cancelled>().is_some());
+    }
+
+    #[test]
+    fn queued_requests_after_cancel_are_marked_cancelled() {
+        // 取消标志是进程级的，碰请求的用例必须串行。
+        let _guard = crate::cancel::test_guard();
+        crate::cancel::request();
+        let requests: Vec<HttpRequest> = (0..3)
+            .map(|i| HttpRequest {
+                method: "GET".into(),
+                url: format!("https://example.com/{i}"),
+                headers: Vec::new(),
+                body: None,
+            })
+            .collect();
+        let refs: Vec<&HttpRequest> = requests.iter().collect();
+        let results = fetch_requests(&refs, 2, 0);
+        assert_eq!(results.len(), 3);
+        assert!(
+            results.iter().all(|r| r
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.downcast_ref::<crate::cancel::Cancelled>().is_some())),
+            "排队中的请求应直接标为取消"
+        );
     }
 }

@@ -5,24 +5,24 @@ use crate::engine::PluginInstance;
 use crate::storage::{Book, Storage};
 use ilp_types::ChapterContent;
 use std::io::IsTerminal;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Once;
 
 /// 一批最多塞多少章给 plan_fetch。
 /// 批量站点用它摊薄请求数，网页站点自己会一章一任务。
 const BATCH_SIZE: usize = 30;
 
-static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 static SIGNALS_INSTALLED: Once = Once::new();
 
 pub fn install_signal_handlers() -> Result<()> {
     let mut error = None;
     SIGNALS_INSTALLED.call_once(|| {
         if let Err(e) = ctrlc::set_handler(|| {
-            if CANCEL_REQUESTED.swap(true, Ordering::SeqCst) {
+            // 第二次 Ctrl-C 直接强退：第一次已经把取消广播出去了，
+            // 用户再按就是不想再等了，不该逼他等当前请求超时。
+            if crate::cancel::request() {
                 std::process::exit(130);
             }
-            eprintln!("收到取消请求，将在当前请求完成后停止...");
+            eprintln!("收到取消请求，正在停止…（再按一次强制退出）");
         }) {
             error = Some(anyhow!("安装 Ctrl-C 处理器失败: {e}"));
         }
@@ -34,7 +34,7 @@ pub fn install_signal_handlers() -> Result<()> {
 }
 
 fn cancellation_requested() -> bool {
-    CANCEL_REQUESTED.load(Ordering::SeqCst)
+    crate::cancel::requested()
 }
 
 fn jsonl_enabled() -> bool {
@@ -151,7 +151,7 @@ fn fetch_all(
 
     for chunk in todo.chunks(BATCH_SIZE) {
         if cancellation_requested() {
-            return Err(anyhow!("下载已取消"));
+            return Err(anyhow::Error::new(crate::cancel::Cancelled));
         }
         let ids: Vec<String> = chunk.iter().map(|(_, c)| c.id.clone()).collect();
         let tasks = match plugin.plan_fetch(&ids) {
@@ -276,7 +276,9 @@ fn retry_missing(
 ) {
     let sleep_ms = config.sleep_time * 1000;
     for (seq, ch) in chapters {
-        std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+        if crate::cancel::sleep(std::time::Duration::from_millis(sleep_ms)) {
+            return;
+        }
         let ids = vec![ch.id.clone()];
         let tasks = match plugin.plan_fetch(&ids) {
             Ok(t) if !t.is_empty() => t,
