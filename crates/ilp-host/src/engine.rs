@@ -528,17 +528,65 @@ fn is_safe_key(key: &str) -> bool {
         && !key.contains("..")
 }
 
+/// 写临时文件再 rename：secret 里绝不能出现“写了一半的凭据”。
+/// 临时名带纳秒后缀，避免两个不同 key（`x.1` / `x.2`）坍缩到同一个临时文件。
 fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path)
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "secret".into());
+    let tmp = path.with_file_name(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
+    let result = (|| {
+        std::fs::write(&tmp, data)?;
+        // 先把临时文件收窄到 0600/ACL，再 rename 到正式名，
+        // 避免“文件已可见但还没设权限”的窗口期。
+        restrict_secret_permissions(&tmp)?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
+/// 把凭据文件限制为仅当前用户可读写。
+///
+/// Unix 用 `0600`。Windows 默认继承父目录 ACL，可能让同机其他账户读到，
+/// 因此显式重写 DACL：先断开继承（`/inheritance:r`），再只授予当前用户。
+/// 失败必须上报——静默失败等于留下一个全世界可读的设备密钥。
 fn restrict_secret_permissions(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(windows)]
+    {
+        use std::process::Command;
+        let user = std::env::var("USERNAME").map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "无法确定当前 Windows 用户")
+        })?;
+        let principal = match std::env::var("USERDOMAIN") {
+            Ok(domain) if !domain.is_empty() => format!("{domain}\\{user}"),
+            _ => user,
+        };
+        // icacls 是系统自带工具，不需要额外 crate 或链接 Win32 API。
+        let status = Command::new("icacls")
+            .arg(path)
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg(format!("{principal}:F"))
+            .status()?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!(
+                "设置 secret 文件 ACL 失败（icacls 退出码 {:?}）",
+                status.code()
+            )));
+        }
     }
     Ok(())
 }
@@ -622,6 +670,27 @@ mod security_tests {
             vec![1]
         )
         .is_err());
+
+        // 凭据文件必须只有当前用户可读（Unix 上是 0600）。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(root.join("secrets/plugin-a/token"))
+                .expect("secret 文件应存在")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "secret 权限应为 0600，实得 {mode:o}");
+        }
+
+        // 写入后不能残留临时文件（临时文件同样含明文凭据）。
+        let leftovers: Vec<String> = std::fs::read_dir(root.join("secrets/plugin-a"))
+            .expect("读 secret 目录")
+            .map(|e| e.expect("条目").file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "不应残留临时文件: {leftovers:?}");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }
