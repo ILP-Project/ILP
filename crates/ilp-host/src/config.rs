@@ -38,6 +38,9 @@ pub struct Config {
     /// 插件签名信任根：key_id -> base64 编码的 Ed25519 公钥。
     #[serde(default)]
     pub plugin_trusted_keys: HashMap<String, String>,
+    /// 已撤销的签名 key_id；撤销优先于签名验证。
+    #[serde(default)]
+    pub plugin_revoked_keys: Vec<String>,
     /// 配置了信任根后，是否拒绝没有有效签名的插件。
     #[serde(default)]
     pub require_plugin_signatures: bool,
@@ -46,7 +49,7 @@ pub struct Config {
     raw: String,
 }
 
-const KNOWN_FIELDS: [&str; 13] = [
+const KNOWN_FIELDS: [&str; 14] = [
     "data_folder",
     "novels_folder",
     "logs_folder",
@@ -59,6 +62,7 @@ const KNOWN_FIELDS: [&str; 13] = [
     "proxy",
     "no_proxy",
     "plugin_trusted_keys",
+    "plugin_revoked_keys",
     "require_plugin_signatures",
 ];
 
@@ -110,6 +114,7 @@ impl Default for Config {
             proxy: None,
             no_proxy: default_no_proxy(),
             plugin_trusted_keys: HashMap::new(),
+            plugin_revoked_keys: Vec::new(),
             require_plugin_signatures: false,
             raw: String::new(),
         }

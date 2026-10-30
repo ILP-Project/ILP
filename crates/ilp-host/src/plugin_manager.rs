@@ -289,6 +289,17 @@ fn verify_signature(
         return Ok(());
     }
     let signature = signature.expect("checked above");
+    if config
+        .plugin_revoked_keys
+        .iter()
+        .any(|key_id| key_id == &signature.key_id)
+    {
+        return Err(anyhow!(
+            "插件 {} 使用已撤销的签名密钥 {}",
+            plugin.name,
+            signature.key_id
+        ));
+    }
     let key_text = config
         .plugin_trusted_keys
         .get(&signature.key_id)
@@ -743,6 +754,46 @@ mod tests {
         };
         let err = format!("{:#}", verify_artifact(&bytes, &p).expect_err("应拒绝"));
         assert!(err.contains("校验和不符"), "实得: {err}");
+    }
+
+    #[test]
+    fn revoked_signing_key_is_rejected() {
+        use ed25519_dalek::SigningKey;
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let key_id = "revoked";
+        let bytes = b"plugin";
+        let signature = BASE64.encode(ed25519_dalek::Signer::sign(&signing, bytes).to_bytes());
+        let plugin = RegistryPlugin {
+            name: "a".into(),
+            site_id: "a".into(),
+            abi: "0.2.0".into(),
+            latest: "1".into(),
+            versions: vec!["1".into()],
+            url: "a.wasm".into(),
+            size: None,
+            sha256: None,
+            artifacts: HashMap::new(),
+            signatures: [(
+                "1".into(),
+                RegistrySignature {
+                    key_id: key_id.into(),
+                    signature,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let mut config = Config::default();
+        config.plugin_trusted_keys = [(
+            key_id.into(),
+            BASE64.encode(signing.verifying_key().to_bytes()),
+        )]
+        .into_iter()
+        .collect();
+        config.plugin_revoked_keys = vec![key_id.into()];
+        config.require_plugin_signatures = true;
+        let err = verify_signature(&config, &plugin, "1", bytes).expect_err("撤销密钥必须拒绝");
+        assert!(format!("{err:#}").contains("已撤销"));
     }
 
     #[test]
