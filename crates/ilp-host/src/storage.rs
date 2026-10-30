@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use ilp_types::ChapterEntry;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,6 +12,30 @@ pub struct Book {
     pub author: String,
     pub cover_url: String,
     pub chapters: Vec<ChapterEntry>,
+}
+
+const MANIFEST_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Manifest {
+    schema_version: u32,
+    site_id: String,
+    book_id: String,
+    title: String,
+    author: String,
+    cover_url: String,
+    chapters: Vec<ManifestChapter>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManifestChapter {
+    id: String,
+    title: String,
+    sequence: usize,
+    status: String,
+    path: Option<String>,
+    bytes: u64,
+    sha256: String,
 }
 
 /// 章节落盘状态的唯一事实来源。
@@ -112,6 +137,7 @@ impl Storage {
 
     pub fn save_book(&self, site_id: &str, book_id: &str, book: &Book) -> Result<()> {
         let chapters = serde_json::to_string(&book.chapters)?;
+        self.write_manifest(site_id, book_id, book, &[])?;
         let now = now_secs();
         self.db.execute(
             "INSERT INTO books (site_id, book_id, title, author, cover_url, chapters, updated_at)
@@ -133,6 +159,34 @@ impl Storage {
             ],
         )?;
         Ok(())
+    }
+
+    fn manifest_path(&self, site_id: &str, book_id: &str) -> PathBuf {
+        self.novels_dir.join(format!(
+            "{}_{}.manifest.json",
+            sanitize(site_id),
+            sanitize(book_id)
+        ))
+    }
+
+    fn write_manifest(
+        &self,
+        site_id: &str,
+        book_id: &str,
+        book: &Book,
+        chapters: &[ManifestChapter],
+    ) -> Result<()> {
+        let manifest = Manifest {
+            schema_version: MANIFEST_VERSION,
+            site_id: site_id.to_string(),
+            book_id: book_id.to_string(),
+            title: book.title.clone(),
+            author: book.author.clone(),
+            cover_url: book.cover_url.clone(),
+            chapters: chapters.to_vec(),
+        };
+        let data = serde_json::to_vec_pretty(&manifest)?;
+        atomic_write(&self.manifest_path(site_id, book_id), &data)
     }
 
     /// 一本书的目录。带 book_id 是为了避免同名书互相覆盖。
@@ -250,6 +304,7 @@ impl Storage {
             content.len() as u64,
             &digest,
         )?;
+        self.rebuild_manifest(site_id, book_id)?;
         Ok(path)
     }
 
@@ -302,7 +357,46 @@ impl Storage {
                  mtime  = excluded.mtime",
             params![site_id, book_id, chapter_id, now_secs()],
         )?;
+        self.rebuild_manifest(site_id, book_id)?;
         Ok(())
+    }
+
+    fn rebuild_manifest(&self, site_id: &str, book_id: &str) -> Result<()> {
+        let Some(book) = self.load_book(site_id, book_id)? else {
+            return Ok(());
+        };
+        let mut stmt = self.db.prepare("SELECT chapter_id, path, status, bytes, sha256 FROM chapters WHERE site_id = ?1 AND book_id = ?2")?;
+        let states = stmt
+            .query_map(params![site_id, book_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? as u64,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let chapters = book
+            .chapters
+            .iter()
+            .enumerate()
+            .map(|(index, chapter)| {
+                let state = states.iter().find(|s| s.0 == chapter.id);
+                ManifestChapter {
+                    id: chapter.id.clone(),
+                    title: chapter.title.clone(),
+                    sequence: index + 1,
+                    status: state
+                        .map(|s| s.2.clone())
+                        .unwrap_or_else(|| "pending".into()),
+                    path: state.and_then(|s| (!s.1.is_empty()).then(|| s.1.clone())),
+                    bytes: state.map(|s| s.3).unwrap_or(0),
+                    sha256: state.map(|s| s.4.clone()).unwrap_or_default(),
+                }
+            })
+            .collect::<Vec<_>>();
+        self.write_manifest(site_id, book_id, &book, &chapters)
     }
 
     pub fn failed_chapter_ids(&self, site_id: &str, book_id: &str) -> Result<Vec<String>> {
@@ -547,6 +641,37 @@ mod tests {
             "不应残留临时文件: {entries:?}"
         );
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn manifest_is_versioned_and_tracks_chapters() {
+        let dir = TempDir::new("manifest");
+        let s = storage_in(&dir.0);
+        let book = Book {
+            title: "书".into(),
+            author: "作者".into(),
+            cover_url: "u".into(),
+            chapters: vec![ChapterEntry {
+                id: "ch1".into(),
+                title: "第1章".into(),
+                url: "a".into(),
+                fetch_url: "b".into(),
+                update_time: 0,
+            }],
+        };
+        s.save_book("fanqie", "42", &book).expect("保存书籍");
+        write_chapter(&s, "正文");
+        let path = s.manifest_path("fanqie", "42");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).expect("读取 manifest"))
+                .expect("解析 manifest");
+        assert_eq!(manifest["schema_version"], 1);
+        assert_eq!(manifest["chapters"][0]["status"], "ok");
+        assert_eq!(manifest["chapters"][0]["bytes"], 6);
+        assert!(!manifest["chapters"][0]["sha256"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty());
     }
 
     #[test]
