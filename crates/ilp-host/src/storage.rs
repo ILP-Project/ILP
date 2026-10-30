@@ -314,19 +314,69 @@ impl Storage {
 
     /// 真正的续传判断：DB 里有成功记录、文件还在、且长度与记录一致。
     /// 任一不满足都视为需要重新下载。
+    ///
+    /// 文件存在但长度或摘要对不上，说明上一次写入被截断或内容被外部改过。
+    /// 直接覆盖会把现场抹掉，因此先改名成 `.corrupt` 保留证据再重下。
     pub fn is_chapter_downloaded(&self, site_id: &str, book_id: &str, chapter_id: &str) -> bool {
         let Ok(Some(state)) = self.chapter_state(site_id, book_id, chapter_id) else {
             return false;
         };
         match std::fs::metadata(&state.path) {
             Ok(meta) if meta.is_file() && meta.len() == state.bytes => {
-                state.sha256.is_empty()
+                if state.sha256.is_empty()
                     || file_sha256(&state.path)
                         .map(|hash| hash == state.sha256)
                         .unwrap_or(false)
+                {
+                    true
+                } else {
+                    self.quarantine_chapter(site_id, book_id, chapter_id, &state, "摘要不符")
+                }
             }
+            Ok(meta) if meta.is_file() => self.quarantine_chapter(
+                site_id,
+                book_id,
+                chapter_id,
+                &state,
+                &format!("长度不符（记录 {}，实际 {}）", state.bytes, meta.len()),
+            ),
             _ => false,
         }
+    }
+
+    /// 把损坏的章节文件改名保留，并清掉它的 DB 记录。
+    /// 清记录是必要的：不清的话下次仍会读到同一条坏记录，反复触发隔离。
+    fn quarantine_chapter(
+        &self,
+        site_id: &str,
+        book_id: &str,
+        chapter_id: &str,
+        state: &ChapterState,
+        reason: &str,
+    ) -> bool {
+        let backup = corrupt_path(&state.path);
+        if let Err(err) = std::fs::rename(&state.path, &backup) {
+            tracing::warn!(
+                path = %state.path.display(),
+                error = %err,
+                "章节文件损坏且无法隔离，仍将重新下载"
+            );
+        } else {
+            tracing::warn!(
+                chapter = chapter_id,
+                path = %state.path.display(),
+                backup = %backup.display(),
+                reason = reason,
+                "章节文件已损坏，已改名保留并重新下载"
+            );
+        }
+        if let Err(err) = self.db.execute(
+            "DELETE FROM chapters WHERE site_id = ?1 AND book_id = ?2 AND chapter_id = ?3",
+            params![site_id, book_id, chapter_id],
+        ) {
+            tracing::warn!(chapter = chapter_id, error = %err, "删除损坏章节记录失败");
+        }
+        false
     }
 
     /// 原子落盘：先写同目录下的唯一临时文件，fsync 后再 rename 覆盖。
@@ -347,6 +397,8 @@ impl Storage {
     ) -> Result<PathBuf> {
         let path = self.chapter_path(book_title, book_id, seq, chapter_title);
         atomic_write(&path, content.as_bytes())?;
+        // 重下成功后清掉上一次留下的损坏副本，避免同一章长期堆两份文件。
+        remove_corrupt_copies(&path);
         let digest = sha256_bytes(content.as_bytes());
         self.record_chapter(
             site_id,
@@ -518,10 +570,14 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     }
 }
 
-/// 损坏文件的保留路径：`x.manifest.json` → `x.manifest.json.corrupt`。
-/// 已存在同名备份时追加时间戳，绝不覆盖上一份证据。
+/// 损坏文件的保留路径：在原文件名后追加 `.corrupt`（保留原扩展名）。
+/// 已存在同名备份时追加纳秒时间戳，绝不覆盖上一份证据。
 fn corrupt_path(path: &Path) -> PathBuf {
-    let base = path.with_extension("json.corrupt");
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let base = path.with_file_name(format!("{name}.corrupt"));
     if !base.exists() {
         return base;
     }
@@ -529,7 +585,29 @@ fn corrupt_path(path: &Path) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    path.with_extension(format!("json.{nanos}.corrupt"))
+    path.with_file_name(format!("{name}.{nanos}.corrupt"))
+}
+
+/// 清理某章节遗留的所有损坏副本（含带时间戳的变体）。
+//
+// 仅删除“本章节文件名”对应的 `.corrupt` 文件：靠前缀匹配，
+// 不会误删别的章节，也不会碰目录里其他文件。
+fn remove_corrupt_copies(path: &Path) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let Some(name) = path.file_name().map(|s| s.to_string_lossy().to_string()) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if file_name.starts_with(&format!("{name}.")) && file_name.ends_with(".corrupt") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// 临时文件名带进程号与纳秒计数，避免并发章节互相覆盖同一个 `.tmp`。
@@ -764,7 +842,8 @@ mod tests {
 
         assert!(s.repair_manifest("fanqie", "42").expect("修复 manifest"));
         assert!(
-            path.with_extension("json.corrupt").exists(),
+            path.with_file_name("fanqie_42.manifest.json.corrupt")
+                .exists(),
             "损坏文件必须保留"
         );
         let manifest: serde_json::Value =
@@ -772,6 +851,60 @@ mod tests {
                 .expect("重建后的 manifest 必须可解析");
         assert_eq!(manifest["chapters"][0]["status"], "ok");
         assert!(!s.repair_manifest("fanqie", "42").expect("再次校验"));
+    }
+
+    #[test]
+    fn truncated_chapter_is_quarantined_and_redownloadable() {
+        let dir = TempDir::new("chapter-corrupt");
+        let s = storage_in(&dir.0);
+        let path = write_chapter(&s, "一二三四五六七八九十");
+        // 模拟写到一半崩溃：文件还在，但内容短了。
+        std::fs::write(&path, "一二").expect("截断文件");
+        assert!(!s.is_chapter_downloaded("fanqie", "42", "ch1"));
+
+        let backup = path.with_file_name(format!(
+            "{}.corrupt",
+            path.file_name().expect("文件名").to_string_lossy()
+        ));
+        assert!(
+            backup.exists(),
+            "损坏章节必须保留现场: {}",
+            backup.display()
+        );
+        assert!(!path.exists(), "损坏的原文件应已改名");
+
+        // 重新下载成功后不应再留下损坏副本。
+        s.save_chapter(
+            "fanqie",
+            "书",
+            "42",
+            1,
+            "ch1",
+            "第1章",
+            "一二三四五六七八九十",
+        )
+        .expect("重新写入");
+        assert!(s.is_chapter_downloaded("fanqie", "42", "ch1"));
+        assert!(!backup.exists(), "重下成功后应清理损坏副本");
+    }
+
+    #[test]
+    fn digest_mismatch_is_quarantined() {
+        let dir = TempDir::new("digest-corrupt");
+        let s = storage_in(&dir.0);
+        let path = write_chapter(&s, "正文");
+        // 长度不变但内容变了：只有摘要能发现。
+        std::fs::write(&path, "伪文").expect("篡改内容");
+        assert!(
+            !s.is_chapter_downloaded("fanqie", "42", "ch1"),
+            "摘要不符必须重新下载"
+        );
+        assert!(path
+            .with_file_name(format!(
+                "{}.corrupt",
+                path.file_name().expect("文件名").to_string_lossy()
+            ))
+            .exists());
     }
 
     #[test]
