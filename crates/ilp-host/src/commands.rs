@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 
 use crate::config::Config;
 use crate::engine::PluginInstance;
+use crate::exporter::{Document, DocumentChapter, Exporter, TxtExporter};
 use crate::storage::{Book, Storage};
 use ilp_types::{ChapterResult, ChapterStatus};
 use std::io::IsTerminal;
@@ -378,7 +379,23 @@ fn persist(
         *failed += 1;
         return;
     };
-    let full = format!("{}\n{}\n---\n{}", item.title, book.author, text);
+    let document = Document {
+        title: book.title.clone(),
+        author: book.author.clone(),
+        chapters: vec![DocumentChapter {
+            title: item.title.clone(),
+            text: text.to_owned(),
+        }],
+    };
+    let full = match TxtExporter.export(&document) {
+        Ok(content) => content,
+        Err(e) => {
+            tracing::warn!(chapter = %item.id, "导出章节失败: {e:#}");
+            mark_failed(storage, site_id, book_id, &item.id);
+            *failed += 1;
+            return;
+        }
+    };
     match storage.save_chapter(
         site_id,
         &book.title,

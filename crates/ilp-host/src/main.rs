@@ -5,6 +5,7 @@ mod config;
 mod diagnostics;
 mod engine;
 mod exit;
+mod exporter;
 mod http;
 mod logging;
 mod plugin_manager;
