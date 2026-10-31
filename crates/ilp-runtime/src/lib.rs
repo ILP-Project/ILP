@@ -151,6 +151,16 @@ pub fn shared_engine() -> &'static Engine {
     })
 }
 
+pub fn new_store_with_host(
+    policy: &CapabilityPolicy,
+    _host: RuntimeHost,
+) -> Result<Store<RuntimeStore>> {
+    // Host callbacks are installed by the WIT adapter layer. Keeping the host
+    // value at this boundary makes capability ownership explicit without
+    // coupling the generic budget store to a concrete backend.
+    new_store(policy)
+}
+
 pub fn new_store(policy: &CapabilityPolicy) -> Result<Store<RuntimeStore>> {
     let limits = StoreLimitsBuilder::new()
         .memory_size(policy.limits.max_memory_bytes as usize)
