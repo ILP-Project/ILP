@@ -24,8 +24,15 @@ Rust 2021 小说下载器，站点能力通过 Wasmtime WebAssembly 插件提供
 ## 版本与 Release 规则
 
 - 当前正式版本为 `v0.1.0`；宿主 crate 版本为 `0.1.0`，WIT ABI 版本独立维护，当前支持 ABI `0.1.0` 和 `0.2.0`。
-- 版本号遵循 SemVer：修复使用 patch，向后兼容功能使用 minor，不兼容变更使用 major；ABI 版本不能因为普通宿主功能变更而随意升级。
+- 版本号遵循 SemVer，格式为 `MAJOR.MINOR.PATCH`，禁止使用与实际发布版本不一致的 tag、Cargo manifest 或安装器版本。
+- `PATCH`：仅修复 bug、安全问题、构建/发布问题或不改变公开 API/ABI 行为的内部调整；例如 `0.1.0` → `0.1.1`。
+- `MINOR`：在兼容现有用户、CLI、配置、数据格式和 ABI 的前提下增加功能或公开 API；例如 `0.1.0` → `0.2.0`。
+- `MAJOR`：删除或修改公开 CLI/API、破坏配置/数据兼容性、改变插件加载契约，或引入不兼容 ABI；例如 `0.2.0` → `1.0.0`。在 `0.x` 阶段，`0.MINOR.0` 的 minor 升级按不兼容变更处理，patch 仍须保持兼容。
+- ABI 版本独立于宿主版本：修改 WIT 接口、资源、调用语义或兼容策略时才升级 ABI；普通宿主功能、文档和修复不得升级 ABI。新增 ABI 必须保留旧 ABI 加载能力，或明确记录迁移/弃用策略。
+- 版本更新必须在一次提交中同步修改所有受影响的 workspace `Cargo.toml`、`Cargo.lock`（若依赖解析发生变化）、CLI `version` 输出、README、安装器、workflow、registry 元数据和发布说明；先搜索旧版本号，避免遗漏。
 - 发布前必须同步检查 workspace 中所有可发布 crate 的 `Cargo.toml` 版本、README、安装器和 workflow；path 依赖同时声明兼容的 registry `version`，确保 `cargo package --workspace --locked --no-verify` 通过。
+- 版本提交必须使用英文 subject，建议格式为 `release: v<version>`；版本提交、签名 tag 和 GitHub Release 必须使用同一个版本号。
+- 新版本发布前必须确认上一版本的工作区、tag、Release 资产和 registry 元数据状态，禁止覆盖已公开版本；正式版本号一旦发布，除非按本文档的发布恢复规则重建，否则不得复用。
 - Release tag 使用签名的 annotated tag，格式为 `v<version>`，例如：`v0.1.0`。tag 指向的提交必须已经合并到 `main`，工作区必须干净。
 - Release 私钥只能存储在 GitHub Actions Secret `ILP_SIGNING_KEYS`，不得打印、提交、写入配置或测试 fixture；仓库和用户配置只保存公钥。当前官方 key ID 为 `release-2026`。
 - 发布前必须通过：
