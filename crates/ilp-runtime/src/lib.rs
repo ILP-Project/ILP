@@ -141,6 +141,18 @@ pub fn new_store(policy: &CapabilityPolicy) -> Result<Store<RuntimeStore>> {
     Ok(store)
 }
 
+pub fn check_execution_budget(
+    store: &Store<RuntimeStore>,
+) -> std::result::Result<(), RuntimeError> {
+    if store.data().started.elapsed() > store.data().timeout {
+        return Err(RuntimeError::ResourceLimit("插件执行超时".into()));
+    }
+    if store.get_fuel().unwrap_or(0) == 0 {
+        return Err(RuntimeError::ResourceLimit("插件 fuel 已耗尽".into()));
+    }
+    Ok(())
+}
+
 pub trait PluginRuntime: Send + Sync {
     fn load(&self, wasm: &[u8], policy: &CapabilityPolicy) -> Result<PluginTrust>;
 }
@@ -240,6 +252,14 @@ mod tests {
         assert!(validate_abi("0.1.0").is_ok());
         assert!(validate_abi(CURRENT_ABI).is_ok());
         assert!(validate_abi("9.9.9").is_err());
+    }
+
+    #[test]
+    fn bounded_wasmtime_store_has_fuel_and_memory_limit() {
+        let policy = CapabilityPolicy::deny_all();
+        let store = new_store(&policy).unwrap();
+        assert!(store.get_fuel().unwrap() > 0);
+        assert!(check_execution_budget(&store).is_ok());
     }
 
     #[test]
