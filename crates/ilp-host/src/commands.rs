@@ -43,6 +43,10 @@ fn jsonl_enabled() -> bool {
     std::env::var_os("ILP_JSONL").is_some() || std::env::var_os("ILP_JSON").is_some()
 }
 
+fn progress_enabled() -> bool {
+    !jsonl_enabled() && std::io::stdout().is_terminal()
+}
+
 fn emit_event(event: serde_json::Value) {
     if jsonl_enabled() {
         println!("{event}");
@@ -333,6 +337,9 @@ fn fetch_all(
         messages::DOWNLOAD_FAILED,
         failed
     );
+    if progress_enabled() {
+        eprintln!("进度完成: {done} 章成功，{failed} 章失败");
+    }
     // 运行摘要：一行、结构化、可 grep。用户抱怨"昨天还能下"时，这行是
     // 唯一能快速定位"哪个站点、哪本书、哪次运行、成败各多少"的线索。
     // 单独一条 target 便于从混杂的日志里筛出来。
@@ -487,6 +494,9 @@ fn persist(
                 );
             } else {
                 println!("{}", messages::chapter_downloaded(&book.title, &item.title));
+                if progress_enabled() {
+                    eprint!("\r已处理 {} 章", done);
+                }
             }
         }
         Err(e) => {
