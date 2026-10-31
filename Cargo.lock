@@ -1430,6 +1430,7 @@ name = "ilp-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ilp-plugin-wit",
  "ilp-types",
  "serde",
  "thiserror 2.0.20",

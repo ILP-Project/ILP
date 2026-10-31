@@ -144,6 +144,22 @@ pub fn new_store(policy: &CapabilityPolicy) -> Result<Store<RuntimeStore>> {
     Ok(store)
 }
 
+pub struct HostCapabilities {
+    pub allow_http: bool,
+    pub allow_storage: bool,
+    pub allow_secrets: bool,
+}
+
+impl HostCapabilities {
+    pub fn from_policy(policy: &CapabilityPolicy) -> Self {
+        Self {
+            allow_http: !policy.allowed_domains.is_empty(),
+            allow_storage: policy.allow_storage,
+            allow_secrets: false,
+        }
+    }
+}
+
 pub fn load_component(wasm: &[u8]) -> std::result::Result<Component, RuntimeError> {
     validate_component(wasm)?;
     Component::from_binary(shared_engine(), wasm)
