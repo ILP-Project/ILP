@@ -162,6 +162,14 @@ impl IlpCore {
             .map_err(|error| CoreError::Storage(error.to_string()))
     }
 
+    fn append_event(&self, kind: &str, payload: &str) -> Result<u64, CoreError> {
+        self.storage
+            .lock()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?
+            .append_event(kind, payload)
+            .map_err(|error| CoreError::Storage(error.to_string()))
+    }
+
     pub fn next_event_sequence(&self) -> u64 {
         if let Ok(storage) = self.storage.lock() {
             if let Ok(sequence) = storage.next_event_sequence() {
@@ -173,11 +181,51 @@ impl IlpCore {
         *sequence
     }
 
-    pub fn task_created_event(&self, task_id: Uuid) -> CoreEvent {
-        CoreEvent::TaskCreated {
-            sequence: self.next_event_sequence(),
-            task_id,
+    pub fn events_after(&self, sequence: u64, limit: u32) -> Result<Vec<CoreEvent>, CoreError> {
+        let storage = self
+            .storage
+            .lock()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?;
+        let oldest = storage
+            .oldest_event_sequence()
+            .map_err(|error| CoreError::Storage(error.to_string()))?;
+        if let Some(oldest) = oldest {
+            if sequence.saturating_add(1) < oldest {
+                return Ok(vec![CoreEvent::ResyncRequired {
+                    sequence: self.next_event_sequence(),
+                }]);
+            }
         }
+        let rows = storage
+            .events_after(sequence, limit)
+            .map_err(|error| CoreError::Storage(error.to_string()))?;
+        rows.into_iter()
+            .map(|(_, kind, payload)| {
+                serde_json::from_str(&payload).map_err(|error| {
+                    CoreError::Storage(format!("事件 {kind} 反序列化失败: {error}"))
+                })
+            })
+            .collect()
+    }
+
+    pub fn prune_events(&self, keep: u64) -> Result<usize, CoreError> {
+        self.storage
+            .lock()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?
+            .prune_events(keep)
+            .map_err(|error| CoreError::Storage(error.to_string()))
+    }
+
+    pub fn task_created_event(&self, task_id: Uuid) -> CoreEvent {
+        let payload = serde_json::to_string(&CoreEvent::TaskCreated {
+            sequence: 0,
+            task_id,
+        })
+        .expect("CoreEvent 序列化不应失败");
+        let sequence = self
+            .append_event("task_created", &payload)
+            .unwrap_or_else(|_| self.next_event_sequence());
+        CoreEvent::TaskCreated { sequence, task_id }
     }
 
     pub fn create_download_task(&self) -> Result<Uuid, CoreError> {
