@@ -866,8 +866,11 @@ fn verify_registry_signature(config: &Config, base: &str, bytes: &[u8]) -> Resul
         tracing::warn!("registry 元数据没有签名，跳过校验（未启用 require_registry_signatures）");
         return Ok(());
     };
-    let set: SignatureSet =
-        serde_json::from_slice(&raw).with_context(|| format!("解析 {sig_url} 失败"))?;
+    verify_registry_signature_bytes(config, bytes, &raw)
+}
+
+fn verify_registry_signature_bytes(config: &Config, bytes: &[u8], raw: &[u8]) -> Result<()> {
+    let set: SignatureSet = serde_json::from_slice(raw).context("解析 registry 签名失败")?;
     crate::signing::verify(config, "registry 元数据", bytes, &set)
 }
 
@@ -1363,6 +1366,61 @@ mod tests {
         let plugin = plugin_with_signatures(vec![("a", &a), ("b", &b)], bytes);
         let config = trust(&[("a", &a)]);
         verify_signature(&config, &plugin, "1", bytes).expect("已信任的一签已足够");
+    }
+
+    #[test]
+    fn registry_signature_accepts_original_bytes() {
+        use ed25519_dalek::SigningKey;
+        let signing = SigningKey::from_bytes(&[9u8; 32]);
+        let bytes = br#"{\n  \"schema\": 1\n}\n"#;
+        let signature = BASE64.encode(ed25519_dalek::Signer::sign(&signing, bytes).to_bytes());
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "key_id": "registry",
+            "signature": signature
+        }))
+        .unwrap();
+        let config = trust(&[("registry", &signing)]);
+        verify_registry_signature_bytes(&config, bytes, &raw).expect("原始字节签名应通过");
+        let altered = br#"{\n  \"schema\": 1\n}\n\n"#;
+        assert!(verify_registry_signature_bytes(&config, altered, &raw).is_err());
+    }
+
+    #[test]
+    fn registry_signature_rejects_unknown_and_revoked_keys() {
+        use ed25519_dalek::SigningKey;
+        let signing = SigningKey::from_bytes(&[10u8; 32]);
+        let bytes = b"registry";
+        let signature = BASE64.encode(ed25519_dalek::Signer::sign(&signing, bytes).to_bytes());
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "key_id": "registry",
+            "signature": signature
+        }))
+        .unwrap();
+        let unknown = Config::default();
+        assert!(verify_registry_signature_bytes(&unknown, bytes, &raw).is_err());
+        let mut revoked = trust(&[("registry", &signing)]);
+        revoked.plugin_revoked_keys.push("registry".into());
+        assert!(verify_registry_signature_bytes(&revoked, bytes, &raw).is_err());
+    }
+
+    #[test]
+    fn registry_signature_threshold_requires_distinct_keys() {
+        use ed25519_dalek::SigningKey;
+        let a = SigningKey::from_bytes(&[11u8; 32]);
+        let b = SigningKey::from_bytes(&[12u8; 32]);
+        let bytes = b"registry";
+        let entries = [(&a, "a"), (&b, "b")].map(|(key, id)| {
+            serde_json::json!({
+                "key_id": id,
+                "signature": BASE64.encode(ed25519_dalek::Signer::sign(key, bytes).to_bytes())
+            })
+        });
+        let raw = serde_json::to_vec(&entries).unwrap();
+        let mut config = trust(&[("a", &a), ("b", &b)]);
+        config.plugin_signature_threshold = 2;
+        verify_registry_signature_bytes(&config, bytes, &raw).expect("双签应通过");
+        config.plugin_signature_threshold = 3;
+        assert!(verify_registry_signature_bytes(&config, bytes, &raw).is_err());
     }
 
     #[test]
