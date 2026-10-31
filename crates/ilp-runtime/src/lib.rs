@@ -141,6 +141,18 @@ pub fn new_store(policy: &CapabilityPolicy) -> Result<Store<RuntimeStore>> {
     Ok(store)
 }
 
+pub fn reset_execution_budget(
+    store: &mut Store<RuntimeStore>,
+    policy: &CapabilityPolicy,
+) -> Result<()> {
+    store.data_mut().started = Instant::now();
+    store.data_mut().timeout = Duration::from_millis(policy.limits.timeout_ms);
+    store
+        .set_fuel(policy.limits.fuel)
+        .map_err(|error| anyhow!("重置插件 fuel 失败: {error}"))?;
+    Ok(())
+}
+
 pub fn check_execution_budget(
     store: &Store<RuntimeStore>,
 ) -> std::result::Result<(), RuntimeError> {
