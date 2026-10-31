@@ -47,8 +47,38 @@ fn progress_enabled() -> bool {
     !jsonl_enabled() && std::io::stdout().is_terminal()
 }
 
+fn validate_jsonl_event(event: &serde_json::Value) -> bool {
+    let Some(name) = event.get("event").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    match name {
+        "update_report" => {
+            event.get("book").is_some_and(serde_json::Value::is_string)
+                && event.get("added").is_some_and(serde_json::Value::is_u64)
+                && event
+                    .get("apply")
+                    .is_some_and(serde_json::Value::is_boolean)
+        }
+        "chapter_added" => {
+            event.get("id").is_some_and(serde_json::Value::is_string)
+                && event.get("title").is_some_and(serde_json::Value::is_string)
+        }
+        "chapter_downloaded" => {
+            event.get("book").is_some_and(serde_json::Value::is_string)
+                && event
+                    .get("chapter")
+                    .is_some_and(serde_json::Value::is_string)
+                && event.get("id").is_some_and(serde_json::Value::is_string)
+                && event
+                    .get("status")
+                    .is_some_and(serde_json::Value::is_string)
+        }
+        _ => false,
+    }
+}
+
 fn emit_event(event: serde_json::Value) {
-    if jsonl_enabled() {
+    if jsonl_enabled() && validate_jsonl_event(&event) {
         println!("{event}");
     }
 }
@@ -945,6 +975,33 @@ mod tests {
     use super::page_step;
     use super::PageCmd;
     use super::PageStep;
+
+    #[test]
+    fn jsonl_contract_accepts_documented_events() {
+        assert!(super::validate_jsonl_event(&serde_json::json!({
+            "event": "update_report", "book": "书", "added": 2, "apply": false
+        })));
+        assert!(super::validate_jsonl_event(&serde_json::json!({
+            "event": "chapter_added", "id": "1", "title": "第一章"
+        })));
+        assert!(super::validate_jsonl_event(&serde_json::json!({
+            "event": "chapter_downloaded", "book": "书", "chapter": "第一章",
+            "id": "1", "status": "ok"
+        })));
+    }
+
+    #[test]
+    fn jsonl_contract_rejects_missing_or_wrong_fields() {
+        assert!(!super::validate_jsonl_event(&serde_json::json!({
+            "event": "update_report", "book": "书", "added": "2", "apply": false
+        })));
+        assert!(!super::validate_jsonl_event(&serde_json::json!({
+            "event": "chapter_added", "id": "1"
+        })));
+        assert!(!super::validate_jsonl_event(&serde_json::json!({
+            "event": "unknown", "value": true
+        })));
+    }
 
     #[test]
     fn next_page_keys() {
