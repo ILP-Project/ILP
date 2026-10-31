@@ -61,6 +61,12 @@ impl TaskState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskSnapshot {
+    pub task_id: Uuid,
+    pub state: TaskState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CoreConfig {
     pub paths: StoragePaths,
     pub plugin_policy: CapabilityPolicy,
@@ -186,11 +192,14 @@ impl IlpCore {
             .map_err(|error| CoreError::Storage(error.to_string()))
     }
 
-    fn append_event(&self, kind: &str, payload: &str) -> Result<u64, CoreError> {
+    fn append_event_with_payload<F>(&self, kind: &str, make_payload: F) -> Result<u64, CoreError>
+    where
+        F: FnOnce(u64) -> anyhow::Result<String>,
+    {
         self.storage
             .lock()
             .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?
-            .append_event(kind, payload)
+            .append_event_with_payload(kind, make_payload)
             .map_err(|error| CoreError::Storage(error.to_string()))
     }
 
@@ -206,28 +215,45 @@ impl IlpCore {
     }
 
     pub fn events_after(&self, sequence: u64, limit: u32) -> Result<Vec<CoreEvent>, CoreError> {
-        let storage = self
-            .storage
-            .lock()
-            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?;
-        let oldest = storage
-            .oldest_event_sequence()
-            .map_err(|error| CoreError::Storage(error.to_string()))?;
+        let (oldest, current, rows) = {
+            let storage = self
+                .storage
+                .lock()
+                .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?;
+            let oldest = storage
+                .oldest_event_sequence()
+                .map_err(|error| CoreError::Storage(error.to_string()))?;
+            let current = storage
+                .current_event_sequence()
+                .map_err(|error| CoreError::Storage(error.to_string()))?;
+            let rows = storage
+                .events_after(sequence, limit)
+                .map_err(|error| CoreError::Storage(error.to_string()))?;
+            (oldest, current, rows)
+        };
         if let Some(oldest) = oldest {
             if sequence.saturating_add(1) < oldest {
-                return Ok(vec![CoreEvent::ResyncRequired {
-                    sequence: self.next_event_sequence(),
-                }]);
+                return Ok(vec![CoreEvent::ResyncRequired { sequence: current }]);
             }
         }
-        let rows = storage
-            .events_after(sequence, limit)
-            .map_err(|error| CoreError::Storage(error.to_string()))?;
         rows.into_iter()
-            .map(|(_, kind, payload)| {
-                serde_json::from_str(&payload).map_err(|error| {
+            .map(|(row_sequence, kind, payload)| {
+                let event: CoreEvent = serde_json::from_str(&payload).map_err(|error| {
                     CoreError::Storage(format!("事件 {kind} 反序列化失败: {error}"))
-                })
+                })?;
+                let payload_sequence = event_sequence(&event);
+                if payload_sequence != row_sequence {
+                    return Err(CoreError::Storage(format!(
+                        "事件 {kind} 序列不一致: 行 {row_sequence}, 载荷 {payload_sequence}"
+                    )));
+                }
+                if event_kind(&event) != kind {
+                    return Err(CoreError::Storage(format!(
+                        "事件类型不一致: 行 {kind}, 载荷 {}",
+                        event_kind(&event)
+                    )));
+                }
+                Ok(event)
             })
             .collect()
     }
@@ -241,13 +267,11 @@ impl IlpCore {
     }
 
     pub fn task_created_event(&self, task_id: Uuid) -> CoreEvent {
-        let payload = serde_json::to_string(&CoreEvent::TaskCreated {
-            sequence: 0,
-            task_id,
-        })
-        .expect("CoreEvent 序列化不应失败");
         let sequence = self
-            .append_event("task_created", &payload)
+            .append_event_with_payload("task_created", |sequence| {
+                serde_json::to_string(&CoreEvent::TaskCreated { sequence, task_id })
+                    .map_err(Into::into)
+            })
             .unwrap_or_else(|_| self.next_event_sequence());
         CoreEvent::TaskCreated { sequence, task_id }
     }
@@ -257,7 +281,16 @@ impl IlpCore {
         self.storage
             .lock()
             .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?
-            .create_task(&task_id.to_string(), "download", "queued")
+            .create_task_with_event(
+                &task_id.to_string(),
+                "download",
+                "queued",
+                "task_created",
+                |sequence| {
+                    serde_json::to_string(&CoreEvent::TaskCreated { sequence, task_id })
+                        .map_err(Into::into)
+                },
+            )
             .map_err(|error| CoreError::Storage(error.to_string()))?;
         Ok(task_id)
     }
@@ -273,14 +306,28 @@ impl IlpCore {
             .ok_or(CoreError::NotFound(id))?;
         let state =
             parse_task_state(&state).ok_or_else(|| CoreError::Storage("未知任务状态".into()))?;
+        let sequence = self
+            .storage
+            .lock()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?
+            .current_event_sequence()
+            .map_err(|error| CoreError::Storage(error.to_string()))?;
         Ok(CoreEvent::TaskStateChanged {
-            sequence: self.next_event_sequence(),
+            sequence,
             task_id,
             state,
         })
     }
 
     pub fn recovery_snapshot(&self) -> Result<Vec<(Uuid, TaskState)>, CoreError> {
+        Ok(self
+            .recovery_snapshot_dto()?
+            .into_iter()
+            .map(|snapshot| (snapshot.task_id, snapshot.state))
+            .collect())
+    }
+
+    pub fn recovery_snapshot_dto(&self) -> Result<Vec<TaskSnapshot>, CoreError> {
         let states = self
             .storage
             .lock()
@@ -289,7 +336,12 @@ impl IlpCore {
             .map_err(|error| CoreError::Storage(error.to_string()))?;
         Ok(states
             .into_iter()
-            .filter_map(|(id, state)| Some((Uuid::parse_str(&id).ok()?, parse_task_state(&state)?)))
+            .filter_map(|(id, state)| {
+                Some(TaskSnapshot {
+                    task_id: Uuid::parse_str(&id).ok()?,
+                    state: parse_task_state(&state)?,
+                })
+            })
             .collect())
     }
 
@@ -311,30 +363,58 @@ impl IlpCore {
             )));
         }
         storage
-            .set_task_state(&id, task_state_name(next))
+            .set_task_state_with_event(
+                &id,
+                task_state_name(next),
+                "task_state_changed",
+                |sequence| {
+                    serde_json::to_string(&CoreEvent::TaskStateChanged {
+                        sequence,
+                        task_id,
+                        state: next,
+                    })
+                    .map_err(Into::into)
+                },
+            )
+            .map(|_| ())
             .map_err(|error| CoreError::Storage(error.to_string()))
     }
 
     pub fn recover_interrupted_tasks(&self) -> Result<Vec<Uuid>, CoreError> {
-        let storage = self
+        let recovered = self
             .storage
             .lock()
-            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?;
-        let tasks = storage
-            .task_states()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?
+            .recover_interrupted_tasks_with_events(|id, sequence| {
+                let task_id = Uuid::parse_str(id).map_err(|error| anyhow::anyhow!(error))?;
+                serde_json::to_string(&CoreEvent::TaskStateChanged {
+                    sequence,
+                    task_id,
+                    state: TaskState::Interrupted,
+                })
+                .map_err(Into::into)
+            })
             .map_err(|error| CoreError::Storage(error.to_string()))?;
-        let mut recovered = Vec::new();
-        for (id, state) in tasks {
-            if matches!(parse_task_state(&state), Some(TaskState::Running)) {
-                storage
-                    .set_task_state(&id, "interrupted")
-                    .map_err(|error| CoreError::Storage(error.to_string()))?;
-                if let Ok(task_id) = Uuid::parse_str(&id) {
-                    recovered.push(task_id);
-                }
-            }
-        }
-        Ok(recovered)
+        recovered
+            .into_iter()
+            .map(|id| Uuid::parse_str(&id).map_err(|error| CoreError::Storage(error.to_string())))
+            .collect()
+    }
+}
+
+fn event_kind(event: &CoreEvent) -> &'static str {
+    match event {
+        CoreEvent::TaskCreated { .. } => "task_created",
+        CoreEvent::TaskStateChanged { .. } => "task_state_changed",
+        CoreEvent::ResyncRequired { .. } => "resync_required",
+    }
+}
+
+fn event_sequence(event: &CoreEvent) -> u64 {
+    match event {
+        CoreEvent::TaskCreated { sequence, .. }
+        | CoreEvent::TaskStateChanged { sequence, .. }
+        | CoreEvent::ResyncRequired { sequence } => *sequence,
     }
 }
 
@@ -458,6 +538,94 @@ mod tests {
             core.search("  "),
             Err(CoreError::InvalidArgument(_))
         ));
+        drop(core);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn task_operations_persist_matching_json_events() {
+        let data = std::env::temp_dir().join(format!("ilp-core-test-{}", Uuid::new_v4()));
+        let core = CoreBuilder::new(CoreConfig::new(&data)).build().unwrap();
+        let task_id = core.create_download_task().unwrap();
+        core.update_task_state(task_id, TaskState::Running).unwrap();
+
+        let events = core.events_after(0, 10).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            CoreEvent::TaskCreated { sequence: 1, task_id: id } if id == task_id
+        ));
+        assert!(matches!(
+            events[1],
+            CoreEvent::TaskStateChanged {
+                sequence: 2,
+                task_id: id,
+                state: TaskState::Running,
+            } if id == task_id
+        ));
+        let json = serde_json::to_value(&events[1]).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "task_state_changed",
+                "sequence": 2,
+                "task_id": task_id,
+                "state": "running",
+            })
+        );
+        drop(core);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn recovery_and_snapshot_have_contracts() {
+        let data = std::env::temp_dir().join(format!("ilp-core-test-{}", Uuid::new_v4()));
+        let core = CoreBuilder::new(CoreConfig::new(&data)).build().unwrap();
+        let task_id = core.create_download_task().unwrap();
+        core.update_task_state(task_id, TaskState::Running).unwrap();
+        assert_eq!(core.recover_interrupted_tasks().unwrap(), vec![task_id]);
+        assert_eq!(
+            core.recovery_snapshot_dto().unwrap(),
+            vec![TaskSnapshot {
+                task_id,
+                state: TaskState::Interrupted,
+            }]
+        );
+        let snapshot_json = serde_json::to_value(core.recovery_snapshot_dto().unwrap()).unwrap();
+        assert_eq!(
+            snapshot_json,
+            serde_json::json!([{"task_id": task_id, "state": "interrupted"}])
+        );
+        let events = core.events_after(0, 10).unwrap();
+        assert!(matches!(
+            events.last(),
+            Some(CoreEvent::TaskStateChanged {
+                sequence: 3,
+                task_id: id,
+                state: TaskState::Interrupted,
+            }) if *id == task_id
+        ));
+        drop(core);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn pruned_history_requires_resync_without_consuming_sequence() {
+        let data = std::env::temp_dir().join(format!("ilp-core-test-{}", Uuid::new_v4()));
+        let core = CoreBuilder::new(CoreConfig::new(&data)).build().unwrap();
+        for _ in 0..3 {
+            core.create_download_task().unwrap();
+        }
+        assert_eq!(core.prune_events(2).unwrap(), 1);
+        assert_eq!(
+            core.events_after(0, 10).unwrap(),
+            vec![CoreEvent::ResyncRequired { sequence: 3 }]
+        );
+        assert_eq!(
+            core.events_after(1, 10).unwrap().len(),
+            2,
+            "sequence 1 is still a valid cursor after retention"
+        );
         drop(core);
         let _ = std::fs::remove_dir_all(data);
     }

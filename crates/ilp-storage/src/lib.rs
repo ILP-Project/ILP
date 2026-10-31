@@ -4,8 +4,15 @@
 //! SQLite、正文文件和搜索索引，不应直接依赖具体数据库实现。
 
 use anyhow::{anyhow, Result};
+
+mod migration;
 use ilp_types::{ChapterEntry, PluginMetadata};
-use rusqlite::{params, Connection, OptionalExtension};
+pub use migration::{
+    backup_legacy_data, backup_legacy_data_to, detect_legacy_data, BackupReport,
+    DefaultLegacyDetector, LegacyArtifact, LegacyArtifactKind, LegacyDetectionReport,
+    LegacyDetector, LegacyFormat, LegacyMigrator, MigrationError, MigrationReport, MigrationStatus,
+};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Write;
@@ -116,6 +123,95 @@ impl SqliteStorage {
         Ok(())
     }
 
+    pub fn create_task_with_event<F>(
+        &self,
+        id: &str,
+        kind: &str,
+        state: &str,
+        event_kind: &str,
+        make_payload: F,
+    ) -> Result<u64>
+    where
+        F: FnOnce(u64) -> Result<String>,
+    {
+        let tx = self.db.unchecked_transaction()?;
+        let now = unix_seconds()?;
+        tx.execute(
+            "INSERT INTO tasks (id, kind, state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)",
+            params![id, kind, state, now],
+        )?;
+        let sequence = next_event_sequence_tx(&tx)?;
+        let payload = make_payload(sequence)?;
+        tx.execute(
+            "INSERT INTO events (sequence, kind, payload, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![sequence as i64, event_kind, payload, now],
+        )?;
+        tx.commit()?;
+        Ok(sequence)
+    }
+
+    pub fn set_task_state_with_event<F>(
+        &self,
+        id: &str,
+        state: &str,
+        event_kind: &str,
+        make_payload: F,
+    ) -> Result<u64>
+    where
+        F: FnOnce(u64) -> Result<String>,
+    {
+        let tx = self.db.unchecked_transaction()?;
+        let now = unix_seconds()?;
+        let changed = tx.execute(
+            "UPDATE tasks SET state = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, state, now],
+        )?;
+        if changed != 1 {
+            return Err(anyhow!("任务不存在: {id}"));
+        }
+        let sequence = next_event_sequence_tx(&tx)?;
+        let payload = make_payload(sequence)?;
+        tx.execute(
+            "INSERT INTO events (sequence, kind, payload, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![sequence as i64, event_kind, payload, now],
+        )?;
+        tx.commit()?;
+        Ok(sequence)
+    }
+
+    pub fn recover_interrupted_tasks_with_events<F>(
+        &self,
+        mut make_payload: F,
+    ) -> Result<Vec<String>>
+    where
+        F: FnMut(&str, u64) -> Result<String>,
+    {
+        let tx = self.db.unchecked_transaction()?;
+        let mut stmt =
+            tx.prepare("SELECT id FROM tasks WHERE state = 'running' ORDER BY created_at")?;
+        let task_ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        let now = unix_seconds()?;
+        let mut recovered = Vec::with_capacity(task_ids.len());
+        for id in task_ids {
+            tx.execute(
+                "UPDATE tasks SET state = 'interrupted', updated_at = ?2 WHERE id = ?1",
+                params![id, now],
+            )?;
+            let sequence = next_event_sequence_tx(&tx)?;
+            let payload = make_payload(&id, sequence)?;
+            tx.execute(
+                "INSERT INTO events (sequence, kind, payload, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![sequence as i64, "task_state_changed", payload, now],
+            )?;
+            recovered.push(id);
+        }
+        tx.commit()?;
+        Ok(recovered)
+    }
+
     pub fn task_state(&self, id: &str) -> Result<Option<String>> {
         self.db
             .query_row("SELECT state FROM tasks WHERE id = ?1", [id], |row| {
@@ -134,11 +230,21 @@ impl SqliteStorage {
     }
 
     pub fn append_event(&self, kind: &str, payload: &str) -> Result<u64> {
-        let sequence = self.next_event_sequence()?;
-        self.db.execute(
+        self.append_event_with_payload(kind, |_| Ok(payload.to_owned()))
+    }
+
+    pub fn append_event_with_payload<F>(&self, kind: &str, make_payload: F) -> Result<u64>
+    where
+        F: FnOnce(u64) -> Result<String>,
+    {
+        let tx = self.db.unchecked_transaction()?;
+        let sequence = next_event_sequence_tx(&tx)?;
+        let payload = make_payload(sequence)?;
+        tx.execute(
             "INSERT INTO events (sequence, kind, payload, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![sequence as i64, kind, payload, unix_seconds()?],
         )?;
+        tx.commit()?;
         Ok(sequence)
     }
 
@@ -161,9 +267,20 @@ impl SqliteStorage {
             .map_err(Into::into)
     }
 
+    pub fn current_event_sequence(&self) -> Result<u64> {
+        self.db
+            .query_row(
+                "SELECT COALESCE((SELECT next_sequence FROM event_sequence WHERE id = 1), 0)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|sequence| sequence as u64)
+            .map_err(Into::into)
+    }
+
     pub fn prune_events(&self, keep: u64) -> Result<usize> {
         let removed = self.db.execute(
-            "DELETE FROM events WHERE sequence < (SELECT COALESCE(MAX(sequence), 0) - ?1 FROM events)",
+            "DELETE FROM events WHERE sequence <= (SELECT COALESCE(MAX(sequence), 0) - ?1 FROM events)",
             [keep as i64],
         )?;
         Ok(removed)
@@ -171,18 +288,9 @@ impl SqliteStorage {
 
     pub fn next_event_sequence(&self) -> Result<u64> {
         let tx = self.db.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO event_sequence (id, next_sequence) VALUES (1, 1)
-             ON CONFLICT(id) DO UPDATE SET next_sequence = next_sequence + 1",
-            [],
-        )?;
-        let value: i64 = tx.query_row(
-            "SELECT next_sequence FROM event_sequence WHERE id = 1",
-            [],
-            |row| row.get(0),
-        )?;
+        let value = next_event_sequence_tx(&tx)?;
         tx.commit()?;
-        Ok(value as u64)
+        Ok(value)
     }
 
     pub fn paths(&self) -> &StoragePaths {
@@ -448,6 +556,20 @@ impl LibraryStorage for SqliteStorage {
             .optional()
             .map_err(Into::into)
     }
+}
+
+fn next_event_sequence_tx(tx: &Transaction<'_>) -> Result<u64> {
+    tx.execute(
+        "INSERT INTO event_sequence (id, next_sequence) VALUES (1, 1)
+         ON CONFLICT(id) DO UPDATE SET next_sequence = next_sequence + 1",
+        [],
+    )?;
+    let value: i64 = tx.query_row(
+        "SELECT next_sequence FROM event_sequence WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(value as u64)
 }
 
 fn unix_seconds() -> Result<i64> {
