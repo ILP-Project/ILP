@@ -143,6 +143,11 @@ impl IlpCore {
     }
 
     pub fn next_event_sequence(&self) -> u64 {
+        if let Ok(storage) = self.storage.lock() {
+            if let Ok(sequence) = storage.next_event_sequence() {
+                return sequence;
+            }
+        }
         let mut sequence = self.next_sequence.lock().expect("事件序列锁不应中毒");
         *sequence += 1;
         *sequence
