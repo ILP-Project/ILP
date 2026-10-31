@@ -164,25 +164,15 @@ fn guest_error(store: &Store<HostState>, e: wasmtime::Error) -> anyhow::Error {
 }
 
 #[derive(Clone, Debug)]
-struct CapabilityPolicy {
-    permissions: std::collections::HashSet<String>,
-    allowed_domains: Vec<String>,
+pub struct CapabilityPolicy {
+    pub permissions: std::collections::HashSet<String>,
+    pub allowed_domains: Vec<String>,
 }
 
 impl CapabilityPolicy {
-    fn unrestricted() -> Self {
+    pub fn deny_all() -> Self {
         Self {
-            permissions: [
-                "http",
-                "clock",
-                "storage-read",
-                "storage-write",
-                "secret-read",
-                "secret-write",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+            permissions: std::collections::HashSet::new(),
             allowed_domains: Vec::new(),
         }
     }
@@ -229,6 +219,45 @@ fn runtime_policy(policy: &CapabilityPolicy) -> RuntimeCapabilityPolicy {
             fuel: MAX_PLUGIN_FUEL,
         },
     }
+}
+
+fn effective_policy(host: &CapabilityPolicy, metadata: &PluginMetadata) -> CapabilityPolicy {
+    let permissions = metadata
+        .permissions
+        .iter()
+        .filter(|permission| host.permissions.contains(*permission))
+        .cloned()
+        .collect();
+    let allowed_domains = if metadata.allowed_domains.is_empty() {
+        host.allowed_domains.clone()
+    } else {
+        metadata
+            .allowed_domains
+            .iter()
+            .filter(|domain| {
+                host.allowed_domains.is_empty()
+                    || host
+                        .allowed_domains
+                        .iter()
+                        .any(|allowed| domain_is_within(domain, allowed))
+            })
+            .cloned()
+            .collect()
+    };
+    CapabilityPolicy {
+        permissions,
+        allowed_domains,
+    }
+}
+
+fn domain_is_within(domain: &str, allowed: &str) -> bool {
+    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    let allowed = allowed.trim().trim_end_matches('.').to_ascii_lowercase();
+    allowed == "*"
+        || allowed == domain
+        || (allowed
+            .strip_prefix("*.")
+            .is_some_and(|suffix| domain.ends_with(&format!(".{suffix}"))))
 }
 
 fn domain_matches(host: &str, domain: &str) -> bool {
@@ -369,6 +398,7 @@ pub struct HostState {
 }
 
 impl HostState {
+    #[cfg(test)]
     fn new(plugin_name: String, storage_dir: PathBuf) -> Self {
         let secret_dir = storage_dir
             .parent()
@@ -379,7 +409,7 @@ impl HostState {
             plugin_name,
             storage_dir,
             secret_dir,
-            CapabilityPolicy::unrestricted(),
+            CapabilityPolicy::deny_all(),
         )
     }
 
@@ -891,6 +921,31 @@ mod security_tests {
     }
 
     #[test]
+    fn plugin_metadata_cannot_escalate_host_policy() {
+        let host = CapabilityPolicy {
+            permissions: ["http".to_string()].into_iter().collect(),
+            allowed_domains: vec!["example.com".to_string()],
+        };
+        let metadata = PluginMetadata {
+            abi_version: "0.2.0".into(),
+            site_name: "site".into(),
+            site_id: "site".into(),
+            site_domain: "example.com".into(),
+            plugin_name: "plugin".into(),
+            plugin_id: "plugin".into(),
+            version: "0.1.0".into(),
+            permissions: vec!["http".into(), "secret-read".into(), "storage-write".into()],
+            allowed_domains: vec!["example.com".into(), "secrets.example.com".into()],
+        };
+        let effective = effective_policy(&host, &metadata);
+        assert_eq!(
+            effective.permissions,
+            ["http".to_string()].into_iter().collect()
+        );
+        assert_eq!(effective.allowed_domains, vec!["example.com"]);
+    }
+
+    #[test]
     fn undeclared_capabilities_are_not_issued() {
         let mut state = HostState::with_policy(
             "test".to_string(),
@@ -987,6 +1042,14 @@ enum PluginBackend {
 
 impl PluginInstance {
     pub fn load(path: &Path, storage_root: &Path) -> Result<Self> {
+        Self::load_with_policy(path, storage_root, CapabilityPolicy::deny_all())
+    }
+
+    pub fn load_with_policy(
+        path: &Path,
+        storage_root: &Path,
+        host_policy: CapabilityPolicy,
+    ) -> Result<Self> {
         let wasm =
             std::fs::read(path).map_err(|e| anyhow!("读取插件失败 {}: {e}", path.display()))?;
         validate_component(&wasm)
@@ -1015,7 +1078,16 @@ impl PluginInstance {
                 >(&mut linker, |s| s)?;
                 let mut store = new_store(
                     engine,
-                    HostState::new(name.clone(), storage_root.join(&name)),
+                    HostState::with_policy_and_secret(
+                        name.clone(),
+                        storage_root.join(&name),
+                        storage_root
+                            .parent()
+                            .unwrap_or(Path::new("."))
+                            .join("secrets")
+                            .join(&name),
+                        CapabilityPolicy::deny_all(),
+                    ),
                 )?;
                 let bindings = current::NovelPlugin::instantiate(&mut store, &component, &linker)
                     .map_err(|e| anyhow!("实例化插件失败 {}: {e}", path.display()))?;
@@ -1034,10 +1106,12 @@ impl PluginInstance {
                     permissions: raw.permissions.into_iter().map(permission_name).collect(),
                     allowed_domains: raw.allowed_domains,
                 };
-                store.data_mut().policy = CapabilityPolicy {
-                    permissions: metadata.permissions.iter().cloned().collect(),
-                    allowed_domains: metadata.allowed_domains.clone(),
-                };
+                let plugin_policy = effective_policy(&host_policy, &metadata);
+                store.data_mut().policy = plugin_policy.clone();
+                store
+                    .data_mut()
+                    .runtime_host
+                    .set_policy(runtime_policy(&plugin_policy));
                 validate_metadata(&metadata)
                     .map_err(|e| anyhow!("插件 metadata 校验失败 {}: {e}", path.display()))?;
                 Self::finish(metadata, PluginBackend::Current { store, bindings })
@@ -1052,7 +1126,16 @@ impl PluginInstance {
                 >(&mut linker, |s| s)?;
                 let mut store = new_store(
                     engine,
-                    HostState::new(name.clone(), storage_root.join(&name)),
+                    HostState::with_policy_and_secret(
+                        name.clone(),
+                        storage_root.join(&name),
+                        storage_root
+                            .parent()
+                            .unwrap_or(Path::new("."))
+                            .join("secrets")
+                            .join(&name),
+                        host_policy.clone(),
+                    ),
                 )?;
                 let bindings = legacy::NovelPlugin::instantiate(&mut store, &component, &linker)
                     .map_err(|e| anyhow!("实例化旧版插件失败 {}: {e}", path.display()))?;

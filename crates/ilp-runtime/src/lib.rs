@@ -308,6 +308,11 @@ impl RuntimeHost {
         self
     }
 
+    pub fn set_policy(&mut self, policy: CapabilityPolicy) {
+        self.capabilities = HostCapabilities::from_policy(&policy);
+        self.policy = policy;
+    }
+
     pub fn fetch(&mut self, url: &str, body: &[u8]) -> std::result::Result<Vec<u8>, RuntimeError> {
         let request = HttpRequest {
             method: "POST".to_string(),

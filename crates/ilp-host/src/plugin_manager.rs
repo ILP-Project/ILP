@@ -741,8 +741,15 @@ fn check_declared_capabilities(config: &Config, p: &RegistryPlugin, wasm: &Path)
         return Ok(());
     }
     let storage_root = Path::new(&config.data_folder).join("plugins");
-    let plugin = crate::engine::PluginInstance::load(wasm, &storage_root)
-        .with_context(|| format!("插件 {} 的元数据校验未通过（组件无法加载）", p.name))?;
+    let plugin = crate::engine::PluginInstance::load_with_policy(
+        wasm,
+        &storage_root,
+        crate::engine::CapabilityPolicy {
+            permissions: p.permissions.iter().cloned().collect(),
+            allowed_domains: p.allowed_domains.clone(),
+        },
+    )
+    .with_context(|| format!("插件 {} 的元数据校验未通过（组件无法加载）", p.name))?;
     for warning in compare_capabilities(&p.permissions, &p.allowed_domains, &plugin.metadata)? {
         tracing::warn!("插件 {}: {warning}", p.name);
     }
