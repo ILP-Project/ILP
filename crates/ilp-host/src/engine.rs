@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use ilp_runtime::{validate_component, validate_metadata};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -892,8 +893,12 @@ enum PluginBackend {
 
 impl PluginInstance {
     pub fn load(path: &Path, storage_root: &Path) -> Result<Self> {
+        let wasm =
+            std::fs::read(path).map_err(|e| anyhow!("读取插件失败 {}: {e}", path.display()))?;
+        validate_component(&wasm)
+            .map_err(|e| anyhow!("插件 Component 校验失败 {}: {e}", path.display()))?;
         let engine = shared_engine();
-        let component = Component::from_file(engine, path)
+        let component = Component::from_binary(engine, &wasm)
             .map_err(|e| anyhow!("读取组件失败 {}: {e}", path.display()))?;
         let version = component
             .component_type()
@@ -939,6 +944,8 @@ impl PluginInstance {
                     permissions: metadata.permissions.iter().cloned().collect(),
                     allowed_domains: metadata.allowed_domains.clone(),
                 };
+                validate_metadata(&metadata)
+                    .map_err(|e| anyhow!("插件 metadata 校验失败 {}: {e}", path.display()))?;
                 Self::finish(metadata, PluginBackend::Current { store, bindings })
             }
             "0.1.0" => {
@@ -970,6 +977,8 @@ impl PluginInstance {
                     permissions: Vec::new(),
                     allowed_domains: Vec::new(),
                 };
+                validate_metadata(&metadata)
+                    .map_err(|e| anyhow!("旧版插件 metadata 校验失败 {}: {e}", path.display()))?;
                 Self::finish(metadata, PluginBackend::Legacy { store, bindings })
             }
             other => Err(anyhow!("插件 ABI 版本 {other} 不受支持")),
