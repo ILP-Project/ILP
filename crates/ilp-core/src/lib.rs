@@ -97,11 +97,20 @@ pub enum CoreError {
 
 pub struct CoreBuilder {
     config: CoreConfig,
+    runtime_threads: usize,
 }
 
 impl CoreBuilder {
     pub fn new(config: CoreConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            runtime_threads: 2,
+        }
+    }
+
+    pub fn runtime_threads(mut self, threads: usize) -> Self {
+        self.runtime_threads = threads.max(1);
+        self
     }
 
     pub fn build(self) -> Result<IlpCore, CoreError> {
@@ -111,10 +120,16 @@ impl CoreBuilder {
             .map_err(|e| CoreError::InvalidArgument(e.to_string()))?;
         let storage = SqliteStorage::open(self.config.paths.clone())
             .map_err(|error| CoreError::Storage(error.to_string()))?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(self.runtime_threads)
+            .enable_all()
+            .build()
+            .map_err(|error| CoreError::InvalidArgument(format!("创建运行时失败: {error}")))?;
         Ok(IlpCore {
             config: self.config,
             storage: Mutex::new(storage),
             next_sequence: Arc::new(Mutex::new(0)),
+            runtime,
         })
     }
 }
@@ -123,11 +138,16 @@ pub struct IlpCore {
     config: CoreConfig,
     storage: Mutex<SqliteStorage>,
     next_sequence: Arc<Mutex<u64>>,
+    runtime: tokio::runtime::Runtime,
 }
 
 impl IlpCore {
     pub fn config(&self) -> &CoreConfig {
         &self.config
+    }
+
+    pub fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
+        self.runtime.block_on(future)
     }
 
     pub fn new_task_id(&self) -> Uuid {
