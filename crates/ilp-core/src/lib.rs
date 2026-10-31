@@ -3,7 +3,7 @@
 //! Core 不读取命令行、不输出人类文本，也不直接暴露底层数据库；调用方通过
 //! 服务接口提交预定义用例，并订阅结构化事件。
 
-use ilp_runtime::{validate_metadata, CapabilityPolicy};
+use ilp_runtime::{validate_metadata, CapabilityPolicy, ResourceLimits};
 use ilp_storage::{LibraryStorage, SqliteStorage, StoragePaths, StoredBook};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -381,6 +381,7 @@ pub trait SyncService {
 
 pub trait PluginService {
     fn policy(&self) -> &CapabilityPolicy;
+    fn resource_limits(&self) -> &ResourceLimits;
 }
 
 impl LibraryService for IlpCore {
@@ -421,6 +422,10 @@ impl SyncService for IlpCore {
 impl PluginService for IlpCore {
     fn policy(&self) -> &CapabilityPolicy {
         &self.config.plugin_policy
+    }
+
+    fn resource_limits(&self) -> &ResourceLimits {
+        &self.config.plugin_policy.limits
     }
 }
 
