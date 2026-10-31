@@ -67,6 +67,21 @@ pub struct PluginTrust {
 pub const CURRENT_ABI: &str = "0.2.0";
 pub const SUPPORTED_ABIS: &[&str] = &["0.1.0", CURRENT_ABI];
 
+pub fn validate_permissions(
+    requested: &[String],
+    granted: &std::collections::BTreeSet<String>,
+) -> std::result::Result<(), RuntimeError> {
+    if let Some(permission) = requested
+        .iter()
+        .find(|permission| !granted.contains(*permission))
+    {
+        return Err(RuntimeError::PermissionDenied(format!(
+            "插件请求未授权能力: {permission}"
+        )));
+    }
+    Ok(())
+}
+
 pub trait PluginRuntime: Send + Sync {
     fn load(&self, wasm: &[u8], policy: &CapabilityPolicy) -> Result<PluginTrust>;
 }
@@ -143,6 +158,7 @@ impl RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn default_policy_denies_network_and_storage() {
@@ -163,6 +179,14 @@ mod tests {
         assert!(validate_abi("0.1.0").is_ok());
         assert!(validate_abi(CURRENT_ABI).is_ok());
         assert!(validate_abi("9.9.9").is_err());
+    }
+
+    #[test]
+    fn permissions_are_default_deny() {
+        let requested = vec!["http".to_string()];
+        assert!(validate_permissions(&requested, &BTreeSet::new()).is_err());
+        let granted = ["http".to_string()].into_iter().collect();
+        assert!(validate_permissions(&requested, &granted).is_ok());
     }
 
     #[test]
