@@ -854,17 +854,21 @@ fn validate_wasm(bytes: &[u8]) -> Result<()> {
 /// 签名是对 `registry.json` 的**原始字节**，放在旁路的 `registry.json.sig`：
 /// 把签名写进 JSON 内部就成了自指（签名内容含签名），而重新序列化做
 /// 规范化又会引入"两侧算法必须完全一致"的隐式契约。
+fn missing_registry_signature(config: &Config, sig_url: &str) -> Result<()> {
+    if config.require_registry_signatures {
+        return Err(anyhow!(
+            "registry 元数据没有签名（{sig_url} 不存在），默认已启用强制校验。\
+             请使用带签名的镜像；仅内部镜像可在 config.json 中显式关闭 require_registry_signatures"
+        ));
+    }
+    tracing::warn!("registry 元数据没有签名，跳过校验（未启用 require_registry_signatures）");
+    Ok(())
+}
+
 fn verify_registry_signature(config: &Config, base: &str, bytes: &[u8]) -> Result<()> {
     let sig_url = format!("{base}/registry.json.sig");
     let Some(raw) = crate::http::get_bytes_if_exists(&sig_url)? else {
-        if config.require_registry_signatures {
-            return Err(anyhow!(
-                "registry 元数据没有签名（{sig_url} 不存在），默认已启用强制校验。\
-                 请使用带签名的镜像；仅内部镜像可在 config.json 中显式关闭 require_registry_signatures"
-            ));
-        }
-        tracing::warn!("registry 元数据没有签名，跳过校验（未启用 require_registry_signatures）");
-        return Ok(());
+        return missing_registry_signature(config, &sig_url);
     };
     verify_registry_signature_bytes(config, bytes, &raw)
 }
@@ -1366,6 +1370,28 @@ mod tests {
         let plugin = plugin_with_signatures(vec![("a", &a), ("b", &b)], bytes);
         let config = trust(&[("a", &a)]);
         verify_signature(&config, &plugin, "1", bytes).expect("已信任的一签已足够");
+    }
+
+    #[test]
+    fn registry_signature_missing_respects_secure_default_and_opt_out() {
+        let mut required = Config::default();
+        required.require_registry_signatures = true;
+        let err = missing_registry_signature(&required, "https://example.test/registry.json.sig")
+            .expect_err("强制模式缺少签名必须拒绝");
+        assert!(format!("{err:#}").contains("没有签名"));
+
+        let mut optional = Config::default();
+        optional.require_registry_signatures = false;
+        missing_registry_signature(&optional, "https://example.test/registry.json.sig")
+            .expect("显式关闭后允许无签名镜像");
+    }
+
+    #[test]
+    fn registry_signature_malformed_payload_is_rejected() {
+        let config = Config::default();
+        let err = verify_registry_signature_bytes(&config, b"registry", b"not-json")
+            .expect_err("非法签名 JSON 必须拒绝");
+        assert!(format!("{err:#}").contains("解析 registry 签名失败"));
     }
 
     #[test]
