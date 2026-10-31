@@ -24,6 +24,23 @@ jobs:
       - run: cargo test --workspace
         timeout-minutes: 15
       - run: cargo build
+      - name: Build official Fanqie plugin
+        run: |
+          set -euo pipefail
+          rustup target add wasm32-wasip2
+          git clone --depth 1 https://github.com/ILP-Project/plugins.git /tmp/ilp-plugins
+          cargo build --manifest-path /tmp/ilp-plugins/Cargo.toml --target wasm32-wasip2 --release
+          test -f /tmp/ilp-plugins/target/wasm32-wasip2/release/ilp_plugin_fanqie.wasm
+          python3 - /tmp/ilp-plugins/target/wasm32-wasip2/release/ilp_plugin_fanqie.wasm <<'PY'
+          import sys
+          data = open(sys.argv[1], "rb").read()
+          if data[:4] != b"\0asm" or data[6:8] != b"\x01\x00":
+              raise SystemExit("Fanqie 产物不是 WebAssembly component")
+          PY
+      - name: Run official plugin ABI smoke tests
+        env:
+          ILP_E2E_PLUGIN: /tmp/ilp-plugins/target/wasm32-wasip2/release/ilp_plugin_fanqie.wasm
+        run: cargo test -p ilp-host --bin ilp
       - name: Test installer
         run: |
           python3 -m pip install --quiet cryptography

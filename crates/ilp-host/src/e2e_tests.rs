@@ -10,6 +10,9 @@
 use std::path::PathBuf;
 
 fn wasm_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("ILP_E2E_PLUGIN") {
+        return PathBuf::from(path);
+    }
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop();
     p.pop();
