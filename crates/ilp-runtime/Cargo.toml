@@ -10,3 +10,4 @@ ilp-types = { version = "0.1.0", path = "../ilp-types" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+wasmtime = "48"

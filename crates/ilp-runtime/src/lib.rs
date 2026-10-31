@@ -6,6 +6,9 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+use wasmtime::{Config as WasmtimeConfig, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResourceLimits {
@@ -13,6 +16,7 @@ pub struct ResourceLimits {
     pub max_response_bytes: u64,
     pub max_requests: u32,
     pub timeout_ms: u64,
+    pub fuel: u64,
 }
 
 impl Default for ResourceLimits {
@@ -22,6 +26,7 @@ impl Default for ResourceLimits {
             max_response_bytes: 16 * 1024 * 1024,
             max_requests: 100,
             timeout_ms: 30_000,
+            fuel: 1_000_000_000,
         }
     }
 }
@@ -97,6 +102,43 @@ pub fn validate_permissions(
         )));
     }
     Ok(())
+}
+
+pub struct RuntimeStore {
+    pub limits: StoreLimits,
+    pub started: Instant,
+    pub timeout: Duration,
+}
+
+pub fn shared_engine() -> &'static Engine {
+    static ENGINE: OnceLock<Engine> = OnceLock::new();
+    ENGINE.get_or_init(|| {
+        let mut config = WasmtimeConfig::new();
+        config.consume_fuel(true);
+        config.epoch_interruption(true);
+        Engine::new(&config).expect("创建 Wasmtime engine 失败")
+    })
+}
+
+pub fn new_store(policy: &CapabilityPolicy) -> Result<Store<RuntimeStore>> {
+    let limits = StoreLimitsBuilder::new()
+        .memory_size(policy.limits.max_memory_bytes as usize)
+        .instances(1)
+        .tables(16)
+        .build();
+    let mut store = Store::new(
+        shared_engine(),
+        RuntimeStore {
+            limits,
+            started: Instant::now(),
+            timeout: Duration::from_millis(policy.limits.timeout_ms),
+        },
+    );
+    store.limiter(|state| &mut state.limits);
+    store
+        .set_fuel(policy.limits.fuel)
+        .map_err(|error| anyhow!("设置插件 fuel 失败: {error}"))?;
+    Ok(store)
 }
 
 pub trait PluginRuntime: Send + Sync {
