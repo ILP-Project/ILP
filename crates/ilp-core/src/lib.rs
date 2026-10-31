@@ -3,7 +3,7 @@
 //! Core 不读取命令行、不输出人类文本，也不直接暴露底层数据库；调用方通过
 //! 服务接口提交预定义用例，并订阅结构化事件。
 
-use ilp_runtime::CapabilityPolicy;
+use ilp_runtime::{validate_metadata, CapabilityPolicy};
 use ilp_storage::{LibraryStorage, SqliteStorage, StoragePaths, StoredBook};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -172,6 +172,10 @@ impl IlpCore {
 
     pub fn new_task_id(&self) -> Uuid {
         Uuid::new_v4()
+    }
+
+    pub fn validate_plugin(&self, metadata: &ilp_types::PluginMetadata) -> Result<(), CoreError> {
+        validate_metadata(metadata).map_err(|error| CoreError::Plugin(error.to_string()))
     }
 
     pub fn save_book(&self, book: &StoredBook) -> Result<(), CoreError> {
