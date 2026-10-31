@@ -49,8 +49,8 @@ pub struct Config {
     pub plugin_signature_threshold: usize,
     /// 是否要求 registry 元数据本身带有效签名。
     ///
-    /// 默认关闭是为了兼容还没发签名的镜像；打开后缺失签名会直接拒绝安装。
-    #[serde(default)]
+    /// 默认开启；仅在使用明确不签名的内部镜像时关闭。
+    #[serde(default = "default_true")]
     pub require_registry_signatures: bool,
     /// 原始文件内容，仅用于检查未知字段，不参与序列化
     #[serde(skip)]
@@ -131,7 +131,7 @@ impl Default for Config {
             plugin_revoked_keys: Vec::new(),
             require_plugin_signatures: false,
             plugin_signature_threshold: default_signature_threshold(),
-            require_registry_signatures: false,
+            require_registry_signatures: true,
             raw: String::new(),
         }
     }
@@ -229,6 +229,7 @@ mod tests {
         assert_eq!(cfg.sleep_time, default_sleep_time());
         assert_eq!(cfg.log_level, "info");
         assert!(cfg.no_proxy.contains(&"i.snssdk.com".to_string()));
+        assert!(cfg.require_registry_signatures);
     }
 
     #[test]
@@ -238,6 +239,7 @@ mod tests {
         assert_eq!(cfg.novels_dir(), Path::new("data/novels"));
         assert_eq!(cfg.covers_dir(), Path::new("data/covers"));
         assert_eq!(cfg.logs_dir(), Path::new("data/logs"));
+        assert!(cfg.require_registry_signatures);
     }
 
     #[test]

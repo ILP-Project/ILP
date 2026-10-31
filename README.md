@@ -91,7 +91,7 @@ data/
 
 默认 registry：`https://ilp.elysola.org`，可用 `ILP_REGISTRY_URL` 指定镜像。
 
-安装前验证 ABI、版本范围、大小、SHA-256、WASM 签名和元数据。插件权限与域名由宿主策略强制执行；registry 声明只用于展示和审核。registry 元数据签名文件为 `registry.json.sig`，签名对象是原始 JSON 字节。
+安装前验证 ABI、版本范围、大小、SHA-256、WASM 签名和元数据。插件权限与域名由宿主策略强制执行；registry 声明只用于展示和审核。registry 元数据签名文件为 `registry.json.sig`，签名对象是原始 JSON 字节。默认强制要求 registry 签名；仅内部未签名镜像才应在配置中显式关闭 `require_registry_signatures`。
 
 宿主只允许 HTTPS，并检查解析得到的每个 IP，防止回环、私网和 DNS rebinding。使用 HTTP 代理时无法钉住代理侧解析结果；敏感目标应加入 `no_proxy`。
 

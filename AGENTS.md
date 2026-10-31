@@ -11,6 +11,7 @@ Rust 2021 小说下载器，站点能力通过 Wasmtime WebAssembly 插件提供
 - 插件只能通过宿主访问网络、存储、secret 和时间；不能自行发 HTTP 或读写文件。
 - 宿主策略是安全边界；registry 的权限和域名字段只是声明。
 - 安装前验证 ABI、版本范围、大小、SHA-256、签名和元数据。
+- 默认强制要求 `registry.json.sig`；仅内部未签名镜像可显式关闭 `require_registry_signatures`。
 - 签名覆盖原始字节；插件签名和 registry 签名分开验证。
 - DNS rebinding 防护必须校验所有解析地址；代理场景要求敏感域名使用 `no_proxy`。
 - 测试不得访问真实网络；使用 wiremock、fixture 或 replay。

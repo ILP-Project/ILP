@@ -818,8 +818,8 @@ fn verify_registry_signature(config: &Config, base: &str, bytes: &[u8]) -> Resul
     let Some(raw) = crate::http::get_bytes_if_exists(&sig_url)? else {
         if config.require_registry_signatures {
             return Err(anyhow!(
-                "registry 元数据没有签名（{sig_url} 不存在），已启用 require_registry_signatures。\
-                 请把镜像升级到带签名的版本，或关闭该开关"
+                "registry 元数据没有签名（{sig_url} 不存在），默认已启用强制校验。\
+                 请使用带签名的镜像；仅内部镜像可在 config.json 中显式关闭 require_registry_signatures"
             ));
         }
         tracing::warn!("registry 元数据没有签名，跳过校验（未启用 require_registry_signatures）");
