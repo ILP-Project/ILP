@@ -3,7 +3,7 @@ use anyhow::{anyhow, Result};
 use crate::config::Config;
 use crate::engine::PluginInstance;
 use crate::storage::{Book, Storage};
-use ilp_types::ChapterContent;
+use ilp_types::{ChapterResult, ChapterStatus};
 use std::io::IsTerminal;
 use std::sync::Once;
 
@@ -351,11 +351,34 @@ fn persist(
     book_id: &str,
     book: &Book,
     seq: usize,
-    item: &ChapterContent,
+    item: &ChapterResult,
     done: &mut usize,
     failed: &mut usize,
 ) {
-    let full = format!("{}\n{}\n---\n{}", item.title, book.author, item.text);
+    if item.status != ChapterStatus::Ok {
+        let detail = item
+            .message
+            .as_deref()
+            .filter(|message| !message.is_empty())
+            .unwrap_or("插件未返回正文");
+        tracing::warn!(
+            chapter = %item.id,
+            status = ?item.status,
+            error_code = %item.error_code,
+            retryable = item.retryable,
+            "章节未获取: {detail}"
+        );
+        mark_failed(storage, site_id, book_id, &item.id);
+        *failed += 1;
+        return;
+    }
+    let Some(text) = item.text.as_deref() else {
+        tracing::warn!(chapter = %item.id, "章节状态为 ok 但没有正文");
+        mark_failed(storage, site_id, book_id, &item.id);
+        *failed += 1;
+        return;
+    };
+    let full = format!("{}\n{}\n---\n{}", item.title, book.author, text);
     match storage.save_chapter(
         site_id,
         &book.title,

@@ -259,7 +259,7 @@ use current::ilp::plugin::types::{FetchTask, HttpResponse};
 
 pub use current::ilp::plugin::types as wit_types;
 
-use ilp_types::{ChapterContent, ChapterEntry, PluginMetadata, SearchResult};
+use ilp_types::{ChapterEntry, ChapterResult, ChapterStatus, PluginMetadata, SearchResult};
 
 /// 宿主给插件的全部能力对应的状态。
 pub struct HostState {
@@ -1119,7 +1119,7 @@ impl PluginInstance {
         &mut self,
         task_id: &str,
         resp: HttpResponse,
-    ) -> Result<Vec<ChapterContent>> {
+    ) -> Result<Vec<ChapterResult>> {
         match &mut self.backend {
             PluginBackend::Current { store, bindings } => Ok(guest_call(store, |s| {
                 bindings
@@ -1128,13 +1128,7 @@ impl PluginInstance {
             })?
             .map_err(|e| anyhow!("plugin::{e}"))?
             .into_iter()
-            .filter_map(|c| {
-                c.text.map(|text| ChapterContent {
-                    id: c.id,
-                    title: c.title,
-                    text,
-                })
-            })
+            .map(convert_chapter_result)
             .collect()),
             PluginBackend::Legacy { store, bindings } => {
                 let resp = convert_legacy_response(resp);
@@ -1145,11 +1139,7 @@ impl PluginInstance {
                 })?
                 .map_err(|e| anyhow!("plugin::{e}"))?
                 .into_iter()
-                .map(|c| ChapterContent {
-                    id: c.id,
-                    title: c.title,
-                    text: c.text,
-                })
+                .map(|c| ChapterResult::ok(c.id, c.title, c.text))
                 .collect())
             }
         }
@@ -1166,6 +1156,26 @@ fn guest_call<T>(
     match out {
         Ok(v) => Ok(v),
         Err(e) => Err(guest_error(store, e)),
+    }
+}
+
+fn convert_chapter_result(c: ilp::plugin::types::ChapterResult) -> ChapterResult {
+    ChapterResult {
+        id: c.id,
+        title: c.title,
+        status: match c.status {
+            ilp::plugin::types::ChapterStatus::Ok => ChapterStatus::Ok,
+            ilp::plugin::types::ChapterStatus::Locked => ChapterStatus::Locked,
+            ilp::plugin::types::ChapterStatus::Captcha => ChapterStatus::Captcha,
+            ilp::plugin::types::ChapterStatus::AuthRequired => ChapterStatus::AuthRequired,
+            ilp::plugin::types::ChapterStatus::NotFound => ChapterStatus::NotFound,
+            ilp::plugin::types::ChapterStatus::Invalid => ChapterStatus::Invalid,
+            ilp::plugin::types::ChapterStatus::Error => ChapterStatus::Error,
+        },
+        text: c.text,
+        error_code: c.error_code,
+        retryable: c.retryable,
+        message: c.message,
     }
 }
 
