@@ -21,6 +21,30 @@ Rust 2021 小说下载器，站点能力通过 Wasmtime WebAssembly 插件提供
 - 提交前使用作者：`RhenCloud <rhencloud@users.noreply.github.com>`。
 - 用户可见文本和代码注释使用简体中文；字符串集中在 `crates/ilp-host/src/messages.rs`。
 
+## 版本与 Release 规则
+
+- 当前正式版本为 `v0.1.0`；宿主 crate 版本为 `0.1.0`，WIT ABI 版本独立维护，当前支持 ABI `0.1.0` 和 `0.2.0`。
+- 版本号遵循 SemVer：修复使用 patch，向后兼容功能使用 minor，不兼容变更使用 major；ABI 版本不能因为普通宿主功能变更而随意升级。
+- 发布前必须同步检查 workspace 中所有可发布 crate 的 `Cargo.toml` 版本、README、安装器和 workflow；path 依赖同时声明兼容的 registry `version`，确保 `cargo package --workspace --locked --no-verify` 通过。
+- Release tag 使用签名的 annotated tag，格式为 `v<version>`，例如：`v0.1.0`。tag 指向的提交必须已经合并到 `main`，工作区必须干净。
+- Release 私钥只能存储在 GitHub Actions Secret `ILP_SIGNING_KEYS`，不得打印、提交、写入配置或测试 fixture；仓库和用户配置只保存公钥。当前官方 key ID 为 `release-2026`。
+- 发布前必须通过：
+  ```bash
+  cargo fmt --all --check
+  cargo clippy --all-targets -- -D warnings
+  cargo test --workspace
+  cargo build --release --locked
+  cargo package --workspace --locked --no-verify
+  scripts/install_test.sh
+  git diff --check
+  ```
+- Release workflow 必须为每个可用平台构建产物，生成 `SHA256SUMS` 和 `SHA256SUMS.sig`；签名覆盖校验清单原始字节，registry 仍须单独签名。
+- 当前官方 Release 平台为 Linux x86_64、Linux ARM64 和 Windows x86_64；不可用的 runner 不得阻塞发布，应从矩阵移除并在 Release 说明中明确缺失平台。macOS 产物只有 runner 可用且构建验证通过时才加入。
+- 发布失败时不得手工上传未经 workflow 验证的二进制；应修复 workflow 后删除并重新创建同名 tag，再重新触发发布。
+- 发布完成后必须验证 GitHub Release、全部资产、`SHA256SUMS`、`SHA256SUMS.sig`、签名 key、安装器和 `ilp version` 启动闭环；下载真实 Release 产物进行 SHA-256 校验。
+- 正式版本发布后 tag 和 Release 资产视为不可变。若确需修复发布流程，必须记录原因；重建同一版本前先取消旧 workflow、删除旧 Release/tag，并重新签名推送 tag。
+- 历史提交重写、作者邮箱变更或 GPG key 变更后，必须重新签名相关提交和 tag，并 force push 前确认远端分支、tag 与 Release 的对应关系。
+
 ## CLI
 
 ```text
