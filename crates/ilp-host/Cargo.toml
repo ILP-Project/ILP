@@ -24,6 +24,8 @@ tracing-appender = "0.2"
 sha2 = "0.10"
 ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
 base64 = "0.23.1"
+# 诊断包用 tar.gz：miniz_oxide 后端是纯 Rust，不引入系统 zlib。
+flate2 = "1"
 
 [dev-dependencies]
 wiremock = "0.6"

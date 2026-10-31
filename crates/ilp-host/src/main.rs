@@ -2,6 +2,7 @@ mod cancel;
 mod cli;
 mod commands;
 mod config;
+mod diagnostics;
 mod engine;
 mod exit;
 mod http;
@@ -55,6 +56,11 @@ fn run() -> anyhow::Result<()> {
             let mut plugins = engine::load_plugins(&config)?;
             commands::do_search(&mut plugins, &config, &keyword, &site_id)
         }
+        cli::Command::Doctor {
+            bundle,
+            with_manifest,
+            yes,
+        } => commands::do_doctor(&config, bundle, with_manifest, yes),
         cli::Command::Version => commands::do_version(&config),
     }
 }

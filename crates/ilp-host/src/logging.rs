@@ -37,6 +37,17 @@ pub fn init(config: &Config) -> Result<LogGuard> {
         .with(stderr_layer)
         .init();
 
+    // 限期保留：日志里必然有书名和章节标题，长期堆在一个没人看的目录里
+    // 只会变成泄漏面。清理在日志系统起来之后做，删掉的数目才有地方记。
+    let removed = crate::diagnostics::prune_logs(config);
+    if removed > 0 {
+        tracing::debug!(
+            removed,
+            days = crate::diagnostics::LOG_RETENTION_DAYS,
+            "清理过期日志"
+        );
+    }
+
     Ok(LogGuard { _file: guard })
 }
 

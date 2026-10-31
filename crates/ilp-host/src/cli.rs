@@ -35,6 +35,18 @@ pub enum Command {
         #[command(subcommand)]
         sub: PluginCommand,
     },
+    /// 检查运行环境，并可选地打出诊断包
+    Doctor {
+        /// 生成诊断包到指定路径（不指定则只检查不打包）
+        #[arg(long, value_name = "PATH")]
+        bundle: Option<std::path::PathBuf>,
+        /// 诊断包里附带 manifest 摘要（含书名与章节标题，默认不含）
+        #[arg(long)]
+        with_manifest: bool,
+        /// 跳过打包前的确认，直接生成
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// 显示版本与已加载插件信息
     Version,
 }

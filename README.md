@@ -61,6 +61,8 @@ ilp get chapter|cover|author|title|all <id> -s <site_id> [-f]
 ilp search <keyword> -s <site_id>
 ilp plugin list|uninstall|enable|disable <name>
 ilp plugin install <name>[@<version>]   # 省略版本即 latest
+ilp plugin new <name> [--site-name ..] [--domain ..]   # 生成插件骨架
+ilp doctor [--bundle <path>] [--with-manifest] [-y]
 ilp version
 ```
 
@@ -84,6 +86,32 @@ data/
 
 章节状态记在 SQLite 里，续传同时校验「DB 里是 ok」+「文件存在」+「文件大小与记录一致」。
 正文用临时文件 + rename 原子写，先落盘再记 DB，崩溃不会留下"标记完成但内容是半截"的章节。
+
+## 诊断
+
+`ilp doctor` 做一遍自检：插件在不在、签名策略是否自洽、代理与 `no_proxy`
+是否搭配、日志目录能不能写。发现问题时给出可执行的下一步，不只是报错。
+
+`ilp doctor --bundle diag.tar.gz` 打一个诊断包。**打包前会先把清单打出来**，
+告诉你每一项是什么、多大、含哪些内容，确认后才写文件（`-y` 跳过确认；
+非交互环境下不加 `-y` 会直接拒绝，避免在 CI 里静默产出一个包含日志的文件）。
+
+默认只含环境信息、配置摘要（密钥类只报数量）、插件清单、脱敏后的日志。
+**不含** secret 文件、章节正文、绝对路径与用户名。manifest 摘要（含书名与
+章节标题）需要显式 `--with-manifest`。
+
+日志里命中 `cookie` / `authorization` / `*_token` / `password` 等标记的行，
+值会被替换成 `<redacted>`，但时间戳、级别、字段名保留——否则日志就没法看了。
+按子串匹配而不是固定名单，因为真实流量里总会有名单外的头。
+
+日志默认保留 7 天，过期自动清理：日志里必然有书名和章节标题，长期堆在
+一个没人看的目录里只会变成泄漏面。
+
+每次运行结束会在日志里留一行结构化摘要（target `ilp::summary`）：
+
+```text
+INFO ilp::summary: 运行摘要 site=fanqie book=7290175791344651298 ok=216 failed=0 total=216
+```
 
 ## 仓库结构
 

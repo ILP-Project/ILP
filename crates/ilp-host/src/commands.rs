@@ -142,6 +142,18 @@ fn fetch_all(
 
     if todo.is_empty() {
         println!("所有章节已下载");
+        // 幂等分支也要留摘要：用户说"跑了但没反应"时，要先能确认
+        // 它到底跑没跑过、跑的是哪本书。
+        tracing::info!(
+            target: "ilp::summary",
+            site = %site_id,
+            book = %book_id,
+            ok = 0,
+            failed = 0,
+            total = 0,
+            skipped = "all",
+            "运行摘要（无待下载章节）"
+        );
         return Ok(());
     }
 
@@ -246,6 +258,18 @@ fn fetch_all(
     }
 
     println!("完成: 成功 {done} 章，失败 {failed} 章");
+    // 运行摘要：一行、结构化、可 grep。用户抱怨"昨天还能下"时，这行是
+    // 唯一能快速定位"哪个站点、哪本书、哪次运行、成败各多少"的线索。
+    // 单独一条 target 便于从混杂的日志里筛出来。
+    tracing::info!(
+        target: "ilp::summary",
+        site = %site_id,
+        book = %book_id,
+        ok = done,
+        failed,
+        total = done + failed,
+        "运行摘要"
+    );
     if failed > 0 {
         // 顺带把历史失败也列出来：之前跑到一半失败的章，这次可能根本没进入待办。
         match storage.failed_chapter_ids(site_id, book_id) {
@@ -584,6 +608,175 @@ fn find_plugin<'a>(
 }
 
 /// `ilp version`：打印宿主版本，并尽力列出每个已加载插件的元数据。
+/// `ilp doctor`：先自检，再（可选）打诊断包。
+///
+/// 自检项只报"能不能干活"，不报配置偏好：用户问"为什么下载不了"时，
+/// 需要立刻看到的是插件在不在、权限配没配、网络通不通、签名策略拦没拦，
+/// 而不是 max_workers 是 1 还是 8。
+pub fn do_doctor(
+    config: &Config,
+    bundle: Option<std::path::PathBuf>,
+    with_manifest: bool,
+    assume_yes: bool,
+) -> Result<()> {
+    println!("ilp {} 自检", env!("CARGO_PKG_VERSION"));
+    println!();
+
+    let mut problems = 0;
+    problems += report(config);
+
+    let Some(path) = bundle else {
+        println!();
+        if problems == 0 {
+            println!("没有发现问题。用 `ilp doctor --bundle diag.tar.gz` 生成诊断包。");
+        } else {
+            println!("发现 {problems} 个问题。仍可用 `ilp doctor --bundle` 打包反馈。");
+        }
+        return Ok(());
+    };
+
+    println!();
+    let entries = crate::diagnostics::collect(config, with_manifest)?;
+    println!("诊断包将包含 {} 项：", entries.len());
+    for entry in &entries {
+        println!(
+            "  {:<28} {:>9} 字节  {}",
+            entry.name,
+            entry.body.len(),
+            entry.note
+        );
+    }
+    println!();
+    // 打包前必须让人看清内容。默认最小集，额外内容要靠参数显式开。
+    println!("包内不含：secret 文件、章节正文、配置里的密钥值、用户名与绝对路径。");
+    if !with_manifest {
+        println!("manifest 摘要未包含（含书名与章节标题）；需要时加 --with-manifest。");
+    }
+
+    if !assume_yes && !confirm(&path)? {
+        println!("已取消，没有生成诊断包。");
+        return Ok(());
+    }
+
+    crate::diagnostics::write_bundle(&path, &entries)?;
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    println!("已生成诊断包: {}（{size} 字节）", path.display());
+    println!("反馈问题前请先看一眼包内容：tar -tzf {}", path.display());
+    Ok(())
+}
+
+/// 逐项自检，返回问题数。
+fn report(config: &Config) -> usize {
+    let mut problems = 0;
+
+    // 数据目录：不存在不是错，第一次运行就还没建。
+    let data = std::path::Path::new(&config.data_folder);
+    check(
+        data.exists(),
+        &format!("数据目录 {}", data.display()),
+        "还没有创建，首次下载时会自动建立",
+    );
+
+    match crate::engine::load_plugins(config) {
+        Ok(plugins) if plugins.is_empty() => {
+            println!("插件: 没有已安装的插件");
+            println!("  用 `ilp plugin install fanqie` 装一个");
+            problems += 1;
+        }
+        Ok(plugins) => {
+            println!("插件: {} 个已加载", plugins.len());
+            for p in &plugins {
+                let m = &p.metadata;
+                println!(
+                    "  {} v{} ({}) ABI {}",
+                    m.plugin_name, m.version, m.site_id, m.abi_version
+                );
+                if m.abi_version != crate::plugin_manager::CURRENT_ABI {
+                    println!(
+                        "    警告: ABI {} 已弃用，当前为 {}",
+                        m.abi_version,
+                        crate::plugin_manager::CURRENT_ABI
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            println!("插件: 加载失败");
+            println!("  {e:#}");
+            problems += 1;
+        }
+    }
+
+    // 签名策略：强制校验却一个可信密钥都没有，等于什么都装不上。
+    if config.require_plugin_signatures && config.plugin_trusted_keys.is_empty() {
+        println!("签名: require_plugin_signatures=true 但没有可信密钥");
+        println!("  这样任何插件都装不上；在 config.json 里配置 plugin_trusted_keys");
+        problems += 1;
+    } else if config.require_plugin_signatures {
+        println!(
+            "签名: 强制校验，可信密钥 {} 个",
+            config.plugin_trusted_keys.len()
+        );
+    } else {
+        println!("签名: 未强制校验（require_plugin_signatures=false）");
+    }
+
+    // 代理与 no_proxy 的搭配是常见坑：设了代理又没排除敏感域名，
+    // DNS 固定会失效（解析发生在代理侧）。
+    if config.proxy.is_some() {
+        println!("网络: 已配置代理");
+        if config.no_proxy.is_empty() {
+            println!("  提示: no_proxy 为空；走代理时 DNS 固定不生效，");
+            println!("  敏感站点建议写进 no_proxy");
+        }
+    } else {
+        println!("网络: 直连");
+    }
+
+    // 日志目录写不进去，后面的诊断就没有素材。
+    let logs = config.logs_dir();
+    match std::fs::create_dir_all(&logs) {
+        Ok(()) => println!("日志: {}", logs.display()),
+        Err(e) => {
+            println!("日志: 目录不可写 {}", logs.display());
+            println!("  {e}");
+            problems += 1;
+        }
+    }
+
+    problems
+}
+
+/// 打印一项检查结果。`false` 时给出可执行的下一步，而不只是"失败"。
+fn check(ok: bool, what: &str, hint_when_missing: &str) {
+    if ok {
+        println!("✔ {what}");
+    } else {
+        println!("· {what}: {hint_when_missing}");
+    }
+}
+
+/// 打包前确认。非交互环境（stdin 不是终端）默认拒绝——
+/// 在 CI 里默默生成一个含日志的文件，比失败更糟。
+fn confirm(path: &std::path::Path) -> Result<bool> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "非交互环境下不自动打包。确认清单后用 --yes 重新执行：\n  ilp doctor --bundle {} --yes",
+            path.display()
+        );
+    }
+    print!("\n确认生成到 {}？[y/N] ", path.display());
+    use std::io::Write;
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    Ok(matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
 ///
 /// 单个插件加载失败不影响其余插件的展示——原版一个坏插件会拖垮整个启动。
 pub fn do_version(config: &Config) -> Result<()> {
