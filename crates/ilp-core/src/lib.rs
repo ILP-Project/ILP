@@ -170,6 +170,37 @@ impl IlpCore {
         Ok(task_id)
     }
 
+    pub fn task_event(&self, task_id: Uuid) -> Result<CoreEvent, CoreError> {
+        let id = task_id.to_string();
+        let state = self
+            .storage
+            .lock()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?
+            .task_state(&id)
+            .map_err(|error| CoreError::Storage(error.to_string()))?
+            .ok_or(CoreError::NotFound(id))?;
+        let state =
+            parse_task_state(&state).ok_or_else(|| CoreError::Storage("未知任务状态".into()))?;
+        Ok(CoreEvent::TaskStateChanged {
+            sequence: self.next_event_sequence(),
+            task_id,
+            state,
+        })
+    }
+
+    pub fn recovery_snapshot(&self) -> Result<Vec<(Uuid, TaskState)>, CoreError> {
+        let states = self
+            .storage
+            .lock()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?
+            .task_states()
+            .map_err(|error| CoreError::Storage(error.to_string()))?;
+        Ok(states
+            .into_iter()
+            .filter_map(|(id, state)| Some((Uuid::parse_str(&id).ok()?, parse_task_state(&state)?)))
+            .collect())
+    }
+
     pub fn update_task_state(&self, task_id: Uuid, next: TaskState) -> Result<(), CoreError> {
         let storage = self
             .storage
