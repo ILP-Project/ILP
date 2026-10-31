@@ -27,14 +27,14 @@ Rust 2021 小说下载器，站点能力通过 Wasmtime WebAssembly 插件提供
 ilp get chapter|cover|author|title|all <id> -s <site_id> [-f]
 ilp update <id> -s <site_id> [--apply]
 ilp search <keyword> -s <site_id>
-ilp plugin list|info|install|uninstall|enable|disable ...
+ilp plugin list|info|install|update|uninstall|enable|disable ...
 ilp plugin new <name> [--site-name ..] [--domain ..]
 ilp doctor [--bundle <path>] [--with-manifest] [-y]
 ilp --jsonl <command>
 ilp --verbose <command>
 ```
 
-`update` 默认 dry-run。`--jsonl` 只输出结构化事件，字段约定见 `docs/jsonl-events.md`；`--verbose` 提高日志级别。TTY 显示即时进度，非 TTY 不阻塞交互。
+`update` 默认 dry-run；`plugin update <name>` 同样默认只报告版本差异，`--apply` 才替换插件。`--jsonl` 只输出结构化事件，字段约定见 `docs/jsonl-events.md`；`--verbose` 提高日志级别。TTY 显示即时进度，非 TTY 不阻塞交互。
 
 ## 代码结构
 

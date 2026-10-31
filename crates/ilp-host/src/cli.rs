@@ -94,6 +94,14 @@ pub enum PluginCommand {
     Info { name: String },
     /// 安装插件（name 或 name@version，省略版本即 latest）
     Install { source: String },
+    /// 检查插件更新；默认只生成报告
+    Update {
+        /// 插件名
+        name: String,
+        /// 应用更新并替换本地插件
+        #[arg(long)]
+        apply: bool,
+    },
     /// 卸载插件
     Uninstall { name: String },
     /// 启用插件

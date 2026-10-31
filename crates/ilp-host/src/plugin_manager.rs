@@ -175,6 +175,7 @@ pub fn run(config: &Config, cmd: PluginCommand) -> Result<()> {
         PluginCommand::List => list(config),
         PluginCommand::Info { name } => info(config, &name),
         PluginCommand::Install { source } => install(config, &source),
+        PluginCommand::Update { name, apply } => update(config, &name, apply),
         PluginCommand::Uninstall { name } => uninstall(config, &name),
         PluginCommand::Enable { name } => enable(config, &name),
         PluginCommand::Disable { name } => disable(config, &name),
@@ -581,6 +582,42 @@ fn verify_artifact(bytes: &[u8], p: &RegistryPlugin) -> Result<()> {
         }
     }
     validate_wasm(bytes)
+}
+
+fn update(config: &Config, name: &str, apply: bool) -> Result<()> {
+    let name = safe_plugin_name(name)?;
+    let installed = config.plugins_dir().join(format!("{name}.wasm"));
+    if !installed.is_file() {
+        return Err(anyhow!(
+            "插件 {name} 尚未安装，请先运行 ilp plugin install {name}"
+        ));
+    }
+    let base = registry_base();
+    let raw = crate::http::get_bytes(&format!("{base}/registry.json"))
+        .context("获取插件 registry 失败（可用 ILP_REGISTRY_URL 指定镜像）")?;
+    verify_registry_signature(config, &base, &raw)?;
+    let reg: Registry = serde_json::from_slice(&raw).context("解析 registry.json 失败")?;
+    let plugin = reg.find(name)?;
+    let current = crate::engine::PluginInstance::load(
+        &installed,
+        &Path::new(&config.data_folder).join("plugins"),
+    )
+    .with_context(|| format!("读取已安装插件 {name} 失败"))?;
+    let latest = &plugin.latest;
+    println!(
+        "插件 {name}: 当前 {}，registry latest {}",
+        current.metadata.version, latest
+    );
+    if current.metadata.version == *latest {
+        println!("插件 {name} 已是最新版本");
+        return Ok(());
+    }
+    println!("可用更新: {name} {} -> {latest}", current.metadata.version);
+    if !apply {
+        println!("预览模式：使用 `ilp plugin update {name} --apply` 应用更新");
+        return Ok(());
+    }
+    install(config, &format!("{name}@{latest}"))
 }
 
 fn install(config: &Config, source: &str) -> Result<()> {

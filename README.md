@@ -19,7 +19,7 @@ ILP_PUBKEY='release-2026:<base64-public-key>' sh install.sh
 ilp get chapter|cover|author|title|all <id> -s <site_id> [-f]
 ilp update <id> -s <site_id> [--apply]
 ilp search <keyword> -s <site_id>
-ilp plugin list|info|install|uninstall|enable|disable ...
+ilp plugin list|info|install|update|uninstall|enable|disable ...
 ilp plugin new <name> [--site-name ..] [--domain ..]
 ilp doctor [--bundle <path>] [--with-manifest] [-y]
 ilp --jsonl get all <id> -s <site_id>
@@ -28,6 +28,7 @@ ilp version
 ```
 
 - `update` 默认只生成新增章节报告；`--apply` 才保存新目录并下载。
+- `plugin update <name>` 默认只报告插件版本差异；`--apply` 才下载并替换插件。
 - `--jsonl` 输出 `update_report`、`chapter_added`、`chapter_downloaded` 等事件，不混入普通进度文本；字段约定见 [`docs/jsonl-events.md`](docs/jsonl-events.md)。
 - `--verbose` 提高日志级别；TTY 显示即时进度，管道和重定向保持稳定输出。
 - `search` 在 TTY 中使用 `n`/回车下一页、`p` 上一页、`q` 退出；非 TTY 自动输出全部结果。
