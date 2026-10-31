@@ -407,7 +407,13 @@ fn info(config: &Config, name: &str) -> Result<()> {
     // 权限与域名只能从 WASM 自己的 metadata 读：registry 里那份是展示用的，
     // 不能当作事实。用户要看“这个插件到底能干什么”，必须看真实声明。
     let storage_root = Path::new(&config.data_folder).join("plugins");
-    match crate::engine::PluginInstance::load(&path, &storage_root) {
+    // `info` 只读取 metadata，不接受 registry 或用户授权；显式 deny-all
+    // 防止旧的 metadata-only 加载语义被误认为运行时授权。
+    match crate::engine::PluginInstance::load_with_policy(
+        &path,
+        &storage_root,
+        crate::engine::CapabilityPolicy::deny_all(),
+    ) {
         Ok(plugin) => print_metadata(&plugin.metadata),
         // 加载失败不该让 info 整个失败：元数据与完整性信息本身是有用的。
         Err(e) => println!("\n无法读取插件内声明的元数据: {e:#}"),
@@ -602,9 +608,11 @@ fn update(config: &Config, name: &str, apply: bool) -> Result<()> {
     verify_registry_signature(config, &base, &raw)?;
     let reg: Registry = serde_json::from_slice(&raw).context("解析 registry.json 失败")?;
     let plugin = reg.find(name)?;
-    let current = crate::engine::PluginInstance::load(
+    // 更新预览只需读取 metadata；没有可信授权时显式 deny-all。
+    let current = crate::engine::PluginInstance::load_with_policy(
         &installed,
         &Path::new(&config.data_folder).join("plugins"),
+        crate::engine::CapabilityPolicy::deny_all(),
     )
     .with_context(|| format!("读取已安装插件 {name} 失败"))?;
     let latest = &plugin.latest;
@@ -725,6 +733,9 @@ fn install(config: &Config, source: &str) -> Result<()> {
 }
 
 /// 核对 registry 声明的权限与 WASM 自己的声明。
+///
+/// registry 的权限与域名仅在这个安装前检查阶段作为临时 host ceiling；
+/// 安装完成后的 CLI 加载路径没有可信授权，仍然显式 deny-all。
 ///
 /// 宿主的安全策略取的是 **WASM metadata**，registry 那份只用于展示与审核。
 /// 两份不一致时，用户看到的权限就不是他实际拿到的权限。

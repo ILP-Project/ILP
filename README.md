@@ -72,6 +72,8 @@ ilp plugin new my-site --site-name '示例站' --domain example.com
 
 插件通过 `plan-fetch` 生成请求，宿主执行请求，再由 `consume-fetch` 解析响应。插件不能直接访问网络、文件或数据库。
 
+`PluginInstance::load` 仅用于无授权的 metadata 加载，默认 deny-all，不会根据插件 metadata 自动发放能力；CLI 的插件发现、`plugin info` 和更新预览因此也保持 deny-all。只有可信调用方应使用 `load_with_policy` 显式传入 host ceiling，安装前校验则临时使用 registry 声明的 ceiling。
+
 正文结果保留 `ok`、`locked`、`captcha`、`auth-required`、`not-found`、`invalid`、`error` 状态；只有成功且有正文的结果才会写入文件。导出通过 `Exporter` trait，目前使用 `TxtExporter`。
 
 章节目录支持 `order_key`。重复章节 ID 或非空重复 `order_key` 会在保存前拒绝；ABI 0.1 没有该字段时使用原目录顺序。

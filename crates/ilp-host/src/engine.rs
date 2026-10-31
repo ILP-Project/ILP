@@ -222,13 +222,16 @@ fn runtime_policy(policy: &CapabilityPolicy) -> RuntimeCapabilityPolicy {
 }
 
 fn effective_policy(host: &CapabilityPolicy, metadata: &PluginMetadata) -> CapabilityPolicy {
-    let permissions = metadata
+    let mut permissions: std::collections::HashSet<String> = metadata
         .permissions
         .iter()
         .filter(|permission| host.permissions.contains(*permission))
         .cloned()
         .collect();
-    let allowed_domains = if metadata.allowed_domains.is_empty() {
+    let allowed_domains = if !permissions.contains("http") {
+        // 没有 HTTP ceiling 时，metadata 的域名声明不能凭空发放网络能力。
+        Vec::new()
+    } else if metadata.allowed_domains.is_empty() {
         host.allowed_domains.clone()
     } else {
         metadata
@@ -244,6 +247,14 @@ fn effective_policy(host: &CapabilityPolicy, metadata: &PluginMetadata) -> Capab
             .cloned()
             .collect()
     };
+    // 空域名列表代表“无限制”，不能把“声明域名与 host ceiling 没有交集”
+    // 误当成无限制；这种情况下直接撤销 HTTP 权限。
+    if permissions.contains("http")
+        && !metadata.allowed_domains.is_empty()
+        && allowed_domains.is_empty()
+    {
+        permissions.remove("http");
+    }
     CapabilityPolicy {
         permissions,
         allowed_domains,
@@ -474,6 +485,10 @@ impl HostState {
         &mut self,
         request: ilp::plugin::types::HttpRequest,
     ) -> Result<ilp::plugin::types::HttpResponse, String> {
+        self.policy
+            .allows("http")
+            .then_some(())
+            .ok_or_else(|| "permission-denied: http".to_string())?;
         validate_http_request(&request)?;
         self.policy.allows_url(&request.url)?;
         let runtime_request = ilp_runtime::HttpRequest {
@@ -543,6 +558,10 @@ impl HostTrait for HostState {
         &mut self,
         request: ilp::plugin::types::HttpRequest,
     ) -> Result<ilp::plugin::types::HttpResponse, String> {
+        self.policy
+            .allows("http")
+            .then_some(())
+            .ok_or_else(|| "permission-denied: http".to_string())?;
         validate_http_request(&request)?;
         self.policy.allows_url(&request.url)?;
         let response = self.runtime_http_fetch(request)?;
@@ -622,6 +641,10 @@ impl legacy::ilp::plugin::host::Host for HostState {
         &mut self,
         request: legacy::ilp::plugin::host::HttpRequest,
     ) -> Result<legacy::ilp::plugin::host::HttpResponse, String> {
+        self.policy
+            .allows("http")
+            .then_some(())
+            .ok_or_else(|| "permission-denied: http".to_string())?;
         crate::http::validate_plugin_url(&request.url).map_err(|e| format!("{e:#}"))?;
         validate_legacy_http_request(&request)?;
         self.policy.allows_url(&request.url)?;
@@ -1041,6 +1064,8 @@ enum PluginBackend {
 }
 
 impl PluginInstance {
+    /// 兼容旧调用方的无授权加载入口；运行时能力保持 deny-all。
+    #[allow(dead_code)]
     pub fn load(path: &Path, storage_root: &Path) -> Result<Self> {
         Self::load_with_policy(path, storage_root, CapabilityPolicy::deny_all())
     }
@@ -1159,6 +1184,15 @@ impl PluginInstance {
                 Self::finish(metadata, PluginBackend::Legacy { store, bindings })
             }
             other => Err(anyhow!("插件 ABI 版本 {other} 不受支持")),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn policy_for_test(&self) -> &CapabilityPolicy {
+        match &self.backend {
+            PluginBackend::Current { store, .. } | PluginBackend::Legacy { store, .. } => {
+                &store.data().policy
+            }
         }
     }
 
@@ -1489,7 +1523,9 @@ pub fn load_plugins(config: &crate::config::Config) -> Result<Vec<PluginInstance
     // 只报 plugin_name 时两个同名插件看上去一模一样。
     let mut origins: Vec<(PathBuf, String)> = Vec::new();
     for path in paths {
-        match PluginInstance::load(&path, &storage_root) {
+        // CLI 加载没有来自用户配置或 registry 的可信授权，显式保持 deny-all。
+        // `load` 也保持这一兼容安全语义；需要能力的调用方必须传入 ceiling。
+        match PluginInstance::load_with_policy(&path, &storage_root, CapabilityPolicy::deny_all()) {
             Ok(p) => {
                 origins.push((path.clone(), p.site_id().to_string()));
                 out.push(p);

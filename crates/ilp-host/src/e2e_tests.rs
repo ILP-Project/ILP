@@ -7,7 +7,30 @@
 //! 如果 wasm 产物不存在（没跑过 wasm 构建），测试会打一行提示并跳过，
 //! 而不是失败——否则 `cargo test` 在只关心宿主的场景下会莫名其妙变红。
 
+use std::collections::HashSet;
 use std::path::PathBuf;
+
+fn deny_all_policy() -> crate::engine::CapabilityPolicy {
+    crate::engine::CapabilityPolicy::deny_all()
+}
+
+fn fixture_v2_policy() -> crate::engine::CapabilityPolicy {
+    crate::engine::CapabilityPolicy {
+        permissions: ["http".to_string(), "clock".to_string()]
+            .into_iter()
+            .collect::<HashSet<_>>(),
+        allowed_domains: vec!["fixture.example.com".to_string()],
+    }
+}
+
+fn mismatched_v2_policy() -> crate::engine::CapabilityPolicy {
+    crate::engine::CapabilityPolicy {
+        permissions: ["http".to_string(), "clock".to_string()]
+            .into_iter()
+            .collect::<HashSet<_>>(),
+        allowed_domains: vec!["other.example.com".to_string()],
+    }
+}
 
 fn wasm_path() -> PathBuf {
     if let Some(path) = std::env::var_os("ILP_E2E_PLUGIN") {
@@ -68,9 +91,60 @@ fn component_v1_fixture_loads_and_reports_metadata() {
         return;
     };
     let storage = tmp_storage("fixture_v1");
-    let plugin = crate::engine::PluginInstance::load(&path, &storage).expect("v1 fixture 应能加载");
+    let plugin =
+        crate::engine::PluginInstance::load_with_policy(&path, &storage, deny_all_policy())
+            .expect("v1 fixture 应能加载");
     assert_eq!(plugin.metadata.abi_version, "0.1.0");
     assert_eq!(plugin.metadata.site_id, "fixture-v1");
+    let _ = std::fs::remove_dir_all(storage);
+}
+
+#[test]
+fn component_v2_load_matrix_keeps_load_deny_all_and_honors_explicit_ceiling() {
+    let Some(path) = fixture_wasm("ILP_V2_FIXTURE", "v2") else {
+        return;
+    };
+    let denied_storage = tmp_storage("fixture_v2_denied");
+    let denied = crate::engine::PluginInstance::load(&path, &denied_storage)
+        .expect("旧 load 调用仍应能读取 metadata");
+    assert_eq!(denied.metadata.abi_version, "0.2.0");
+    assert!(denied.policy_for_test().permissions.is_empty());
+    assert!(denied.policy_for_test().allowed_domains.is_empty());
+
+    let granted_storage = tmp_storage("fixture_v2_granted");
+    let granted = crate::engine::PluginInstance::load_with_policy(
+        &path,
+        &granted_storage,
+        fixture_v2_policy(),
+    )
+    .expect("显式 host ceiling 应能加载 fixture");
+    assert_eq!(
+        granted.policy_for_test().permissions,
+        ["http".to_string(), "clock".to_string()]
+            .into_iter()
+            .collect::<HashSet<_>>()
+    );
+    assert_eq!(
+        granted.policy_for_test().allowed_domains,
+        ["fixture.example.com".to_string()]
+    );
+
+    let _ = std::fs::remove_dir_all(denied_storage);
+    let _ = std::fs::remove_dir_all(granted_storage);
+}
+
+#[test]
+fn component_v2_policy_matrix_rejects_domain_escalation() {
+    let Some(path) = fixture_wasm("ILP_V2_FIXTURE", "v2") else {
+        return;
+    };
+    let storage = tmp_storage("fixture_v2_mismatch");
+    let plugin =
+        crate::engine::PluginInstance::load_with_policy(&path, &storage, mismatched_v2_policy())
+            .expect("host ceiling 不应阻止 metadata 加载");
+    assert!(!plugin.policy_for_test().permissions.contains("http"));
+    assert!(plugin.policy_for_test().allowed_domains.is_empty());
+    assert!(plugin.policy_for_test().permissions.contains("clock"));
     let _ = std::fs::remove_dir_all(storage);
 }
 
@@ -80,7 +154,9 @@ fn component_v2_fixture_loads_and_reports_declared_permissions() {
         return;
     };
     let storage = tmp_storage("fixture_v2");
-    let plugin = crate::engine::PluginInstance::load(&path, &storage).expect("v2 fixture 应能加载");
+    let plugin =
+        crate::engine::PluginInstance::load_with_policy(&path, &storage, fixture_v2_policy())
+            .expect("v2 fixture 应能加载");
     assert_eq!(plugin.metadata.abi_version, "0.2.0");
     assert_eq!(plugin.metadata.site_id, "fixture-v2");
     assert_eq!(plugin.metadata.permissions, ["http", "clock"]);
@@ -107,7 +183,9 @@ fn component_loads_and_reports_metadata() {
         return;
     };
     let storage = tmp_storage("meta");
-    let plugin = crate::engine::PluginInstance::load(&path, &storage).expect("应能加载组件");
+    let plugin =
+        crate::engine::PluginInstance::load_with_policy(&path, &storage, deny_all_policy())
+            .expect("应能加载组件");
 
     let m = &plugin.metadata;
     assert_eq!(m.site_id, "fanqie");
@@ -129,8 +207,10 @@ fn two_instances_do_not_share_state() {
     };
     let sa = tmp_storage("inst_a");
     let sb = tmp_storage("inst_b");
-    let a = crate::engine::PluginInstance::load(&path, &sa).expect("加载 a");
-    let b = crate::engine::PluginInstance::load(&path, &sb).expect("加载 b");
+    let a = crate::engine::PluginInstance::load_with_policy(&path, &sa, deny_all_policy())
+        .expect("加载 a");
+    let b = crate::engine::PluginInstance::load_with_policy(&path, &sb, deny_all_policy())
+        .expect("加载 b");
     // site_id 来自元数据，天然相同；关键是它们能同时存在且互不干扰。
     assert_eq!(a.site_id(), b.site_id());
     assert_eq!(a.metadata.plugin_id, b.metadata.plugin_id);
@@ -145,14 +225,18 @@ fn methods_fail_cleanly_without_init() {
         return;
     };
     let storage = tmp_storage("noinit");
-    let mut plugin = crate::engine::PluginInstance::load(&path, &storage).expect("应能加载组件");
+    let mut plugin =
+        crate::engine::PluginInstance::load_with_policy(&path, &storage, deny_all_policy())
+            .expect("应能加载组件");
 
     // title 依赖目录/页面，未 init 时应明确失败。
     let r = plugin.title();
     assert!(r.is_err(), "未 init 就取标题应失败，实得 {r:?}");
 
     let storage2 = tmp_storage("noinit2");
-    let mut plugin2 = crate::engine::PluginInstance::load(&path, &storage2).expect("应能加载组件");
+    let mut plugin2 =
+        crate::engine::PluginInstance::load_with_policy(&path, &storage2, deny_all_policy())
+            .expect("应能加载组件");
     let r2 = plugin2.catalog(false);
     assert!(r2.is_err(), "未 init 就取目录应失败，实得 {:?}", r2.err());
 
@@ -168,7 +252,9 @@ fn plan_fetch_rejects_empty_list_without_network() {
         return;
     };
     let storage = tmp_storage("empty");
-    let mut plugin = crate::engine::PluginInstance::load(&path, &storage).expect("应能加载组件");
+    let mut plugin =
+        crate::engine::PluginInstance::load_with_policy(&path, &storage, deny_all_policy())
+            .expect("应能加载组件");
 
     let tasks = plugin.plan_fetch(&[]).expect("空列表应返回空计划");
     assert!(tasks.is_empty(), "空输入不该产出任务");
@@ -184,7 +270,9 @@ fn plan_fetch_without_catalog_fails_instead_of_hitting_network() {
         return;
     };
     let storage = tmp_storage("nocat");
-    let mut plugin = crate::engine::PluginInstance::load(&path, &storage).expect("应能加载组件");
+    let mut plugin =
+        crate::engine::PluginInstance::load_with_policy(&path, &storage, deny_all_policy())
+            .expect("应能加载组件");
 
     let err = plugin
         .plan_fetch(&["123".to_string()])
@@ -206,7 +294,9 @@ fn consume_fetch_reports_non_200() {
         return;
     };
     let storage = tmp_storage("consume");
-    let mut plugin = crate::engine::PluginInstance::load(&path, &storage).expect("应能加载组件");
+    let mut plugin =
+        crate::engine::PluginInstance::load_with_policy(&path, &storage, deny_all_policy())
+            .expect("应能加载组件");
 
     let resp = crate::engine::wit_types::HttpResponse {
         status: 500,
@@ -236,7 +326,8 @@ fn plugin_writes_device_state_to_host_storage() {
     let seeded = br#"{"device_id":1,"install_id":2}"#;
     std::fs::write(storage.join("fanqie_device"), seeded).expect("预置设备状态");
 
-    let p1 = crate::engine::PluginInstance::load(&path, &storage).expect("首次加载");
+    let p1 = crate::engine::PluginInstance::load_with_policy(&path, &storage, deny_all_policy())
+        .expect("首次加载");
     drop(p1);
     // 插件在 load 期不应当动这份状态。
     assert_eq!(
@@ -245,7 +336,8 @@ fn plugin_writes_device_state_to_host_storage() {
         "加载插件不该改写已有设备状态"
     );
 
-    let p2 = crate::engine::PluginInstance::load(&path, &storage).expect("二次加载");
+    let p2 = crate::engine::PluginInstance::load_with_policy(&path, &storage, deny_all_policy())
+        .expect("二次加载");
     drop(p2);
 
     let _ = std::fs::remove_dir_all(&storage);
@@ -260,8 +352,10 @@ fn storage_dir_is_created_lazily_and_isolated() {
     let b = tmp_storage("iso_b");
     // 刻意删掉再让插件写入，验证宿主会按需创建而不是要求预建目录。
     std::fs::remove_dir_all(&a).ok();
-    let _pa = crate::engine::PluginInstance::load(&path, &a).expect("加载 a");
-    let _pb = crate::engine::PluginInstance::load(&path, &b).expect("加载 b");
+    let _pa = crate::engine::PluginInstance::load_with_policy(&path, &a, deny_all_policy())
+        .expect("加载 a");
+    let _pb = crate::engine::PluginInstance::load_with_policy(&path, &b, deny_all_policy())
+        .expect("加载 b");
     assert_ne!(a, b);
 
     let _ = std::fs::remove_dir_all(&a);
