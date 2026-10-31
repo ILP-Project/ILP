@@ -461,10 +461,6 @@ fn migrate(db: &Connection) -> Result<()> {
          );
          CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
              book_id UNINDEXED, title, author, chapter_title, body
-         );
-         CREATE TABLE IF NOT EXISTS events (
-             sequence INTEGER PRIMARY KEY NOT NULL, kind TEXT NOT NULL,
-             payload TEXT NOT NULL, created_at INTEGER NOT NULL
          );",
     )?;
     transaction.execute(

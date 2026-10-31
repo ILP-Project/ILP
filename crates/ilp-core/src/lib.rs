@@ -476,7 +476,7 @@ impl LibraryService for IlpCore {
 
 impl DownloadService for IlpCore {
     fn create_task(&self) -> Result<Uuid, CoreError> {
-        Ok(self.new_task_id())
+        self.create_download_task()
     }
 }
 
@@ -546,7 +546,7 @@ mod tests {
     fn task_operations_persist_matching_json_events() {
         let data = std::env::temp_dir().join(format!("ilp-core-test-{}", Uuid::new_v4()));
         let core = CoreBuilder::new(CoreConfig::new(&data)).build().unwrap();
-        let task_id = core.create_download_task().unwrap();
+        let task_id = DownloadService::create_task(&core).unwrap();
         core.update_task_state(task_id, TaskState::Running).unwrap();
 
         let events = core.events_after(0, 10).unwrap();
@@ -563,15 +563,39 @@ mod tests {
                 state: TaskState::Running,
             } if id == task_id
         ));
-        let json = serde_json::to_value(&events[1]).unwrap();
         assert_eq!(
-            json,
+            serde_json::to_value(&events[0]).unwrap(),
+            serde_json::json!({
+                "type": "task_created",
+                "sequence": 1,
+                "task_id": task_id,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&events[1]).unwrap(),
             serde_json::json!({
                 "type": "task_state_changed",
                 "sequence": 2,
                 "task_id": task_id,
                 "state": "running",
             })
+        );
+        assert_eq!(
+            serde_json::to_value(CoreEvent::ResyncRequired { sequence: 2 }).unwrap(),
+            serde_json::json!({
+                "type": "resync_required",
+                "sequence": 2,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreEvent>(serde_json::json!({
+                "type": "task_state_changed",
+                "sequence": 2,
+                "task_id": task_id,
+                "state": "running",
+            }))
+            .unwrap(),
+            events[1]
         );
         drop(core);
         let _ = std::fs::remove_dir_all(data);
