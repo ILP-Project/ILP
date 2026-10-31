@@ -73,10 +73,10 @@ pub struct StoredPlugin {
     pub trusted_at: Option<String>,
 }
 
-pub trait LibraryStorage: Send + Sync {
+pub trait LibraryStorage: Send {
     fn schema_version(&self) -> Result<SchemaVersion>;
-    fn save_book(&self, book: &StoredBook) -> Result<()>;
-    fn load_book(&self, id: &str) -> Result<Option<StoredBook>>;
+    fn save_book(&mut self, book: &StoredBook) -> Result<()>;
+    fn load_book(&mut self, id: &str) -> Result<Option<StoredBook>>;
 }
 
 /// SQLite-backed storage used by Core. Files are written atomically and their
@@ -209,6 +209,65 @@ fn sanitize_component(value: &str) -> String {
         "untitled".into()
     } else {
         trimmed.into()
+    }
+}
+
+impl LibraryStorage for SqliteStorage {
+    fn schema_version(&self) -> Result<SchemaVersion> {
+        SqliteStorage::schema_version(self)
+    }
+
+    fn save_book(&mut self, book: &StoredBook) -> Result<()> {
+        let chapters = serde_json::to_string(&book.chapters)?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        self.db.execute(
+            "INSERT INTO books (id, title, author, source_type, source_id, authorized, chapters, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET title=excluded.title, author=excluded.author,
+                 source_type=excluded.source_type, source_id=excluded.source_id,
+                 authorized=excluded.authorized, chapters=excluded.chapters,
+                 updated_at=excluded.updated_at",
+            params![
+                book.id,
+                book.title,
+                book.author,
+                book.source_type,
+                book.source_id,
+                book.authorized,
+                chapters,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn load_book(&mut self, id: &str) -> Result<Option<StoredBook>> {
+        self.db
+            .query_row(
+                "SELECT id, title, author, source_type, source_id, authorized, chapters
+             FROM books WHERE id = ?1",
+                [id],
+                |row| {
+                    let chapters: String = row.get(6)?;
+                    Ok(StoredBook {
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        author: row.get(2)?,
+                        source_type: row.get(3)?,
+                        source_id: row.get(4)?,
+                        authorized: row.get::<_, i64>(5)? != 0,
+                        chapters: serde_json::from_str(&chapters).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                6,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 }
 
