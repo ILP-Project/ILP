@@ -4,7 +4,7 @@
 //! 服务接口提交预定义用例，并订阅结构化事件。
 
 use ilp_runtime::CapabilityPolicy;
-use ilp_storage::StoragePaths;
+use ilp_storage::{LibraryStorage, SqliteStorage, StoragePaths, StoredBook};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -109,8 +109,11 @@ impl CoreBuilder {
             .paths
             .validate()
             .map_err(|e| CoreError::InvalidArgument(e.to_string()))?;
+        let storage = SqliteStorage::open(self.config.paths.clone())
+            .map_err(|error| CoreError::Storage(error.to_string()))?;
         Ok(IlpCore {
             config: self.config,
+            storage: Mutex::new(storage),
             next_sequence: Arc::new(Mutex::new(0)),
         })
     }
@@ -118,6 +121,7 @@ impl CoreBuilder {
 
 pub struct IlpCore {
     config: CoreConfig,
+    storage: Mutex<SqliteStorage>,
     next_sequence: Arc<Mutex<u64>>,
 }
 
@@ -128,6 +132,14 @@ impl IlpCore {
 
     pub fn new_task_id(&self) -> Uuid {
         Uuid::new_v4()
+    }
+
+    pub fn save_book(&self, book: &StoredBook) -> Result<(), CoreError> {
+        self.storage
+            .lock()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?
+            .save_book(book)
+            .map_err(|error| CoreError::Storage(error.to_string()))
     }
 
     pub fn next_event_sequence(&self) -> u64 {
@@ -166,7 +178,11 @@ pub trait PluginService {
 
 impl LibraryService for IlpCore {
     fn list_books(&self) -> Result<Vec<String>, CoreError> {
-        Ok(Vec::new())
+        self.storage
+            .lock()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?
+            .list_book_ids()
+            .map_err(|error| CoreError::Storage(error.to_string()))
     }
 }
 
@@ -181,7 +197,11 @@ impl SearchService for IlpCore {
         if query.trim().is_empty() {
             return Err(CoreError::InvalidArgument("搜索关键词不能为空".into()));
         }
-        Ok(Vec::new())
+        self.storage
+            .lock()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?
+            .search(query)
+            .map_err(|error| CoreError::Storage(error.to_string()))
     }
 }
 
