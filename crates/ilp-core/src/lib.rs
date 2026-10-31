@@ -159,6 +159,25 @@ impl IlpCore {
             task_id,
         }
     }
+
+    pub fn create_download_task(&self) -> Result<Uuid, CoreError> {
+        let task_id = self.new_task_id();
+        self.storage
+            .lock()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?
+            .create_task(&task_id.to_string(), "download", "queued")
+            .map_err(|error| CoreError::Storage(error.to_string()))?;
+        Ok(task_id)
+    }
+
+    pub fn update_task_state(&self, task_id: Uuid, next: TaskState) -> Result<(), CoreError> {
+        let state = format!("{next:?}").to_lowercase();
+        self.storage
+            .lock()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?
+            .set_task_state(&task_id.to_string(), &state)
+            .map_err(|error| CoreError::Storage(error.to_string()))
+    }
 }
 
 pub trait LibraryService {
