@@ -54,6 +54,23 @@ impl CapabilityPolicy {
             Err(anyhow!("插件无权访问域名: {domain}"))
         }
     }
+
+    pub fn check_url(&self, url: &str) -> Result<()> {
+        let (scheme, rest) = url
+            .split_once("://")
+            .ok_or_else(|| anyhow!("网络地址缺少 scheme"))?;
+        if scheme != "https" {
+            return Err(anyhow!("插件网络请求必须使用 HTTPS"));
+        }
+        let host = rest
+            .split('/')
+            .next()
+            .unwrap_or_default()
+            .split(':')
+            .next()
+            .unwrap_or_default();
+        self.check_domain(host)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -172,6 +189,8 @@ mod tests {
         let policy = CapabilityPolicy::deny_all().allow_domain("example.com");
         assert!(policy.check_domain("example.com").is_ok());
         assert!(policy.check_domain("other.example.com").is_err());
+        assert!(policy.check_url("http://example.com").is_err());
+        assert!(policy.check_url("https://example.com/path").is_ok());
     }
 
     #[test]
