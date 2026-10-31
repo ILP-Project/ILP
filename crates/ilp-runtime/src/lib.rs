@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+use wasmtime::component::Component;
 use wasmtime::{Config as WasmtimeConfig, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -141,6 +142,17 @@ pub fn new_store(policy: &CapabilityPolicy) -> Result<Store<RuntimeStore>> {
     Ok(store)
 }
 
+pub fn validate_component(wasm: &[u8]) -> std::result::Result<(), RuntimeError> {
+    if wasm.len() < 8 || &wasm[0..4] != b"\\0asm" {
+        return Err(RuntimeError::InvalidFormat(
+            "插件不是有效的 WASM 文件".into(),
+        ));
+    }
+    Component::from_binary(shared_engine(), wasm)
+        .map(|_| ())
+        .map_err(|error| RuntimeError::InvalidFormat(format!("WASM component 无效: {error}")))
+}
+
 pub fn reset_execution_budget(
     store: &mut Store<RuntimeStore>,
     policy: &CapabilityPolicy,
@@ -264,6 +276,11 @@ mod tests {
         assert!(validate_abi("0.1.0").is_ok());
         assert!(validate_abi(CURRENT_ABI).is_ok());
         assert!(validate_abi("9.9.9").is_err());
+    }
+
+    #[test]
+    fn invalid_component_is_rejected() {
+        assert!(validate_component(b"not wasm").is_err());
     }
 
     #[test]

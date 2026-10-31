@@ -11,3 +11,4 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 wasmtime = "48"
+wasmtime-wasi = { version = "48", default-features = false, features = ["p1"] }

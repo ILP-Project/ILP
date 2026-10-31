@@ -1434,6 +1434,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.20",
  "wasmtime",
+ "wasmtime-wasi",
 ]
 
 [[package]]
