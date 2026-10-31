@@ -275,6 +275,50 @@ impl RuntimeHost {
             .map_err(|e| RuntimeError::ExecutionFailed(e.to_string()))
     }
 
+    pub fn secret_get(&self, key: &str) -> std::result::Result<Option<Vec<u8>>, RuntimeError> {
+        if !self.capabilities.can_use("secret-read") {
+            return Err(RuntimeError::PermissionDenied(
+                "插件未获 secret 读取权限".into(),
+            ));
+        }
+        self.secrets
+            .as_ref()
+            .ok_or_else(|| RuntimeError::ExecutionFailed("secret backend 未配置".into()))?
+            .get(key)
+            .map_err(|e| RuntimeError::ExecutionFailed(e.to_string()))
+    }
+
+    pub fn secret_set(&self, key: &str, value: &[u8]) -> std::result::Result<(), RuntimeError> {
+        if !self.capabilities.can_use("secret-write") {
+            return Err(RuntimeError::PermissionDenied(
+                "插件未获 secret 写入权限".into(),
+            ));
+        }
+        if value.len() as u64 > self.policy.limits.max_response_bytes {
+            return Err(RuntimeError::ResourceLimit(
+                "插件 secret 值超过大小限制".into(),
+            ));
+        }
+        self.secrets
+            .as_ref()
+            .ok_or_else(|| RuntimeError::ExecutionFailed("secret backend 未配置".into()))?
+            .set(key, value)
+            .map_err(|e| RuntimeError::ExecutionFailed(e.to_string()))
+    }
+
+    pub fn secret_delete(&self, key: &str) -> std::result::Result<(), RuntimeError> {
+        if !self.capabilities.can_use("secret-write") {
+            return Err(RuntimeError::PermissionDenied(
+                "插件未获 secret 写入权限".into(),
+            ));
+        }
+        self.secrets
+            .as_ref()
+            .ok_or_else(|| RuntimeError::ExecutionFailed("secret backend 未配置".into()))?
+            .delete(key)
+            .map_err(|e| RuntimeError::ExecutionFailed(e.to_string()))
+    }
+
     pub fn storage_set(&self, key: &str, value: &[u8]) -> std::result::Result<(), RuntimeError> {
         if !self.capabilities.can_use("storage-write") {
             return Err(RuntimeError::PermissionDenied(

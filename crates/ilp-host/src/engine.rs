@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use ilp_runtime::{validate_component, validate_metadata};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use wasmtime::component::{Component, Linker, Resource};
@@ -213,6 +213,14 @@ impl CapabilityPolicy {
     }
 }
 
+fn runtime_policy(policy: &CapabilityPolicy) -> RuntimeCapabilityPolicy {
+    RuntimeCapabilityPolicy {
+        allowed_domains: policy.allowed_domains.iter().cloned().collect(),
+        allow_storage: policy.allows("storage-read") || policy.allows("storage-write"),
+        limits: Default::default(),
+    }
+}
+
 fn domain_matches(host: &str, domain: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     let domain = domain
@@ -260,6 +268,10 @@ use current::ilp::plugin::types::{FetchTask, HttpResponse};
 
 pub use current::ilp::plugin::types as wit_types;
 
+use ilp_runtime::{
+    CapabilityPolicy as RuntimeCapabilityPolicy, FileSecretBackend, FileStorageBackend, RuntimeHost,
+};
+
 use ilp_types::{
     validate_chapter_order, ChapterEntry, ChapterResult, ChapterStatus, PluginMetadata,
     SearchResult,
@@ -289,6 +301,8 @@ pub struct HostState {
     timed_out: bool,
     /// epoch 回调因用户取消而中断过当前调用。
     interrupted: bool,
+    /// 统一运行时能力后端；旧字段和 v1 执行链保留在此适配层。
+    runtime_host: RuntimeHost,
 }
 
 impl HostState {
@@ -327,10 +341,10 @@ impl HostState {
             ctx: WasiCtx::builder().build(),
             table: ResourceTable::new(),
             plugin_name,
-            storage_dir,
-            secret_dir,
+            storage_dir: storage_dir.clone(),
+            secret_dir: secret_dir.clone(),
             cache: HashMap::new(),
-            policy,
+            policy: policy.clone(),
             limits: StoreLimitsBuilder::new()
                 .memory_size(MAX_PLUGIN_MEMORY)
                 .instances(8)
@@ -344,6 +358,14 @@ impl HostState {
             fuel_budget: MAX_PLUGIN_FUEL,
             timed_out: false,
             interrupted: false,
+            runtime_host: RuntimeHost::new(runtime_policy(&policy))
+                .with_storage(Arc::new(
+                    FileStorageBackend::new(storage_dir.clone())
+                        .expect("创建插件 storage 后端失败"),
+                ))
+                .with_secret_backend(Arc::new(
+                    FileSecretBackend::new(secret_dir.clone()).expect("创建插件 secret 后端失败"),
+                )),
         }
     }
 
@@ -427,37 +449,22 @@ impl HostTrait for HostState {
     }
 
     fn storage_get(&mut self, key: String) -> Option<Vec<u8>> {
-        if !self.policy.allows("storage-read") {
+        if !self.policy.allows("storage-read") || !is_safe_key(&key) {
             return None;
         }
-        if let Some(v) = self.cache.get(&key) {
-            return Some(v.clone());
-        }
-        // key 只允许简单标识符，防止穿越到 storage 目录之外
-        if !is_safe_key(&key) {
-            tracing::warn!("插件 {} 请求了非法 storage key: {key}", self.plugin_name);
-            return None;
-        }
-        let path = self.storage_dir.join(&key);
-        let v = std::fs::read(path).ok()?;
-        self.cache.insert(key, v.clone());
-        Some(v)
+        self.runtime_host.storage_get(&key).ok().flatten()
     }
 
     fn storage_set(&mut self, key: String, value: Vec<u8>) -> Result<(), String> {
-        if !self.policy.allows("storage-write") {
-            return Err("permission-denied: storage-write".to_string());
-        }
         if !is_safe_key(&key) {
             return Err(format!("非法 storage key: {key}"));
         }
         if value.len() > MAX_STORAGE_VALUE {
             return Err(format!("storage value 过大: {} 字节", value.len()));
         }
-        std::fs::create_dir_all(&self.storage_dir).map_err(|e| e.to_string())?;
-        atomic_write(&self.storage_dir.join(&key), &value).map_err(|e| e.to_string())?;
-        self.cache.insert(key, value);
-        Ok(())
+        self.runtime_host
+            .storage_set(&key, &value)
+            .map_err(|error| error.to_string())
     }
 
     fn storage_delete(&mut self, key: String) -> Result<(), String> {
@@ -467,13 +474,12 @@ impl HostTrait for HostState {
         if !is_safe_key(&key) {
             return Err(format!("非法 storage key: {key}"));
         }
-        self.cache.remove(&key);
-        let path = self.storage_dir.join(&key);
-        match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.to_string()),
-        }
+        self.runtime_host
+            .storage
+            .as_ref()
+            .ok_or_else(|| "storage backend 未配置".to_string())?
+            .delete(&key)
+            .map_err(|error| error.to_string())
     }
 }
 
