@@ -30,6 +30,9 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-14
             name: macos-aarch64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: windows-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -54,7 +57,8 @@ jobs:
           else
             cargo build --release --locked --target ${{ matrix.target }}
           fi
-      - name: Package
+      - name: Package Unix archive
+        if: runner.os != 'Windows'
         run: |
           set -euo pipefail
           archive=ilp-${{ github.ref_name }}-${{ matrix.name }}
@@ -69,12 +73,26 @@ jobs:
           else
             shasum -a 256 "$archive.tar.gz" > "$archive.tar.gz.sha256"
           fi
+      - name: Package Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = "ilp-${{ github.ref_name }}-${{ matrix.name }}"
+          New-Item -ItemType Directory -Force package | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/ilp.exe" package/ilp.exe
+          Copy-Item LICENSE, README.md package/
+          Compress-Archive -Path package/ilp.exe, package/LICENSE, package/README.md -DestinationPath "$archive.zip"
+          Remove-Item -Recurse -Force package
+          $hash = (Get-FileHash "$archive.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $archive.zip" | Out-File -Encoding ascii "$archive.zip.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
           path: |
             *.tar.gz
-            *.tar.gz.sha256
+            *.zip
+            *.sha256
 
   publish:
     needs: build
@@ -88,8 +106,8 @@ jobs:
         working-directory: dist
         run: |
           set -euo pipefail
-          cat *.tar.gz.sha256 > SHA256SUMS
-          rm *.tar.gz.sha256
+          cat *.sha256 > SHA256SUMS
+          rm *.sha256
       - name: Install signing dependency
         run: python3 -m pip install --quiet cryptography
       - name: Sign checksum manifest
@@ -127,6 +145,7 @@ jobs:
         with:
           files: |
             dist/*.tar.gz
+            dist/*.zip
             dist/SHA256SUMS
             dist/SHA256SUMS.sig
           fail_on_unmatched_files: true
