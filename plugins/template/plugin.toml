@@ -1,8 +1,8 @@
-name = "template"
-site_name = "Example Site"
-site_id = "example"
-site_domain = "example.com"
-description = "用于开发和测试的 ILP 插件模板。"
+name = "@PLUGIN_NAME@"
+site_name = "@SITE_NAME@"
+site_id = "@SITE_ID@"
+site_domain = "@DOMAIN@"
+description = "@SITE_NAME@ 的 ILP 插件。"
 author = "Plugin Author"
 license = "MIT"
 data_source = "Example Site 公开可访问内容"
@@ -13,7 +13,7 @@ known_limitations = ["模板不实现真实站点抓取"]
 # 与 src/lib.rs 里 metadata() 的返回值逐项一致，否则 build_site.py 会拦下来。
 # 模板只演示 http + clock，正好是没有 storage/secret 的最小权限范例。
 permissions = ["http", "clock"]
-allowed_domains = ["example.com"]
+allowed_domains = ["@DOMAIN@"]
 
 # 宿主兼容范围（闭区间）。ABI 只锁接口形状；燃料预算、限流、落盘语义
 # 这些行为变化只能靠版本范围表达。

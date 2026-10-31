@@ -4,22 +4,43 @@
 
 ## 快速开始
 
-从模板复制一个插件：
+一条命令生成骨架：
 
 ```bash
-cp -R plugins/template plugins/my-site
+ilp plugin new my-site --site-name "我的站点" --domain mysite.com
 ```
 
-然后修改 `plugins/my-site/Cargo.toml` 的 package 名称，以及 `src/lib.rs` 中的 metadata 和业务逻辑。
+`--site-name`、`--site-id`、`--domain` 都可省略，默认从插件名推导。
+生成的目录自带 `plugin.toml`、`src/lib.rs`、`src/fixture.rs` 和示例 cassette，
+占位符已按你给的参数填好，可以直接构建。
+
+然后：
+
+```bash
+cargo build --manifest-path my-site/Cargo.toml --target wasm32-wasip2 --release
+ilp plugin install my-site/target/wasm32-wasip2/release/ilp_plugin_my_site.wasm
+```
+
+生成的 `plugin.toml` 里 `data_source` 和 `authorization_boundary` 还是模板文案，
+**必须改成你站点的真实情况**——这两项是发布门禁的硬性要求，不是建议。
 
 ## 构建
 
-```bash
-cargo build --manifest-path plugins/my-site/Cargo.toml \
-  --target wasm32-wasip2 --release
-```
-
 宿主安装前会校验 ABI、WASM component、大小、SHA-256 和签名。
+
+## 提交贡献
+
+发布到官方 registry 之前，这些会自动跑：
+
+| 门禁 | 内容 |
+|---|---|
+| `cargo test` | `manifest_matches_metadata` 校验 `plugin.toml` 与 WASM 元数据一致 |
+| `scan_fixtures.py` | 扫描 fixture 里的 Cookie、token、密码、设备 ID，命中即失败 |
+| `build_site.py` | 许可证白名单、权限枚举、域名格式、`min/max_host_version`、必需元数据 |
+| CI 断言 | `registry.json` 必含 `permissions`、`allowed_domains`、`license`、`maintenance`、各版本 `sha256` |
+
+**从真实流量录制 cassette 之前先读 `fixtures/README.md`**：录制器会自动脱敏
+常见的秘密头与参数，但它靠的是标记匹配，不是保证——录完必须自己看一眼。
 
 ## 元数据治理
 

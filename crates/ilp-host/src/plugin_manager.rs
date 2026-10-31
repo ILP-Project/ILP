@@ -165,6 +165,13 @@ impl Registry {
 
 pub fn run(config: &Config, cmd: PluginCommand) -> Result<()> {
     match cmd {
+        PluginCommand::New {
+            name,
+            site_name,
+            site_id,
+            domain,
+            dir,
+        } => new_plugin(&name, site_name, site_id, domain, dir),
         PluginCommand::List => list(config),
         PluginCommand::Info { name } => info(config, &name),
         PluginCommand::Install { source } => install(config, &source),
@@ -172,6 +179,172 @@ pub fn run(config: &Config, cmd: PluginCommand) -> Result<()> {
         PluginCommand::Enable { name } => enable(config, &name),
         PluginCommand::Disable { name } => disable(config, &name),
     }
+}
+
+/// 模板里的占位符。故意用 `@名字@` 而不是 `{{name}}`：
+/// 模板里本来就有 Rust 的 `{}` 格式串和 TOML，用大括号会撞。
+const TEMPLATE_FILES: &[(&str, &str)] = &[
+    (
+        "Cargo.toml",
+        include_str!("../../../plugins/template/Cargo.toml"),
+    ),
+    (
+        "plugin.toml",
+        include_str!("../../../plugins/template/plugin.toml"),
+    ),
+    (
+        "src/lib.rs",
+        include_str!("../../../plugins/template/src/lib.rs"),
+    ),
+    (
+        "src/fixture.rs",
+        include_str!("../../../plugins/template/src/fixture.rs"),
+    ),
+    (
+        "fixtures/README.md",
+        include_str!("../../../plugins/template/fixtures/README.md"),
+    ),
+    (
+        "fixtures/example-http.json",
+        include_str!("../../../plugins/template/fixtures/example-http.json"),
+    ),
+    (
+        "README.md",
+        include_str!("../../../plugins/template/README.md"),
+    ),
+];
+
+/// 生成插件骨架。
+///
+/// 目标是让「第三条命令就能跑起来」成立：`new` → `cargo build --target
+/// wasm32-wasip2` → `ilp plugin install ./<dir>/target/.../<name>.wasm`。
+///
+/// 缺省值故意从 `name` 推导而不是要求全填：刚上手的人还不知道 site_id
+/// 和域名该怎么写，逼他先做决定只会让他去抄别人的。
+fn new_plugin(
+    name: &str,
+    site_name: Option<String>,
+    site_id: Option<String>,
+    domain: Option<String>,
+    dir: Option<PathBuf>,
+) -> Result<()> {
+    validate_plugin_name(name)?;
+    let parent = dir.unwrap_or_else(|| PathBuf::from("."));
+    let target = parent.join(name);
+    if target.exists() {
+        return Err(anyhow!(
+            "目录 {} 已存在。换个名字，或先删掉它",
+            target.display()
+        ));
+    }
+
+    // Cargo 包名不能直接用插件名里的下划线/点，统一成连字符再校验。
+    let crate_name = name.replace(['_', '.'], "-");
+    let site_id = site_id.unwrap_or_else(|| crate_name.clone());
+    let site_name = site_name.unwrap_or_else(|| format!("{name} 站点"));
+    let domain = domain.unwrap_or_else(|| format!("{site_id}.example.com"));
+    validate_site_id(&site_id)?;
+    validate_domain(&domain)?;
+
+    let replacements = [
+        ("@PLUGIN_NAME@", name),
+        ("@CRATE_NAME@", &crate_name),
+        ("@SITE_ID@", &site_id),
+        ("@SITE_NAME@", &site_name),
+        ("@DOMAIN@", &domain),
+    ];
+
+    for (rel, content) in TEMPLATE_FILES {
+        let mut body = (*content).to_string();
+        for (needle, value) in &replacements {
+            body = body.replace(needle, value);
+        }
+        let path = target.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("创建目录 {} 失败", parent.display()))?;
+        }
+        std::fs::write(&path, body).with_context(|| format!("写入 {} 失败", path.display()))?;
+    }
+
+    println!("已生成插件骨架: {}", target.display());
+    println!();
+    println!("下一步:");
+    println!(
+        "  1. 编辑 {}/plugin.toml：填写 data_source 与 authorization_boundary",
+        target.display()
+    );
+    println!("  2. 实现 {}/src/lib.rs 里的抓取逻辑", target.display());
+    println!(
+        "  3. cargo build --target wasm32-wasip2 --release --manifest-path {}/Cargo.toml",
+        target.display()
+    );
+    // 产物名是 Cargo 把包名的 `-` 换成 `_` 再加 `ilp_plugin_` 前缀，不是包名本身。
+    // 提示里写错会让用户对着一个不存在的路径反复重试。
+    let artifact = format!("ilp_plugin_{}.wasm", crate_name.replace('-', "_"));
+    println!(
+        "  4. ilp plugin install {}/target/wasm32-wasip2/release/{artifact}",
+        target.display()
+    );
+    Ok(())
+}
+
+/// 插件名会变成目录名和 Cargo 包名，必须限定在安全字符集内。
+fn validate_plugin_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 64 {
+        return Err(anyhow!("插件名长度必须在 1–64 之间"));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(anyhow!(
+            "插件名 {name} 含非法字符（只允许字母、数字、- 和 _）"
+        ));
+    }
+    if name.starts_with('-') || name.starts_with('_') {
+        return Err(anyhow!("插件名不能以 - 或 _ 开头"));
+    }
+    Ok(())
+}
+
+/// site_id 会出现在 URL 查询和文件名里，限制比插件名更严：不允许下划线。
+///
+/// 与 `install` 侧的校验保持一致——这里放过、那边拒绝，用户会在
+/// 构建完之后才撞墙。
+fn validate_site_id(id: &str) -> Result<()> {
+    if id.is_empty() || id.len() > 64 {
+        return Err(anyhow!("站点 ID 长度必须在 1–64 之间"));
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(anyhow!(
+            "站点 ID {id} 含非法字符（只允许字母、数字、- 和 _）"
+        ));
+    }
+    Ok(())
+}
+
+/// 域名必须能被 `allowed_domains` 的匹配规则接受：不带协议、不带路径、不带端口，
+/// 也不允许通配符（宿主按标签边界精确匹配，通配符从来就不生效）。
+fn validate_domain(domain: &str) -> Result<()> {
+    if domain.is_empty() {
+        return Err(anyhow!("域名不能为空"));
+    }
+    if domain.contains("://") || domain.contains('/') || domain.contains(':') {
+        return Err(anyhow!(
+            "域名 {domain} 只能写主机名，不能带协议、路径或端口"
+        ));
+    }
+    if domain.contains('*') {
+        return Err(anyhow!("域名 {domain} 不支持通配符，请写明具体域名"));
+    }
+    if !domain.contains('.') {
+        return Err(anyhow!("域名 {domain} 至少要有一个点"));
+    }
+    Ok(())
 }
 
 fn list(config: &Config) -> Result<()> {
@@ -1182,6 +1355,105 @@ mod tests {
             max_host_version: None,
         };
         assert!(verify_artifact(&bytes, &p).is_ok());
+    }
+
+    #[test]
+    fn template_files_are_embedded_and_placeholder_driven() {
+        // 生成器把模板编译进二进制。模板被挪走或改名时，
+        // include_str! 会先报错——这条测试守的是「占位符没被写死回字面量」。
+        for (rel, content) in TEMPLATE_FILES {
+            assert!(!content.is_empty(), "{rel} 是空的");
+        }
+        let plugin_toml = TEMPLATE_FILES
+            .iter()
+            .find(|(rel, _)| *rel == "plugin.toml")
+            .map(|(_, c)| *c)
+            .expect("模板必须有 plugin.toml");
+        for needle in ["@PLUGIN_NAME@", "@SITE_ID@", "@SITE_NAME@", "@DOMAIN@"] {
+            assert!(
+                plugin_toml.contains(needle),
+                "plugin.toml 缺少占位符 {needle}，生成出来的插件会带模板的假数据"
+            );
+        }
+    }
+
+    #[test]
+    fn new_plugin_replaces_every_placeholder() {
+        let dir = std::env::temp_dir().join(format!("ilp-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        new_plugin(
+            "demo",
+            Some("示例站点".into()),
+            Some("demo-id".into()),
+            Some("demo.com".into()),
+            Some(dir.clone()),
+        )
+        .expect("生成插件骨架");
+
+        let root = dir.join("demo");
+        for (rel, _) in TEMPLATE_FILES {
+            let path = root.join(rel);
+            assert!(path.exists(), "{rel} 没写出来");
+            let body = std::fs::read_to_string(&path).unwrap();
+            // 漏替换的占位符会让生成的插件带着模板数据跑起来，很难发现。
+            assert!(
+                !body.contains('@') || !body.contains("@PLUGIN_NAME@"),
+                "{rel} 残留占位符"
+            );
+            assert!(!body.contains("@SITE_ID@"), "{rel} 残留 @SITE_ID@");
+            assert!(!body.contains("@SITE_NAME@"), "{rel} 残留 @SITE_NAME@");
+            assert!(!body.contains("@DOMAIN@"), "{rel} 残留 @DOMAIN@");
+            assert!(!body.contains("@CRATE_NAME@"), "{rel} 残留 @CRATE_NAME@");
+        }
+
+        let manifest = std::fs::read_to_string(root.join("plugin.toml")).unwrap();
+        assert!(manifest.contains("name = \"demo\""));
+        assert!(manifest.contains("site_id = \"demo-id\""));
+        assert!(manifest.contains("allowed_domains = [\"demo.com\"]"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_plugin_refuses_to_overwrite_existing_directory() {
+        let dir = std::env::temp_dir().join(format!("ilp-newdup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("demo")).unwrap();
+        let err = new_plugin("demo", None, None, None, Some(dir.clone())).expect_err("应拒绝");
+        assert!(format!("{err}").contains("已存在"), "实得: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_plugin_rejects_unsafe_names_and_domains() {
+        let dir = std::env::temp_dir().join(format!("ilp-newbad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 名字会变成目录名，`../` 必须挡在写文件之前。
+        assert!(new_plugin("../evil", None, None, None, Some(dir.clone())).is_err());
+        assert!(new_plugin("a/b", None, None, None, Some(dir.clone())).is_err());
+        // 域名写法错了，宿主那边永远匹配不上，早点拒绝。
+        assert!(new_plugin(
+            "d1",
+            None,
+            None,
+            Some("https://x.com".into()),
+            Some(dir.clone())
+        )
+        .is_err());
+        assert!(new_plugin("d2", None, None, Some("*.x.com".into()), Some(dir.clone())).is_err());
+        assert!(new_plugin(
+            "d3",
+            None,
+            None,
+            Some("x.com:8080".into()),
+            Some(dir.clone())
+        )
+        .is_err());
+        assert!(new_plugin("d4", None, None, Some("nodot".into()), Some(dir.clone())).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -41,6 +41,23 @@ pub enum Command {
 
 #[derive(Subcommand)]
 pub enum PluginCommand {
+    /// 从模板生成新插件骨架
+    New {
+        /// 插件名（按 Cargo 包名规则，如 my-site），决定目录名
+        name: String,
+        /// 站点显示名，如「某某小说」
+        #[arg(long)]
+        site_name: Option<String>,
+        /// 站点 ID（与 `ilp get -s` 用的值一致）
+        #[arg(long)]
+        site_id: Option<String>,
+        /// 站点主域名，同时写进 allowed_domains
+        #[arg(long)]
+        domain: Option<String>,
+        /// 父目录，默认当前目录
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
     /// 列出插件
     List,
     /// 显示插件元数据与完整性信息

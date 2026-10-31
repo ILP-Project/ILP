@@ -9,14 +9,14 @@ impl Guest for Template {
     fn metadata() -> PluginMetadata {
         PluginMetadata {
             abi_version: "0.2.0".into(),
-            site_name: "Example Site".into(),
-            site_id: "example".into(),
-            site_domain: "example.com".into(),
-            plugin_name: "example".into(),
-            plugin_id: "example".into(),
+            site_name: "@SITE_NAME@".into(),
+            site_id: "@SITE_ID@".into(),
+            site_domain: "@DOMAIN@".into(),
+            plugin_name: "@PLUGIN_NAME@".into(),
+            plugin_id: "@PLUGIN_NAME@".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             permissions: vec![Permission::Http, Permission::Clock],
-            allowed_domains: vec!["example.com".into()],
+            allowed_domains: vec!["@DOMAIN@".into()],
         }
     }
 

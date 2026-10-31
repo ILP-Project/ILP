@@ -1,5 +1,5 @@
 [package]
-name = "ilp-plugin-template"
+name = "ilp-plugin-@CRATE_NAME@"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,7 +7,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-ilp-plugin-wit = { path = "../../crates/ilp-plugin-wit" }
+ilp-plugin-wit = { git = "https://github.com/ILP-Project/ILP", tag = "abi-v0.2.0" }
 serde = { version = "1", features = ["derive"] }
 base64 = "0.22"
 serde_json = "1"
