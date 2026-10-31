@@ -95,41 +95,7 @@ impl SqliteStorage {
         std::fs::create_dir_all(&paths.covers_dir)?;
         std::fs::create_dir_all(&paths.plugins_dir)?;
         let db = Connection::open(&paths.database)?;
-        db.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
-             CREATE TABLE IF NOT EXISTS schema_meta (
-                 key TEXT PRIMARY KEY NOT NULL,
-                 value TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS books (
-                 id TEXT PRIMARY KEY NOT NULL,
-                 title TEXT NOT NULL,
-                 author TEXT NOT NULL,
-                 source_type TEXT NOT NULL,
-                 source_id TEXT NOT NULL,
-                 authorized INTEGER NOT NULL,
-                 chapters TEXT NOT NULL,
-                 updated_at INTEGER NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS chapter_files (
-                 book_id TEXT NOT NULL,
-                 chapter_id TEXT NOT NULL,
-                 path TEXT NOT NULL,
-                 bytes INTEGER NOT NULL,
-                 sha256 TEXT NOT NULL,
-                 PRIMARY KEY (book_id, chapter_id)
-             );",
-        )?;
-        db.execute(
-            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [format!(
-                "{}.{}",
-                SchemaVersion::CURRENT.major,
-                SchemaVersion::CURRENT.minor
-            )],
-        )?;
+        migrate(&db)?;
         Ok(Self { db, paths })
     }
 
@@ -177,6 +143,29 @@ impl SqliteStorage {
         Ok(Some(data))
     }
 
+    pub fn rebuild_search_index(&self) -> Result<()> {
+        self.db.execute_batch(
+            "DROP TABLE IF EXISTS search_index;
+             CREATE VIRTUAL TABLE search_index USING fts5(
+                 book_id UNINDEXED, title, author, chapter_title, body
+             );
+             INSERT INTO search_index(book_id, title, author)
+                 SELECT id, title, author FROM books;",
+        )?;
+        Ok(())
+    }
+
+    pub fn search(&self, query: &str) -> Result<Vec<String>> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.db.prepare(
+            "SELECT book_id FROM search_index WHERE search_index MATCH ?1 ORDER BY rank",
+        )?;
+        let rows = stmt.query_map([query], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn schema_version(&self) -> Result<SchemaVersion> {
         let value: String = self.db.query_row(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'",
@@ -191,6 +180,39 @@ impl SqliteStorage {
             minor: minor.parse()?,
         })
     }
+}
+
+fn migrate(db: &Connection) -> Result<()> {
+    let transaction = db.unchecked_transaction()?;
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_meta (
+             key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS books (
+             id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, author TEXT NOT NULL,
+             source_type TEXT NOT NULL, source_id TEXT NOT NULL, authorized INTEGER NOT NULL,
+             chapters TEXT NOT NULL, updated_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS chapter_files (
+             book_id TEXT NOT NULL, chapter_id TEXT NOT NULL, path TEXT NOT NULL,
+             bytes INTEGER NOT NULL, sha256 TEXT NOT NULL,
+             PRIMARY KEY (book_id, chapter_id)
+         );
+         CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
+             book_id UNINDEXED, title, author, chapter_title, body
+         );",
+    )?;
+    transaction.execute(
+        "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [format!(
+            "{}.{}",
+            SchemaVersion::CURRENT.major,
+            SchemaVersion::CURRENT.minor
+        )],
+    )?;
+    transaction.commit()?;
+    Ok(())
 }
 
 fn sanitize_component(value: &str) -> String {
