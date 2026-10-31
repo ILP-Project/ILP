@@ -8,6 +8,7 @@ mod exit;
 mod exporter;
 mod http;
 mod logging;
+mod messages;
 mod plugin_manager;
 mod replay;
 mod signing;

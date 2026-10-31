@@ -3,6 +3,7 @@ use anyhow::{anyhow, Result};
 use crate::config::Config;
 use crate::engine::PluginInstance;
 use crate::exporter::{Document, DocumentChapter, Exporter, TxtExporter};
+use crate::messages;
 use crate::storage::{Book, Storage};
 use ilp_types::{ChapterResult, ChapterStatus};
 use std::io::IsTerminal;
@@ -81,14 +82,8 @@ pub fn do_update(
     }));
     if !jsonl_enabled() {
         println!(
-            "更新报告: {}，新增 {} 章{}",
-            old_book.title,
-            added.len(),
-            if apply {
-                "（将立即下载）"
-            } else {
-                "（预览，未修改本地数据）"
-            }
+            "{}",
+            messages::update_report(&old_book.title, added.len(), apply)
         );
     }
     for chapter in &added {
@@ -99,7 +94,7 @@ pub fn do_update(
                 "title": chapter.title,
             }));
         } else {
-            println!("新增: {}", chapter.title);
+            println!("{}: {}", messages::CHAPTER_ADDED, chapter.title);
         }
     }
     if !apply || added.is_empty() {
@@ -214,7 +209,7 @@ fn fetch_all(
         .collect();
 
     if todo.is_empty() {
-        println!("所有章节已下载");
+        println!("{}", messages::ALL_CHAPTERS_DOWNLOADED);
         // 幂等分支也要留摘要：用户说"跑了但没反应"时，要先能确认
         // 它到底跑没跑过、跑的是哪本书。
         tracing::info!(
@@ -330,7 +325,14 @@ fn fetch_all(
         }
     }
 
-    println!("完成: 成功 {done} 章，失败 {failed} 章");
+    println!(
+        "{}: {} {} 章，{} {} 章",
+        messages::DOWNLOAD_DONE,
+        messages::DOWNLOAD_SUCCESS,
+        done,
+        messages::DOWNLOAD_FAILED,
+        failed
+    );
     // 运行摘要：一行、结构化、可 grep。用户抱怨"昨天还能下"时，这行是
     // 唯一能快速定位"哪个站点、哪本书、哪次运行、成败各多少"的线索。
     // 单独一条 target 便于从混杂的日志里筛出来。
@@ -484,7 +486,7 @@ fn persist(
                     serde_json::json!({"event":"chapter_downloaded","book":book.title,"chapter":item.title,"id":item.id,"status":"ok"}),
                 );
             } else {
-                println!("已下载: {} - {}", book.title, item.title);
+                println!("{}", messages::chapter_downloaded(&book.title, &item.title));
             }
         }
         Err(e) => {
