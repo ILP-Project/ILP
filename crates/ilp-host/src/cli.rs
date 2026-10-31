@@ -30,6 +30,18 @@ pub enum Command {
         #[arg(short = 's', long = "site_id")]
         site_id: String,
     },
+    /// 检查目录更新；默认只生成变更报告
+    Update {
+        /// 小说 ID
+        #[arg(value_name = "id")]
+        id: String,
+        /// 站点 ID
+        #[arg(short = 's', long = "site_id")]
+        site_id: String,
+        /// 应用目录变更并下载新增章节
+        #[arg(long)]
+        apply: bool,
+    },
     /// 插件管理
     Plugin {
         #[command(subcommand)]

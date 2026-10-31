@@ -57,6 +57,10 @@ fn run() -> anyhow::Result<()> {
             let mut plugins = engine::load_plugins(&config)?;
             commands::do_search(&mut plugins, &config, &keyword, &site_id)
         }
+        cli::Command::Update { id, site_id, apply } => {
+            let mut plugins = engine::load_plugins(&config)?;
+            commands::do_update(&mut plugins, &config, &id, &site_id, apply)
+        }
         cli::Command::Doctor {
             bundle,
             with_manifest,

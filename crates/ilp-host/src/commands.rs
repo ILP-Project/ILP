@@ -42,6 +42,56 @@ fn jsonl_enabled() -> bool {
     std::env::var_os("ILP_JSONL").is_some() || std::env::var_os("ILP_JSON").is_some()
 }
 
+pub fn do_update(
+    plugins: &mut [PluginInstance],
+    config: &Config,
+    book_id: &str,
+    site_id: &str,
+    apply: bool,
+) -> Result<()> {
+    let plugin = find_plugin(plugins, site_id)?;
+    let storage = Storage::open("cache.db", config.novels_dir(), config.covers_dir())?;
+    plugin.init(book_id, true)?;
+    let Some(old_book) = storage.load_book(site_id, book_id)? else {
+        return Err(anyhow!(
+            "没有找到已缓存的书籍，请先运行 ilp get all {book_id}"
+        ));
+    };
+    let new_chapters = plugin.catalog(true)?;
+    let old_ids: std::collections::HashSet<&str> = old_book
+        .chapters
+        .iter()
+        .map(|chapter| chapter.id.as_str())
+        .collect();
+    let added: Vec<_> = new_chapters
+        .iter()
+        .filter(|chapter| !old_ids.contains(chapter.id.as_str()))
+        .collect();
+    println!(
+        "更新报告: {}，新增 {} 章{}",
+        old_book.title,
+        added.len(),
+        if apply {
+            "（将立即下载）"
+        } else {
+            "（预览，未修改本地数据）"
+        }
+    );
+    for chapter in &added {
+        println!("新增: {}", chapter.title);
+    }
+    if !apply || added.is_empty() {
+        return Ok(());
+    }
+    let updated = Book {
+        chapters: new_chapters,
+        ..old_book
+    };
+    storage.save_book(site_id, book_id, &updated)?;
+    let _lock = storage.lock_book(site_id, book_id)?;
+    fetch_all(plugin, &storage, config, site_id, book_id, &updated)
+}
+
 pub fn do_get(
     plugins: &mut [PluginInstance],
     config: &Config,
