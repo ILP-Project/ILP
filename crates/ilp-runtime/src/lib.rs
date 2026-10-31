@@ -109,6 +109,7 @@ pub struct RuntimeStore {
     pub limits: StoreLimits,
     pub started: Instant,
     pub timeout: Duration,
+    pub cancelled: bool,
 }
 
 pub fn shared_engine() -> &'static Engine {
@@ -133,6 +134,7 @@ pub fn new_store(policy: &CapabilityPolicy) -> Result<Store<RuntimeStore>> {
             limits,
             started: Instant::now(),
             timeout: Duration::from_millis(policy.limits.timeout_ms),
+            cancelled: false,
         },
     );
     store.limiter(|state| &mut state.limits);
@@ -159,12 +161,17 @@ pub fn validate_component(wasm: &[u8]) -> std::result::Result<(), RuntimeError> 
         .map_err(|error| RuntimeError::InvalidFormat(format!("WASM component 无效: {error}")))
 }
 
+pub fn cancel(store: &mut Store<RuntimeStore>) {
+    store.data_mut().cancelled = true;
+}
+
 pub fn reset_execution_budget(
     store: &mut Store<RuntimeStore>,
     policy: &CapabilityPolicy,
 ) -> Result<()> {
     store.data_mut().started = Instant::now();
     store.data_mut().timeout = Duration::from_millis(policy.limits.timeout_ms);
+    store.data_mut().cancelled = false;
     store
         .set_fuel(policy.limits.fuel)
         .map_err(|error| anyhow!("重置插件 fuel 失败: {error}"))?;
@@ -174,6 +181,9 @@ pub fn reset_execution_budget(
 pub fn check_execution_budget(
     store: &Store<RuntimeStore>,
 ) -> std::result::Result<(), RuntimeError> {
+    if store.data().cancelled {
+        return Err(RuntimeError::ExecutionFailed("插件执行已取消".into()));
+    }
     if store.data().started.elapsed() > store.data().timeout {
         return Err(RuntimeError::ResourceLimit("插件执行超时".into()));
     }
