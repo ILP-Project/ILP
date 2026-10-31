@@ -148,6 +148,8 @@ pub struct HostCapabilities {
     pub allow_http: bool,
     pub allow_storage: bool,
     pub allow_secrets: bool,
+    pub requests_used: u32,
+    pub max_requests: u32,
 }
 
 impl HostCapabilities {
@@ -156,7 +158,17 @@ impl HostCapabilities {
             allow_http: !policy.allowed_domains.is_empty(),
             allow_storage: policy.allow_storage,
             allow_secrets: false,
+            requests_used: 0,
+            max_requests: policy.limits.max_requests,
         }
+    }
+
+    pub fn consume_request(&mut self) -> std::result::Result<(), RuntimeError> {
+        if self.requests_used >= self.max_requests {
+            return Err(RuntimeError::ResourceLimit("插件请求次数超限".into()));
+        }
+        self.requests_used += 1;
+        Ok(())
     }
 
     pub fn can_use(&self, permission: &str) -> bool {
@@ -177,7 +189,7 @@ pub fn load_component(wasm: &[u8]) -> std::result::Result<Component, RuntimeErro
 }
 
 pub fn validate_component(wasm: &[u8]) -> std::result::Result<(), RuntimeError> {
-    if wasm.len() < 8 || &wasm[0..4] != b"\\0asm" {
+    if wasm.len() < 8 || &wasm[0..4] != b"\0asm" {
         return Err(RuntimeError::InvalidFormat(
             "插件不是有效的 WASM 文件".into(),
         ));
@@ -322,11 +334,15 @@ mod tests {
 
     #[test]
     fn capability_mapping_is_default_deny() {
-        let capabilities = HostCapabilities::from_policy(&CapabilityPolicy::deny_all());
+        let mut policy = CapabilityPolicy::deny_all();
+        policy.limits.max_requests = 1;
+        let mut capabilities = HostCapabilities::from_policy(&policy);
         assert!(!capabilities.can_use("http"));
         assert!(!capabilities.can_use("storage-read"));
         assert!(!capabilities.can_use("secret-read"));
         assert!(capabilities.can_use("clock"));
+        assert!(capabilities.consume_request().is_ok());
+        assert!(capabilities.consume_request().is_err());
     }
 
     #[test]
