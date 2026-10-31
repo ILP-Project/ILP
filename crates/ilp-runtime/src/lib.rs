@@ -157,6 +157,30 @@ pub trait SecretBackend: Send + Sync {
     fn delete(&self, key: &str) -> Result<()>;
 }
 
+pub struct FileSecretBackend {
+    inner: FileStorageBackend,
+}
+
+impl FileSecretBackend {
+    pub fn new(root: PathBuf) -> Result<Self> {
+        Ok(Self {
+            inner: FileStorageBackend::new(root)?,
+        })
+    }
+}
+
+impl SecretBackend for FileSecretBackend {
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(key)
+    }
+    fn set(&self, key: &str, value: &[u8]) -> Result<()> {
+        self.inner.set(key, value)
+    }
+    fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key)
+    }
+}
+
 pub struct FileStorageBackend {
     root: PathBuf,
 }
