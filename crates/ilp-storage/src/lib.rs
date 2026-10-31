@@ -184,6 +184,14 @@ impl SqliteStorage {
         Ok(())
     }
 
+    pub fn list_book_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT id FROM books ORDER BY title COLLATE NOCASE")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn search(&self, query: &str) -> Result<Vec<String>> {
         if query.trim().is_empty() {
             return Ok(Vec::new());
