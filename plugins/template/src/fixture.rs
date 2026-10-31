@@ -50,7 +50,8 @@ mod tests {
 
     #[test]
     fn validates_and_decodes_fixture() {
-        let fixture: Fixture = serde_json::from_str(include_str!("../fixtures/example-http.json")).expect("解析 fixture");
+        let fixture: Fixture = serde_json::from_str(include_str!("../fixtures/example-http.json"))
+            .expect("解析 fixture");
         fixture.validate().expect("fixture 应有效");
         assert_eq!(fixture.decode_body().expect("解码"), b"{\"chapters\":[]}");
         assert_eq!(fixture.request.method, "GET");
@@ -60,8 +61,17 @@ mod tests {
     fn rejects_unknown_schema() {
         let fixture = Fixture {
             schema_version: 2,
-            request: FixtureRequest { method: "GET".into(), url: "https://example.com".into(), headers: Default::default(), body_base64: None },
-            response: FixtureResponse { status: 200, headers: Default::default(), body_base64: "".into() },
+            request: FixtureRequest {
+                method: "GET".into(),
+                url: "https://example.com".into(),
+                headers: Default::default(),
+                body_base64: None,
+            },
+            response: FixtureResponse {
+                status: 200,
+                headers: Default::default(),
+                body_base64: "".into(),
+            },
             notes: String::new(),
         };
         assert!(fixture.validate().is_err());

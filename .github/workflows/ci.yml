@@ -38,15 +38,16 @@ jobs:
         timeout-minutes: 15
         run: cargo test -p ilp-host
 
+      - name: 构建二进制
+        # 安装脚本自测需要真实的 ilp 二进制当模拟产物。
+        run: cargo build
+
       - name: 安装脚本自测
         # 安装脚本是唯一由用户直接执行的东西，且它在下载别人的字节装进
         # PATH。它的异常路径必须有人守着。
         run: |
-          pip install --quiet cryptography
+          python3 -m pip install --quiet cryptography
           sh scripts/install_test.sh
-        env:
-          # 自测只需要 debug 二进制；先构建再跑。
-          CARGO_PROFILE: debug
 
   plugin-skeleton:
     runs-on: ubuntu-latest
