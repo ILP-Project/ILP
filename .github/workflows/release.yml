@@ -38,15 +38,20 @@ jobs:
           key: release-${{ matrix.target }}
       - name: Install musl toolchain
         if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y musl-tools
       - name: Install cross
         if: matrix.target == 'aarch64-unknown-linux-musl'
+        shell: bash
         run: cargo install cross --git https://github.com/cross-rs/cross --locked
-      - run: rustup target add ${{ matrix.target }}
+      - name: Add Rust target
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
       - name: Build
+        shell: bash
         run: |
           set -euo pipefail
           if [ '${{ matrix.target }}' = 'aarch64-unknown-linux-musl' ]; then
