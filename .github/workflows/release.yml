@@ -37,29 +37,36 @@ jobs:
         with:
           key: release-${{ matrix.target }}
       - name: Install musl toolchain
-        if: contains(matrix.target, 'musl')
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y musl-tools
-          if [ '${{ matrix.target }}' = 'aarch64-unknown-linux-musl' ]; then
-            curl -fsSL https://musl.cc/aarch64-linux-musl-cross.tgz -o /tmp/musl.tgz
-            sudo tar -xzf /tmp/musl.tgz -C /opt
-            echo /opt/aarch64-linux-musl-cross/bin >> "$GITHUB_PATH"
-          fi
+      - name: Install ARM64 musl toolchain
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: docker pull messense/rust-musl-cross:aarch64-musl
       - run: rustup target add ${{ matrix.target }}
       - name: Build
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
-          CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
-          AR_aarch64_unknown_linux_musl: aarch64-linux-musl-ar
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [ '${{ matrix.target }}' = 'aarch64-unknown-linux-musl' ]; then
+            docker run --rm -u "$(id -u):$(id -g)" \
+              -v "$GITHUB_WORKSPACE:/volume" \
+              -w /volume messense/rust-musl-cross:aarch64-musl \
+              cargo build --release --locked --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --target ${{ matrix.target }}
+          fi
       - name: Package
         run: |
           set -euo pipefail
           archive=ilp-${{ github.ref_name }}-${{ matrix.name }}
-          install -Dm755 target/${{ matrix.target }}/release/ilp ilp
-          tar -czf "$archive.tar.gz" ilp LICENSE README.md
+          mkdir -p package
+          cp target/${{ matrix.target }}/release/ilp package/ilp
+          chmod 755 package/ilp
+          cp LICENSE README.md package/
+          tar -czf "$archive.tar.gz" -C package ilp LICENSE README.md
+          rm -rf package
           rm ilp
           sha256sum "$archive.tar.gz" > "$archive.tar.gz.sha256"
       - uses: actions/upload-artifact@v4
