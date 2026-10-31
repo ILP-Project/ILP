@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Result};
 use ilp_runtime::{validate_component, validate_metadata};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -283,10 +282,7 @@ pub struct HostState {
     table: ResourceTable,
     /// 插件名，用于隔离 storage 命名空间
     plugin_name: String,
-    storage_dir: PathBuf,
     secret_dir: PathBuf,
-    /// 内存里的 KV，落盘前先命中这里
-    cache: HashMap<String, Vec<u8>>,
     policy: CapabilityPolicy,
     limits: StoreLimits,
     /// 本次插件调用的起点，epoch 回调用它算墙钟预算。
@@ -341,9 +337,7 @@ impl HostState {
             ctx: WasiCtx::builder().build(),
             table: ResourceTable::new(),
             plugin_name,
-            storage_dir: storage_dir.clone(),
             secret_dir: secret_dir.clone(),
-            cache: HashMap::new(),
             policy: policy.clone(),
             limits: StoreLimitsBuilder::new()
                 .memory_size(MAX_PLUGIN_MEMORY)
