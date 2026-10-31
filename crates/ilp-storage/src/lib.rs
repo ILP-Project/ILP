@@ -116,6 +116,23 @@ impl SqliteStorage {
         Ok(())
     }
 
+    pub fn task_state(&self, id: &str) -> Result<Option<String>> {
+        self.db
+            .query_row("SELECT state FROM tasks WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn task_states(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT id, state FROM tasks ORDER BY created_at")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn next_event_sequence(&self) -> Result<u64> {
         let tx = self.db.unchecked_transaction()?;
         tx.execute(
