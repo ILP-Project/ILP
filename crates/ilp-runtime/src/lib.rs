@@ -142,6 +142,12 @@ pub fn new_store(policy: &CapabilityPolicy) -> Result<Store<RuntimeStore>> {
     Ok(store)
 }
 
+pub fn load_component(wasm: &[u8]) -> std::result::Result<Component, RuntimeError> {
+    validate_component(wasm)?;
+    Component::from_binary(shared_engine(), wasm)
+        .map_err(|error| RuntimeError::InvalidFormat(format!("WASM component 加载失败: {error}")))
+}
+
 pub fn validate_component(wasm: &[u8]) -> std::result::Result<(), RuntimeError> {
     if wasm.len() < 8 || &wasm[0..4] != b"\\0asm" {
         return Err(RuntimeError::InvalidFormat(
