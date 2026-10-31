@@ -51,6 +51,7 @@ jobs:
           set -euo pipefail
           if [ '${{ matrix.target }}' = 'aarch64-unknown-linux-musl' ]; then
             docker run --rm -u "$(id -u):$(id -g)" \
+              -e CARGO_HOME=/tmp/cargo \
               -v "$GITHUB_WORKSPACE:/volume" \
               -w /volume messense/rust-musl-cross:aarch64-musl \
               cargo build --release --locked --target ${{ matrix.target }}
@@ -67,7 +68,6 @@ jobs:
           cp LICENSE README.md package/
           tar -czf "$archive.tar.gz" -C package ilp LICENSE README.md
           rm -rf package
-          rm ilp
           sha256sum "$archive.tar.gz" > "$archive.tar.gz.sha256"
       - uses: actions/upload-artifact@v4
         with:
