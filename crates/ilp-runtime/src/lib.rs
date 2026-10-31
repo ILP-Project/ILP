@@ -6,6 +6,7 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use wasmtime::component::Component;
@@ -142,6 +143,61 @@ pub fn new_store(policy: &CapabilityPolicy) -> Result<Store<RuntimeStore>> {
         .set_fuel(policy.limits.fuel)
         .map_err(|error| anyhow!("设置插件 fuel 失败: {error}"))?;
     Ok(store)
+}
+
+pub trait StorageBackend: Send + Sync {
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
+    fn set(&self, key: &str, value: &[u8]) -> Result<()>;
+    fn delete(&self, key: &str) -> Result<()>;
+}
+
+pub trait SecretBackend: Send + Sync {
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
+    fn set(&self, key: &str, value: &[u8]) -> Result<()>;
+    fn delete(&self, key: &str) -> Result<()>;
+}
+
+pub struct FileStorageBackend {
+    root: PathBuf,
+}
+
+impl FileStorageBackend {
+    pub fn new(root: PathBuf) -> Result<Self> {
+        std::fs::create_dir_all(&root)?;
+        Ok(Self { root })
+    }
+
+    fn path(&self, key: &str) -> Result<PathBuf> {
+        if key.is_empty() || key.contains('/') || key.contains('\\') || key == "." || key == ".." {
+            return Err(anyhow!("非法插件存储键"));
+        }
+        Ok(self.root.join(key))
+    }
+}
+
+impl StorageBackend for FileStorageBackend {
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let path = self.path(key)?;
+        match std::fs::read(path) {
+            Ok(data) => Ok(Some(data)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn set(&self, key: &str, value: &[u8]) -> Result<()> {
+        std::fs::write(self.path(key)?, value)?;
+        Ok(())
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        let path = self.path(key)?;
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 pub struct HostCapabilities {
