@@ -27,7 +27,14 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run() -> anyhow::Result<()> {
-    let command = cli::parse();
+    let parsed = cli::parse();
+    if parsed.jsonl {
+        std::env::set_var("ILP_JSONL", "1");
+    }
+    if parsed.verbose {
+        std::env::set_var("RUST_LOG", "debug");
+    }
+    let command = parsed.command;
     let config = config::Config::load("config.json")?;
     let _log_guard = logging::init(&config)?;
     commands::install_signal_handlers()?;

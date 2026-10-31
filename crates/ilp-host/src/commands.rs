@@ -42,6 +42,12 @@ fn jsonl_enabled() -> bool {
     std::env::var_os("ILP_JSONL").is_some() || std::env::var_os("ILP_JSON").is_some()
 }
 
+fn emit_event(event: serde_json::Value) {
+    if jsonl_enabled() {
+        println!("{event}");
+    }
+}
+
 pub fn do_update(
     plugins: &mut [PluginInstance],
     config: &Config,
@@ -67,18 +73,34 @@ pub fn do_update(
         .iter()
         .filter(|chapter| !old_ids.contains(chapter.id.as_str()))
         .collect();
-    println!(
-        "更新报告: {}，新增 {} 章{}",
-        old_book.title,
-        added.len(),
-        if apply {
-            "（将立即下载）"
-        } else {
-            "（预览，未修改本地数据）"
-        }
-    );
+    emit_event(serde_json::json!({
+        "event": "update_report",
+        "book": old_book.title,
+        "added": added.len(),
+        "apply": apply,
+    }));
+    if !jsonl_enabled() {
+        println!(
+            "更新报告: {}，新增 {} 章{}",
+            old_book.title,
+            added.len(),
+            if apply {
+                "（将立即下载）"
+            } else {
+                "（预览，未修改本地数据）"
+            }
+        );
+    }
     for chapter in &added {
-        println!("新增: {}", chapter.title);
+        if jsonl_enabled() {
+            emit_event(serde_json::json!({
+                "event": "chapter_added",
+                "id": chapter.id,
+                "title": chapter.title,
+            }));
+        } else {
+            println!("新增: {}", chapter.title);
+        }
     }
     if !apply || added.is_empty() {
         return Ok(());
@@ -458,8 +480,9 @@ fn persist(
         Ok(_) => {
             *done += 1;
             if jsonl_enabled() {
-                let event = serde_json::json!({"event":"chapter_downloaded","book":book.title,"chapter":item.title,"id":item.id,"status":"ok"});
-                println!("{}", event);
+                emit_event(
+                    serde_json::json!({"event":"chapter_downloaded","book":book.title,"chapter":item.title,"id":item.id,"status":"ok"}),
+                );
             } else {
                 println!("已下载: {} - {}", book.title, item.title);
             }

@@ -3,6 +3,12 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "ilp", version, about = "小说下载器")]
 pub struct Cli {
+    /// 输出结构化 JSONL 事件，不混入普通进度文本
+    #[arg(long, global = true)]
+    pub jsonl: bool,
+    /// 输出更详细的运行日志
+    #[arg(short, long, global = true)]
+    pub verbose: bool,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -96,6 +102,6 @@ pub enum PluginCommand {
     Disable { name: String },
 }
 
-pub fn parse() -> Command {
-    Cli::parse().command
+pub fn parse() -> Cli {
+    Cli::parse()
 }
