@@ -191,7 +191,20 @@ impl SqliteStorage {
         let mut stmt = self.db.prepare(
             "SELECT book_id FROM search_index WHERE search_index MATCH ?1 ORDER BY rank",
         )?;
-        let rows = stmt.query_map([query], |row| row.get::<_, String>(0))?;
+        let results = stmt
+            .query_map([query], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if !results.is_empty() {
+            return Ok(results);
+        }
+        // SQLite 的默认 FTS tokenizer 对部分 CJK 文本不会产生可检索 token；
+        // 使用参数化 LIKE 作为派生索引的安全兜底，不拼接用户输入到 SQL。
+        let pattern = format!("%{query}%");
+        let mut fallback = self.db.prepare(
+            "SELECT DISTINCT book_id FROM search_index
+             WHERE title LIKE ?1 OR author LIKE ?1 OR chapter_title LIKE ?1 OR body LIKE ?1",
+        )?;
+        let rows = fallback.query_map([pattern], |row| row.get::<_, String>(0))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -357,5 +370,26 @@ mod tests {
     #[test]
     fn current_schema_is_explicit() {
         assert_eq!(SchemaVersion::CURRENT, SchemaVersion { major: 1, minor: 0 });
+    }
+
+    #[test]
+    fn sqlite_storage_round_trips_chapter_and_search() {
+        let root = std::env::temp_dir().join(format!("ilp-storage-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let storage = SqliteStorage::open(StoragePaths::new(&root)).unwrap();
+        storage
+            .save_chapter("book/1", "chapter/1", "正文内容".as_bytes())
+            .unwrap();
+        assert_eq!(
+            storage.read_chapter("book/1", "chapter/1").unwrap(),
+            Some("正文内容".as_bytes().to_vec())
+        );
+        storage.index_book("book/1", "测试书", "测试作者").unwrap();
+        storage
+            .index_chapter("book/1", "chapter/1", "第一章", "正文内容")
+            .unwrap();
+        assert_eq!(storage.search("正文").unwrap(), vec!["book/1"]);
+        assert_eq!(storage.schema_version().unwrap(), SchemaVersion::CURRENT);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
