@@ -1,167 +1,87 @@
 # AGENTS.md — ILP-rs
 
-## 项目目标
+## 项目定位
 
-用 Rust 重写 [ILP-Cpp](https://github.com/RhenCloud/ILP-Cpp)：一个模块化、支持多网站的小说下载器 CLI。原版 C++ 源码是唯一蓝图，动手前先读原仓库与 [ILP-Docs](https://github.com/RhenCloud/ILP-Docs)（插件开发文档在 `src/zh/dev/plugins/`）。
+Rust 2021 小说下载器，站点能力通过 Wasmtime WebAssembly 插件提供。插件仓库为 `ILP-Project/plugins`；本仓库提供宿主、共享类型和 WIT ABI。
 
-## 已锁定决策（勿改）
+完整路线图在仓库外：`/home/rhencloud/Project/ILP-Project/plan/2026-10-29_roadmap.md`。
 
-- **插件机制：WASM + wasmtime**（不是 native cdylib/libloading）。插件产物是 `.wasm`。
-- **范围：仅功能对齐，可重构存储**。`config.json`、旧 `cache.db` schema、`txt` 分章 + `covers/` 目录布局均无需兼容旧版数据。
-- **任务状态用 JSON manifest，不引入数据库**（旧计划里的 SQLite 方案已废）。
-- **插件安装按 registry 名 + 版本**：`ilp plugin install <name>[@<version>]`，
-  默认 registry `https://ilp.elysola.org`。`owner/repo` 形式已废。
-- **输出只做中文**，但用户可见字符串集中管理。
+## 必须遵守
 
-> 完整路线图和 106 项设计决策见 `ILP-Project/plan/2026-10-29_roadmap.md`
-> （**在仓库之外**，不进 git tree）。本文只保留实现时必须知道的事实。
+- 插件只能通过宿主访问网络、存储、secret 和时间；不能自行发 HTTP 或读写文件。
+- 宿主策略是安全边界；registry 的权限和域名字段只是声明。
+- 安装前验证 ABI、版本范围、大小、SHA-256、签名和元数据。
+- 签名覆盖原始字节；插件签名和 registry 签名分开验证。
+- DNS rebinding 防护必须校验所有解析地址；代理场景要求敏感域名使用 `no_proxy`。
+- 测试不得访问真实网络；使用 wiremock、fixture 或 replay。
+- fixture 必须脱敏，不得包含 Cookie、token、密码、设备 ID 或密钥。
+- 不提交 `target/`、密钥、真实凭据或未脱敏日志。
+- 提交 subject 和 body 均使用英文。使用 `git commit -F <file>` 编写复杂消息。
+- 提交前使用作者：`RhenCloud <rhencloud@users.noreply.github.com>`。
+- 用户可见文本和代码注释使用简体中文；字符串集中在 `crates/ilp-host/src/messages.rs`。
 
-## WASM 插件模型的关键含义（易被忽略）
+## CLI
 
-- 插件是沙箱，不能直接发 HTTP、读写文件、用 SQLite。这些能力必须由宿主通过 WASI 或自定义 host function（imports）注入。
-- 因此网络请求、`sleep_time` 限速、`max_workers` 并发、进度判断（跳过已下载）、章节落盘等逻辑应**收敛到宿主**，而非像原版那样由 IPlugin 基类 + 各插件各自用 cpr 发请求。
-- 插件安装：`.wasm` 跨平台，单一产物 URL；安装走静态 registry + ABI 预检 + size/sha256 校验。
-- **权限声明在 WIT `plugin-metadata` 里，registry 不参与**。真正安全边界是宿主在
-  每个 host function 调用点的策略检查，不是插件自己的声明。
-- 但 registry 会**展示**权限，所以两份声明必须一致，否则用户看到的是假信息。
-  于是有两道核对：发布侧 `plugin.toml` 的 `permissions`/`allowed_domains` 由
-  插件自己的 `manifest_matches_metadata` 测试锁死在 `metadata()` 上（`cargo test`
-  即门禁）；安装侧宿主把 registry 那份与 WASM 实际声明逐项比对，
-  **WASM 多申请一项就拒绝安装**（信息隐瞒），registry 多写只告警（文档过错）。
-- 出口的 SSRF 防线必须覆盖**解析结果**，不能只看 URL 里的主机名：主机名可以解析成公网
-  IP 骗过检查后再改指向 `127.0.0.1`（DNS rebinding）。宿主自己解析、逐条校验，
-  再把地址钉给 reqwest。
-- 签名有**两层，缺一不可**：产物签名证明"代码是谁写的"，元数据签名证明"这个名字
-  该指向哪段代码"。只签产物时，攻击者不必伪造签名就能把 `latest` 指到一份有效
-  签名但有漏洞的旧版本。签名对象一律取**原始字节**，不要重新序列化 JSON 再签——
-  规范化差异会让验签静默失效。
-- 录制/回放是**宿主 HTTP 层**的能力，不是插件能力。插件拿不到“现在是不是回放”
-  的信息，否则它会根据环境改行为，测试就失去意义。回放未命中必须报错，
-  不能回退到真实网络。
-
-## 需对齐的 CLI 与行为
-
-子命令（原版 CLI11 结构）：
-
-- `get chapter|cover|author|all <id> -s <site_id> [-f/--force_update]`
-- `update <id> -s <site_id> [--apply]`（默认 dry-run，先报告新增章节）
-- `search <keyword> -s <site_id>`（分页交互：`n` 翻页 / 数字跳转 / `q` 退出）
-- 全局 `--jsonl` 输出结构化事件流；`--verbose` 提升日志级别
-- `plugin list|info|install <name>[@<version>]|uninstall|enable|disable <name>`
-- `version`
-
-`-s/--site_id` 需校验是否为已加载插件的 `site_id`（原版 `CLI::IsMember(site_ids)`）。
-
-宿主侧内容模型为 `ChapterResult`，保留 `ok`、`locked`、`captcha`、`auth-required`、
-`not-found`、`invalid`、`error` 状态及错误分类；只有成功且有正文的结果才写入文件。
-统一导出通过 `Exporter` trait，目前默认实现是保持既有格式的 `TxtExporter`。
-
-用户可见字符串集中在 `crates/ilp-host/src/messages.rs`，当前语言为中文，为未来 i18n
-保留替换边界。
-
-## 插件接口（等价 trait）
-
-元数据：`site_name` / `site_id` / `site_domain` / `plugin_name` / `plugin_id` / `version`。
-方法：`init(id, force_update)`、`getContent(force_update)`（目录抓取 + 缓存）、`getTitle` / `getAuthor` / `getCover`、`fetchAllChapter`（并发 + 跳过已下载）、`search(keyword)`、`parseChapter`（HTML/JSON → 纯文本）。
-
-章节目录条目字段：`id`、`title`、`url`（阅读页）、`fetch_url`（内容 API，`fetchOneChapter` 用它）、
-`update_time`（Unix 时间戳）、`order_key`（可选的稳定文档顺序键）。宿主拒绝重复的章节 ID
-和非空 `order_key`，避免统一文档模型出现歧义。ABI 0.1 没有 `order_key` 时保留原目录顺序。
-
-## 原版依赖 → Rust 建议（非强制）
-
-`cpr`→`reqwest` · `fmt`→`println!` · `nlohmann/json`→`serde`/`serde_json` · `SQLiteCpp`→`rusqlite` · `CLI11`→`clap`。
-
-## 工程结构
-
-- `crates/ilp-types`：共享 serde 类型（`PluginMetadata` / `ChapterEntry` / `SearchResult` / `ParseInput`）。
-- `crates/ilp-host`：宿主二进制 `ilp`（clap CLI、config、storage、http、wasmtime loader、plugin manager）。
-- `crates/ilp-plugin-wit`：插件 ABI（`wit/plugin.wit`），宿主与插件共享的唯一来源。
-- 站点插件在独立的 `ILP-Project/plugins` 仓库（一站点一子目录），不在本仓库。
-
-## 命令
-
-- 宿主：`cargo build` / `cargo run -- <args>`
-- 插件（在 `ILP-Project/plugins` 仓库里，需先 `rustup target add wasm32-wasip2`）：
-  `cargo build --target wasm32-wasip2 --release`
-  产物 `target/wasm32-wasip2/release/ilp_plugin_fanqie.wasm` 复制到宿主的 `plugins/` 下。
-- `cargo test`、`cargo clippy --all-targets -- -D warnings`、`cargo fmt --check`
-
-## 番茄协议链（已端到端跑通，勿重新试错）
-
-```
-① 设备注册  POST i.snssdk.com/service/2/device_register/?tt_data=a
-   body = TT加密(JSON)，header: tt-data=a, UA: okhttp/4.10.0
-   TT加密 = magic[116,99,5,16,0,0] ‖ rand32 ‖ AES-128-CBC(
-                key=sha512(sha512(rand32)‖FIXED)[0..16],
-                iv =sha512(sha512(rand32)‖FIXED)[16..32],
-                sha512(gzip(json)) ‖ gzip(json))
-   → device_id / install_id / device_token
-
-② 密钥注册  POST reading.snssdk.com/reading/crypt/registerkey
-   明文 = reverse(device_id 大端16字节)[0..8]
-   body = gzip(JSON{content: b64(iv16 ‖ AES-256-CBC(shared_key, iv, 明文))})
-   需 x-argus + x-ladon + x-khronos + x-ss-req-ticket + X-SS-STUB(md5(body))
-   → key(16B 实测) / keyver
-
-③ 正文  GET reading.snssdk.com/reading/reader/{full,batch_full}/v
-   data.content = b64(iv16 ‖ AES-128-CBC(key, iv, 密文))
-   compress_status==1 → gunzip → XHTML 或 JSON
+```text
+ilp get chapter|cover|author|title|all <id> -s <site_id> [-f]
+ilp update <id> -s <site_id> [--apply]
+ilp search <keyword> -s <site_id>
+ilp plugin list|info|install|uninstall|enable|disable ...
+ilp plugin new <name> [--site-name ..] [--domain ..]
+ilp doctor [--bundle <path>] [--with-manifest] [-y]
+ilp --jsonl <command>
+ilp --verbose <command>
 ```
 
-`FIXED` 盐值（base64）：
-`TdTC5rgxYgkOUrPHpnM7pByyRiuCmrWKGWs521cXdST0m69/COjWjSanLjfBqVovHwWlGJKu8pSXMrYqOKrdWA==`
+`update` 默认 dry-run。`--jsonl` 只输出结构化事件；`--verbose` 提高日志级别。TTY 显示即时进度，非 TTY 不阻塞交互。
 
-**四处反直觉的坑（都是实测打脸的）**：
+## 代码结构
 
-- 正文密钥是 **16 字节 AES-128**，不是 32 字节 AES-256。
-- `FIXED` 抄错两个字节，服务端**静默**回 `device_id=0`（HTTP 仍 200）。
-- 设备上报缺 `ipv6_list` 即被拒，同样是 200 + `device_id=0`。
-- `now_ms` 必须是 UTC epoch 毫秒，不能用单调时钟。
+- `crates/ilp-host`：CLI、HTTP、存储、WASM 加载器、插件管理、诊断、导出器。
+- `crates/ilp-types`：共享 serde 类型、`ChapterResult`、章节顺序校验。
+- `crates/ilp-plugin-wit`：WIT ABI，支持 `0.1.0` 与 `0.2.0`。
+- `scripts`：签名安装器和离线安装测试。
+- `.github/workflows`：CI 与 Release 构建。
 
-**限流实测**：背靠背连发只回 1 章；间隔 ≥3 s 回满 30 章。351 章 = 12 批 ≈ 36 秒。
-服务端触发限流时会**静默少返回章节**（一批 30 章只回 29 章不报错），
-必须检测缺失并逐章单章重试，否则产出带洞的书。
+ABI 0.2 的章节目录包含 `order_key`。宿主拒绝重复章节 ID 和非空重复 `order_key`；ABI 0.1 使用原目录顺序。章节结果失败状态不会被静默丢弃，只有成功且有正文时才落盘。导出通过 `Exporter` trait，默认实现为 `TxtExporter`。
 
-**正文通道唯一性**：网页阅读页已被风控整体封掉（返回验证码中间页），
-与并发/UA/Referer 无关；APP 网关是唯一可用正文通道。目录 API 与书籍页仍免签名可用。
+## 开发与验证
 
-**搜索响应结构**：书籍列表不在 `data.search_tab_data`，而在顶层 `search_tabs`
-数组中 `tab_type == 3` 的那个 tab，条目正文在 `book_data[0]`，分页凭据是该 tab
-自己的 `passback` / `search_id`。
+```bash
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo test --workspace
+cargo build --release
+scripts/install_test.sh
+```
 
-**字体码表**：区间 `0xe3e8`(58344) .. `0xe55b`(58715)，共 372 码点，`?` 表示空位。
-静态码表（非轮廓匹配）；长度不符时宁可不解密，直接返回原文。
+插件必须使用：
 
-**代理**：`https_proxy` 会让 `i.snssdk.com` TLS RST/EOF，必须直连。
+```bash
+cargo build --target wasm32-wasip2 --release
+```
 
-## 原版已知问题（重写时规避）
+生成器验证：
 
-- 翻页：search 交互里 `page++` 双重递增导致跳页错位；重写注意翻页/跳转逻辑。
-- 标题未清洗：原版用 `title` 直接作目录名/文件名/SQLite 表名 → Windows 非法字符崩溃 + SQL 注入。重写时对标题 sanitize，DB 表名改用固定 schema + id。
-- 续传误判：只看文件是否存在，写一半崩溃被永久跳过；落盘用「临时文件 + rename」原子写，或写入后校验完整性。
-- HTTP 全裸：无超时/重试/状态码检查/UA（`RandomUserAgent` 写了从未用）。收敛到宿主后统一加超时、重试、UA。
-- 并发：`TaskManager` 每章 `std::async` 一个线程且无上限，`sleep_time` 在任务完成后仍占并发槽；宿主改用有界 worker + 信号量限速。
-- 配置：值存字符串反复 `stoi`，缺失即抛异常崩溃；改为类型化配置一次解析。
-- fanqie 重复请求 `detail` API（`getTitle`/`getCover`/`getContent` 各拉一次）；加缓存。
-- HTML 用正则 `(<.*?>)+` 解析脆弱；用 html5ever/scraper，JSON 用 serde。
-- 无日志：`logs_folder` 配了但 Logger 被注释；补 tracing。
-- 插件安装无校验：不查下载状态/大小、`source` 未校验、`refs/heads/main` 硬编码。
-- 一个坏插件拖垮启动（`loadPlugin` 抛异常不捕获）；单个插件加载失败应隔离降级。
-- 原生插件加载 = 任意代码执行；WASM 沙箱天然解决（这是选 wasmtime 的额外收益）。
+```bash
+ilp plugin new example --site-name '示例站' --domain example.com
+cargo fmt --check
+cargo clippy --target wasm32-wasip2 -- -D warnings
+cargo build --target wasm32-wasip2 --release
+```
 
-## 约定
+## 分发与签名
 
-- CLI 用户交互字符串与注释用中文；代码不加多余注释（见全局 AGENTS.md）。
-- 依赖/开发环境优先 Nix flake devShell。
-- **不要提交 `target/`。** 曾经有一次 `plugins/template` 开发时把整个构建目录
-  提交进去（873 MB 的 `.so`），事后只能改写历史清掉：仓库 293 MB → 572 KB。
-  `.gitignore` 已覆盖，但新目录别忘了检查。
-- 改写历史会让 **tag 指向的提交哈希全变**。插件仓库通过
-  `ilp-plugin-wit = { git = ..., tag = "abi-v0.2.0" }` 拉依赖，所以 tag 必须
-  一起重推（annotated tag 要先删远端再推）。改写后务必用干净的
-  `cargo build --target wasm32-wasip2 --release`（不带本地 patch）验证一次。
+默认 registry：`https://ilp.elysola.org`。发布的 WASM 和 Release 二进制都必须验证大小、SHA-256 和 Ed25519 签名。registry 元数据签名为旁路文件 `registry.json.sig`，签名对象是 `registry.json` 原始字节。
 
-## 参考
+发布版本不可变。WASM 使用 `cargo build --target wasm32-wasip2 --release`。不要把本地 path 依赖或 `target/` 带入发布物。
 
-- 插件示例：[FanqiePlugin](https://github.com/RhenCloud/FanqiePlugin)（fanqienovel.com）、[plugin-template](https://github.com/RhenCloud/plugin-template)
+## 历史兼容
+
+ABI tag 或历史提交被重写后，必须重新推送 tag，并用干净环境验证插件构建。消费者需要：
+
+```bash
+git fetch --tags --force
+```
+
+不要恢复已移除的构建产物或旧版原生插件加载方式。
