@@ -8,7 +8,7 @@ name = "ilp"
 path = "src/main.rs"
 
 [dependencies]
-ilp-types = { path = "../ilp-types" }
+ilp-types = { version = "0.1.0", path = "../ilp-types" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
