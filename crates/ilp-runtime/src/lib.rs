@@ -158,6 +158,16 @@ impl HostCapabilities {
             allow_secrets: false,
         }
     }
+
+    pub fn can_use(&self, permission: &str) -> bool {
+        match permission {
+            "http" => self.allow_http,
+            "storage-read" | "storage-write" => self.allow_storage,
+            "secret-read" | "secret-write" => self.allow_secrets,
+            "clock" => true,
+            _ => false,
+        }
+    }
 }
 
 pub fn load_component(wasm: &[u8]) -> std::result::Result<Component, RuntimeError> {
@@ -308,6 +318,15 @@ mod tests {
         assert!(validate_abi("0.1.0").is_ok());
         assert!(validate_abi(CURRENT_ABI).is_ok());
         assert!(validate_abi("9.9.9").is_err());
+    }
+
+    #[test]
+    fn capability_mapping_is_default_deny() {
+        let capabilities = HostCapabilities::from_policy(&CapabilityPolicy::deny_all());
+        assert!(!capabilities.can_use("http"));
+        assert!(!capabilities.can_use("storage-read"));
+        assert!(!capabilities.can_use("secret-read"));
+        assert!(capabilities.can_use("clock"));
     }
 
     #[test]
