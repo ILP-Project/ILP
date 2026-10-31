@@ -133,6 +133,42 @@ impl SqliteStorage {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn append_event(&self, kind: &str, payload: &str) -> Result<u64> {
+        let sequence = self.next_event_sequence()?;
+        self.db.execute(
+            "INSERT INTO events (sequence, kind, payload, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![sequence as i64, kind, payload, unix_seconds()?],
+        )?;
+        Ok(sequence)
+    }
+
+    pub fn events_after(&self, sequence: u64, limit: u32) -> Result<Vec<(u64, String, String)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT sequence, kind, payload FROM events WHERE sequence > ?1 ORDER BY sequence LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![sequence as i64, limit], |row| {
+            Ok((row.get::<_, i64>(0)? as u64, row.get(1)?, row.get(2)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn oldest_event_sequence(&self) -> Result<Option<u64>> {
+        self.db
+            .query_row("SELECT MIN(sequence) FROM events", [], |row| {
+                row.get::<_, Option<i64>>(0)
+            })
+            .map(|value| value.map(|sequence| sequence as u64))
+            .map_err(Into::into)
+    }
+
+    pub fn prune_events(&self, keep: u64) -> Result<usize> {
+        let removed = self.db.execute(
+            "DELETE FROM events WHERE sequence < (SELECT COALESCE(MAX(sequence), 0) - ?1 FROM events)",
+            [keep as i64],
+        )?;
+        Ok(removed)
+    }
+
     pub fn next_event_sequence(&self) -> Result<u64> {
         let tx = self.db.unchecked_transaction()?;
         tx.execute(
@@ -309,8 +345,18 @@ fn migrate(db: &Connection) -> Result<()> {
              id INTEGER PRIMARY KEY CHECK (id = 1),
              next_sequence INTEGER NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS events (
+             sequence INTEGER PRIMARY KEY NOT NULL,
+             kind TEXT NOT NULL,
+             payload TEXT NOT NULL,
+             created_at INTEGER NOT NULL
+         );
          CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
              book_id UNINDEXED, title, author, chapter_title, body
+         );
+         CREATE TABLE IF NOT EXISTS events (
+             sequence INTEGER PRIMARY KEY NOT NULL, kind TEXT NOT NULL,
+             payload TEXT NOT NULL, created_at INTEGER NOT NULL
          );",
     )?;
     transaction.execute(
