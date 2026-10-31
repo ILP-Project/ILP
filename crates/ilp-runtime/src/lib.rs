@@ -7,7 +7,7 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use wasmtime::component::Component;
 use wasmtime::{
@@ -183,6 +183,86 @@ pub trait StorageBackend: Send + Sync {
 
 pub trait HttpBackend: Send + Sync {
     fn fetch(&self, url: &str, body: &[u8]) -> Result<Vec<u8>>;
+}
+
+pub struct RuntimeHost {
+    pub policy: CapabilityPolicy,
+    pub capabilities: HostCapabilities,
+    pub storage: Option<Arc<dyn StorageBackend>>,
+    pub secrets: Option<Arc<dyn SecretBackend>>,
+    pub http: Option<Arc<dyn HttpBackend>>,
+}
+
+impl RuntimeHost {
+    pub fn new(policy: CapabilityPolicy) -> Self {
+        let capabilities = HostCapabilities::from_policy(&policy);
+        Self {
+            policy,
+            capabilities,
+            storage: None,
+            secrets: None,
+            http: None,
+        }
+    }
+
+    pub fn with_storage(mut self, storage: Arc<dyn StorageBackend>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    pub fn with_secret_backend(mut self, secrets: Arc<dyn SecretBackend>) -> Self {
+        self.secrets = Some(secrets);
+        self
+    }
+
+    pub fn with_http_backend(mut self, http: Arc<dyn HttpBackend>) -> Self {
+        self.http = Some(http);
+        self
+    }
+
+    pub fn fetch(&mut self, url: &str, body: &[u8]) -> std::result::Result<Vec<u8>, RuntimeError> {
+        validate_http_request(&self.policy, &mut self.capabilities, url)?;
+        let backend = self
+            .http
+            .as_ref()
+            .ok_or_else(|| RuntimeError::ExecutionFailed("HTTP backend 未配置".into()))?;
+        let response = backend
+            .fetch(url, body)
+            .map_err(|error| RuntimeError::ExecutionFailed(error.to_string()))?;
+        if response.len() as u64 > self.policy.limits.max_response_bytes {
+            return Err(RuntimeError::ResourceLimit("插件响应超过大小限制".into()));
+        }
+        Ok(response)
+    }
+
+    pub fn storage_get(&self, key: &str) -> std::result::Result<Option<Vec<u8>>, RuntimeError> {
+        if !self.capabilities.can_use("storage-read") {
+            return Err(RuntimeError::PermissionDenied(
+                "插件未获存储读取权限".into(),
+            ));
+        }
+        self.storage
+            .as_ref()
+            .ok_or_else(|| RuntimeError::ExecutionFailed("storage backend 未配置".into()))?
+            .get(key)
+            .map_err(|e| RuntimeError::ExecutionFailed(e.to_string()))
+    }
+
+    pub fn storage_set(&self, key: &str, value: &[u8]) -> std::result::Result<(), RuntimeError> {
+        if !self.capabilities.can_use("storage-write") {
+            return Err(RuntimeError::PermissionDenied(
+                "插件未获存储写入权限".into(),
+            ));
+        }
+        if value.len() as u64 > self.policy.limits.max_response_bytes {
+            return Err(RuntimeError::ResourceLimit("插件存储值超过大小限制".into()));
+        }
+        self.storage
+            .as_ref()
+            .ok_or_else(|| RuntimeError::ExecutionFailed("storage backend 未配置".into()))?
+            .set(key, value)
+            .map_err(|e| RuntimeError::ExecutionFailed(e.to_string()))
+    }
 }
 
 pub fn validate_http_request(
@@ -486,6 +566,29 @@ mod tests {
         assert!(
             validate_http_request(&policy, &mut capabilities, "https://other.example/a").is_err()
         );
+    }
+
+    struct EchoHttp;
+
+    impl HttpBackend for EchoHttp {
+        fn fetch(&self, _url: &str, body: &[u8]) -> Result<Vec<u8>> {
+            Ok(body.to_vec())
+        }
+    }
+
+    #[test]
+    fn runtime_host_enforces_http_and_storage_boundaries() {
+        let root = std::env::temp_dir().join(format!("ilp-runtime-host-{}", std::process::id()));
+        let storage = Arc::new(FileStorageBackend::new(root.clone()).unwrap());
+        let mut policy = CapabilityPolicy::deny_all().allow_domain("example.com");
+        policy.allow_storage = true;
+        let mut host = RuntimeHost::new(policy)
+            .with_storage(storage)
+            .with_http_backend(Arc::new(EchoHttp));
+        assert_eq!(host.fetch("https://example.com", b"ok").unwrap(), b"ok");
+        host.storage_set("key", b"value").unwrap();
+        assert_eq!(host.storage_get("key").unwrap(), Some(b"value".to_vec()));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
