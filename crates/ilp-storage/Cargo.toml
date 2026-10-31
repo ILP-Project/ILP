@@ -1,0 +1,14 @@
+[package]
+name = "ilp-storage"
+version = "0.1.0"
+edition = "2021"
+description = "ILP 核心持久化、文件存储和迁移接口"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+ilp-types = { version = "0.1.0", path = "../ilp-types" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+sha2 = "0.10"

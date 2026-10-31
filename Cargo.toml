@@ -3,11 +3,17 @@ resolver = "2"
 members = [
     "crates/ilp-types",
     "crates/ilp-plugin-wit",
+    "crates/ilp-storage",
+    "crates/ilp-runtime",
+    "crates/ilp-core",
     "crates/ilp-host",
 ]
 default-members = [
     "crates/ilp-types",
     "crates/ilp-plugin-wit",
+    "crates/ilp-storage",
+    "crates/ilp-runtime",
+    "crates/ilp-core",
     "crates/ilp-host",
 ]
 exclude = ["plugins/template"]

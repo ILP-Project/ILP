@@ -1,0 +1,251 @@
+//! ILP 核心持久化边界。
+//!
+//! 该 crate 只负责稳定的数据存储协议和迁移入口；上层通过此边界访问
+//! SQLite、正文文件和搜索索引，不应直接依赖具体数据库实现。
+
+use anyhow::{anyhow, Result};
+use ilp_types::{ChapterEntry, PluginMetadata};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoragePaths {
+    pub data_dir: PathBuf,
+    pub database: PathBuf,
+    pub content_dir: PathBuf,
+    pub covers_dir: PathBuf,
+    pub plugins_dir: PathBuf,
+}
+
+impl StoragePaths {
+    pub fn new(data_dir: impl Into<PathBuf>) -> Self {
+        let data_dir = data_dir.into();
+        Self {
+            database: data_dir.join("library.db"),
+            content_dir: data_dir.join("content"),
+            covers_dir: data_dir.join("covers"),
+            plugins_dir: data_dir.join("plugins"),
+            data_dir,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.data_dir.as_os_str().is_empty()
+            || self.data_dir.is_absolute() && self.data_dir == Path::new("/")
+        {
+            return Err(anyhow!("数据目录无效"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SchemaVersion {
+    pub major: u32,
+    pub minor: u32,
+}
+
+impl SchemaVersion {
+    pub const CURRENT: Self = Self { major: 1, minor: 0 };
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredBook {
+    pub id: String,
+    pub title: String,
+    pub author: String,
+    pub source_type: String,
+    pub source_id: String,
+    pub authorized: bool,
+    pub chapters: Vec<ChapterEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredPlugin {
+    pub metadata: PluginMetadata,
+    pub content_hash: String,
+    pub signature_key_id: Option<String>,
+    pub source: String,
+    pub trusted_at: Option<String>,
+}
+
+pub trait LibraryStorage: Send + Sync {
+    fn schema_version(&self) -> Result<SchemaVersion>;
+    fn save_book(&self, book: &StoredBook) -> Result<()>;
+    fn load_book(&self, id: &str) -> Result<Option<StoredBook>>;
+}
+
+/// SQLite-backed storage used by Core. Files are written atomically and their
+/// digest is recorded alongside the metadata so interrupted writes are never
+/// mistaken for completed chapters.
+pub struct SqliteStorage {
+    db: Connection,
+    paths: StoragePaths,
+}
+
+impl SqliteStorage {
+    pub fn open(paths: StoragePaths) -> Result<Self> {
+        paths.validate()?;
+        std::fs::create_dir_all(&paths.data_dir)?;
+        std::fs::create_dir_all(&paths.content_dir)?;
+        std::fs::create_dir_all(&paths.covers_dir)?;
+        std::fs::create_dir_all(&paths.plugins_dir)?;
+        let db = Connection::open(&paths.database)?;
+        db.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             CREATE TABLE IF NOT EXISTS schema_meta (
+                 key TEXT PRIMARY KEY NOT NULL,
+                 value TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS books (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 title TEXT NOT NULL,
+                 author TEXT NOT NULL,
+                 source_type TEXT NOT NULL,
+                 source_id TEXT NOT NULL,
+                 authorized INTEGER NOT NULL,
+                 chapters TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS chapter_files (
+                 book_id TEXT NOT NULL,
+                 chapter_id TEXT NOT NULL,
+                 path TEXT NOT NULL,
+                 bytes INTEGER NOT NULL,
+                 sha256 TEXT NOT NULL,
+                 PRIMARY KEY (book_id, chapter_id)
+             );",
+        )?;
+        db.execute(
+            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [format!(
+                "{}.{}",
+                SchemaVersion::CURRENT.major,
+                SchemaVersion::CURRENT.minor
+            )],
+        )?;
+        Ok(Self { db, paths })
+    }
+
+    pub fn paths(&self) -> &StoragePaths {
+        &self.paths
+    }
+
+    pub fn save_chapter(&self, book_id: &str, chapter_id: &str, content: &[u8]) -> Result<PathBuf> {
+        let safe_book = sanitize_component(book_id);
+        let safe_chapter = sanitize_component(chapter_id);
+        let dir = self.paths.content_dir.join(&safe_book);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{safe_chapter}.txt"));
+        atomic_write(&path, content)?;
+        let digest = format!("{:x}", Sha256::digest(content));
+        self.db.execute(
+            "INSERT INTO chapter_files (book_id, chapter_id, path, bytes, sha256)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(book_id, chapter_id) DO UPDATE SET
+                 path=excluded.path, bytes=excluded.bytes, sha256=excluded.sha256",
+            params![
+                book_id,
+                chapter_id,
+                path.to_string_lossy(),
+                content.len() as i64,
+                digest
+            ],
+        )?;
+        Ok(path)
+    }
+
+    pub fn read_chapter(&self, book_id: &str, chapter_id: &str) -> Result<Option<Vec<u8>>> {
+        let row = self.db.query_row(
+            "SELECT path, bytes, sha256 FROM chapter_files WHERE book_id = ?1 AND chapter_id = ?2",
+            params![book_id, chapter_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64, row.get::<_, String>(2)?)),
+        ).optional()?;
+        let Some((path, bytes, expected)) = row else {
+            return Ok(None);
+        };
+        let data = std::fs::read(&path)?;
+        if data.len() as u64 != bytes || format!("{:x}", Sha256::digest(&data)) != expected {
+            return Err(anyhow!("章节文件校验失败: {path}"));
+        }
+        Ok(Some(data))
+    }
+
+    pub fn schema_version(&self) -> Result<SchemaVersion> {
+        let value: String = self.db.query_row(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        let (major, minor) = value
+            .split_once('.')
+            .ok_or_else(|| anyhow!("schema 版本无效"))?;
+        Ok(SchemaVersion {
+            major: major.parse()?,
+            minor: minor.parse()?,
+        })
+    }
+}
+
+fn sanitize_component(value: &str) -> String {
+    let value: String = value
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '/' | '\\' | ':' | '*') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = value.trim_matches(['.', ' ']);
+    if trimmed.is_empty() {
+        "untitled".into()
+    } else {
+        trimmed.into()
+    }
+}
+
+fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| anyhow!("文件路径没有父目录"))?;
+    std::fs::create_dir_all(parent)?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        nanos
+    ));
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_paths_are_deterministic() {
+        let paths = StoragePaths::new("data");
+        assert_eq!(paths.database, PathBuf::from("data/library.db"));
+        assert_eq!(paths.content_dir, PathBuf::from("data/content"));
+    }
+
+    #[test]
+    fn current_schema_is_explicit() {
+        assert_eq!(SchemaVersion::CURRENT, SchemaVersion { major: 1, minor: 0 });
+    }
+}

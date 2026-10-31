@@ -1377,6 +1377,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ilp-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ilp-runtime",
+ "ilp-storage",
+ "ilp-types",
+ "serde",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
 name = "ilp-host"
 version = "0.2.0"
 dependencies = [
@@ -1408,6 +1421,27 @@ name = "ilp-plugin-wit"
 version = "0.2.0"
 dependencies = [
  "wit-bindgen",
+]
+
+[[package]]
+name = "ilp-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ilp-types",
+ "serde",
+]
+
+[[package]]
+name = "ilp-storage"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ilp-types",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -2939,7 +2973,9 @@ version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f053576934f05a761a402421fbbe3d425d9366f75f978806a037b3ca481abecc"
 dependencies = [
+ "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 
