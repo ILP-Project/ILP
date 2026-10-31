@@ -30,6 +30,25 @@ fn wasm_path() -> PathBuf {
 }
 
 /// 拿到已构建的插件；未构建则返回 None 让调用方跳过。
+fn fixture_wasm(variable: &str, version: &str) -> Option<PathBuf> {
+    let path = std::env::var_os(variable)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures")
+                .join(format!("component-{version}/target/wasm32-wasip2/release/ilp_fixture_component_{version}.wasm"))
+        });
+    if path.exists() {
+        Some(path)
+    } else {
+        eprintln!(
+            "跳过 Component fixture {version}：未找到 {}；请先按 fixtures/README.md 构建",
+            path.display()
+        );
+        None
+    }
+}
+
 fn plugin_wasm() -> Option<PathBuf> {
     let path = wasm_path();
     if path.exists() {
@@ -41,6 +60,32 @@ fn plugin_wasm() -> Option<PathBuf> {
         );
         None
     }
+}
+
+#[test]
+fn component_v1_fixture_loads_and_reports_metadata() {
+    let Some(path) = fixture_wasm("ILP_V1_FIXTURE", "v1") else {
+        return;
+    };
+    let storage = tmp_storage("fixture_v1");
+    let plugin = crate::engine::PluginInstance::load(&path, &storage).expect("v1 fixture 应能加载");
+    assert_eq!(plugin.metadata.abi_version, "0.1.0");
+    assert_eq!(plugin.metadata.site_id, "fixture-v1");
+    let _ = std::fs::remove_dir_all(storage);
+}
+
+#[test]
+fn component_v2_fixture_loads_and_reports_declared_permissions() {
+    let Some(path) = fixture_wasm("ILP_V2_FIXTURE", "v2") else {
+        return;
+    };
+    let storage = tmp_storage("fixture_v2");
+    let plugin = crate::engine::PluginInstance::load(&path, &storage).expect("v2 fixture 应能加载");
+    assert_eq!(plugin.metadata.abi_version, "0.2.0");
+    assert_eq!(plugin.metadata.site_id, "fixture-v2");
+    assert_eq!(plugin.metadata.permissions, ["http", "clock"]);
+    assert_eq!(plugin.metadata.allowed_domains, ["fixture.example.com"]);
+    let _ = std::fs::remove_dir_all(storage);
 }
 
 fn tmp_storage(tag: &str) -> PathBuf {
