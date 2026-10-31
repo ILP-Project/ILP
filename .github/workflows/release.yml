@@ -1,18 +1,8 @@
 name: release
 
-# 打 tag 时构建各平台二进制，签名后上传到 GitHub Releases。
-#
-# 为什么用 musl 静态链接而不是默认的 gnu：glibc 版本地狱是分发二进制最常见的
-# 故障——在 ubuntu-24.04 上构建的产物在新一点的发行版能跑，在稍旧的
-# （glibc 2.31 的 Debian 11、Ubuntu 20.04）上直接 "GLIBC_2.38 not found"。
-# musl 静态链接把 libc 一起带上，一个二进制在几乎所有 Linux 上都能跑。
-#
-# macOS 的 Intel/ARM 各自构建而不是交叉编译：rustls 和 ring 都带汇编，
-# 交叉编译需要额外配置，直接各跑一次 runner 更省心也不容易出错。
-
 on:
   push:
-    tags: ["v*"]
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -40,58 +30,38 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-14
             name: macos-aarch64
-
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
-
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
-
-      # musl 静态链接需要 musl 版 C 编译器：libsqlite3-sys 要编译 SQLite 的
-      # C 源码，用 gnu 的 gcc 会把它链到 glibc 上，产出"看着静态、实际依赖
-      # glibc"的二进制——那种产物在旧发行版上照样跑不起来。
-      - name: 安装 musl 工具链
+          key: release-${{ matrix.target }}
+      - name: Install musl toolchain
         if: contains(matrix.target, 'musl')
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y musl-tools
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-            # musl 官方维护的交叉工具链，aarch64-linux-musl-gcc 自带
-            # musl 的 libc 头与库，cc crate 会自动选用它。
-            sudo apt-get install -y musl-dev
-            curl -sSfL -o /tmp/musl-cross.tgz \
-              https://musl.cc/aarch64-linux-musl-cross.tgz
-            sudo tar -xzf /tmp/musl-cross.tgz -C /opt
-            echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          if [ '${{ matrix.target }}' = 'aarch64-unknown-linux-musl' ]; then
+            curl -fsSL https://musl.cc/aarch64-linux-musl-cross.tgz -o /tmp/musl.tgz
+            sudo tar -xzf /tmp/musl.tgz -C /opt
+            echo /opt/aarch64-linux-musl-cross/bin >> "$GITHUB_PATH"
           fi
-
-      - name: 添加目标
-        run: rustup target add ${{ matrix.target }}
-
-      - name: 构建
+      - run: rustup target add ${{ matrix.target }}
+      - name: Build
         env:
-          # 必须指向 musl 的交叉编译器，不是 gnu 的。写错就会产出
-          # 依赖 glibc 的伪静态二进制。
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
           CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
           AR_aarch64_unknown_linux_musl: aarch64-linux-musl-ar
         run: cargo build --release --locked --target ${{ matrix.target }}
-
-      - name: 打包
+      - name: Package
         run: |
           set -euo pipefail
-          bin=target/${{ matrix.target }}/release/ilp
-          out=ilp-${{ github.ref_name }}-${{ matrix.name }}
-          # 只发二进制本体，附加 LICENSE 与 README 摘要。
-          # 不打整棵源码树：用户要的是能跑的命令，不是另一个 tar 包。
-          install -m 755 "$bin" ilp
-          tar -czf "$out.tar.gz" ilp LICENSE README.md
-          rm -f ilp
-          sha256sum "$out.tar.gz" > "$out.tar.gz.sha256"
-
+          archive=ilp-${{ github.ref_name }}-${{ matrix.name }}
+          install -Dm755 target/${{ matrix.target }}/release/ilp ilp
+          tar -czf "$archive.tar.gz" ilp LICENSE README.md
+          rm ilp
+          sha256sum "$archive.tar.gz" > "$archive.tar.gz.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
@@ -99,66 +69,51 @@ jobs:
             *.tar.gz
             *.tar.gz.sha256
 
-  release:
+  publish:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-
-      - name: 汇总校验和
+      - name: Create checksum manifest
+        working-directory: dist
         run: |
           set -euo pipefail
-          cd dist
-          # 各平台各自的 .sha256 合成一份，安装脚本直接照这份核对。
           cat *.tar.gz.sha256 > SHA256SUMS
-          rm -f *.tar.gz.sha256
-          ls -la
-
-      - name: 签名校验和
+          rm *.tar.gz.sha256
+      - name: Sign checksum manifest
+        working-directory: dist
         env:
-          # 与插件发布共用同一套 Ed25519 密钥。二进制和插件都是分发物，
-          # 用两个信任根只会让用户多配一次、多错一次。
           ILP_SIGNING_KEYS: ${{ secrets.ILP_SIGNING_KEYS }}
         run: |
           set -euo pipefail
-          if [ -z "${ILP_SIGNING_KEYS:-}" ]; then
-            echo "::error::缺少 ILP_SIGNING_KEYS，不签名就不该发布二进制"
-            exit 1
-          fi
-          cd dist
-          # 对 SHA256SUMS 的原始字节签名——不重新生成、不重新排序。
-          # 签名一旦和实际文件对不上，用户拿到的校验和就不可信了。
+          test -n "${ILP_SIGNING_KEYS:-}" || { echo 'ILP_SIGNING_KEYS is required' >&2; exit 1; }
           python3 - <<'PY'
-          import base64, json, os, sys
+          import base64, json, os
           from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-          raw = open("SHA256SUMS", "rb").read()
-          sigs = []
-          for item in os.environ["ILP_SIGNING_KEYS"].split(","):
-              item = item.strip()
-              if not item:
+          raw = open('SHA256SUMS', 'rb').read()
+          signatures = []
+          for item in os.environ['ILP_SIGNING_KEYS'].split(','):
+              key_id, _, encoded = item.strip().partition(':')
+              if not key_id:
                   continue
-              key_id, _, b64 = item.partition(":")
-              seed = base64.b64decode(b64)
+              seed = base64.b64decode(encoded)
               if len(seed) != 32:
-                  sys.exit(f"密钥 {key_id} 不是 32 字节")
-              key = Ed25519PrivateKey.from_private_bytes(seed)
-              sigs.append({
-                  "key_id": key_id.strip(),
-                  "signature": base64.b64encode(key.sign(raw)).decode(),
+                  raise SystemExit(f'{key_id}: expected a 32-byte seed')
+              signature = Ed25519PrivateKey.from_private_bytes(seed).sign(raw)
+              signatures.append({
+                  'key_id': key_id,
+                  'signature': base64.b64encode(signature).decode(),
               })
-          if not sigs:
-              sys.exit("没有可用签名密钥")
-          with open("SHA256SUMS.sig", "w") as f:
-              json.dump(sigs if len(sigs) > 1 else sigs[0], f, indent=2)
-              f.write("\n")
-          print(f"已用 {len(sigs)} 个密钥签名")
+          if not signatures:
+              raise SystemExit('no signing keys configured')
+          value = signatures[0] if len(signatures) == 1 else signatures
+          with open('SHA256SUMS.sig', 'w') as file:
+              json.dump(value, file, indent=2)
+              file.write('\n')
           PY
-
       - uses: softprops/action-gh-release@v2
         with:
           files: |

@@ -1,9 +1,5 @@
 name: ci
 
-# 主仓此前没有 CI，所有门禁靠本地手动跑。这里补上，但刻意只做**不需要网络、
-# 不需要密钥**的那部分：测试套件按设计不碰真实网络（用 wiremock 和本地
-# cassette），所以它能在 CI 里稳定跑，不会因为对方站点改版而变红。
-
 on:
   push:
     branches: [main]
@@ -22,29 +18,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-
       - uses: Swatinem/rust-cache@v2
-
-      # rusqlite 用 bundled 特性自带 SQLite 源码，不需要系统 libsqlite3；
-      # rustls 也不需要 OpenSSL。所以这里没有 apt-get install。
-      - name: 格式
-        run: cargo fmt --all --check
-
-      - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: 测试
-        # 测试套件不该发真实请求；万一有人加了一个，超时让它暴露而不是挂住。
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --workspace
         timeout-minutes: 15
-        run: cargo test -p ilp-host
-
-      - name: 构建二进制
-        # 安装脚本自测需要真实的 ilp 二进制当模拟产物。
-        run: cargo build
-
-      - name: 安装脚本自测
-        # 安装脚本是唯一由用户直接执行的东西，且它在下载别人的字节装进
-        # PATH。它的异常路径必须有人守着。
+      - run: cargo build
+      - name: Test installer
         run: |
           python3 -m pip install --quiet cryptography
           sh scripts/install_test.sh
@@ -53,84 +33,45 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-
       - uses: Swatinem/rust-cache@v2
         with:
           key: wasm
-
-      - name: 安装 wasm 目标
-        run: rustup target add wasm32-wasip2
-
-      - name: 构建宿主
-        run: cargo build
-
-      # 验证的是**用户实际拿到的东西**：跑 `ilp plugin new` 生成骨架，再
-      # 让那个骨架独立 build 成 wasm。
-      #
-      # 不直接 build plugins/template 下的文件：那是占位符形式
-      # （name = "ilp-plugin-@CRATE_NAME@"），本身就不该能编译——直接
-      # build 它只会得到"模板坏了"的假警报，而真正要保证的是生成器的输出
-      # 能编译。
-      - name: 生成插件骨架
+      - run: rustup target add wasm32-wasip2
+      - run: cargo build
+      - name: Generate skeleton
         run: |
           set -euo pipefail
           mkdir -p /tmp/skeleton
           ./target/debug/ilp plugin new ci-demo \
-            --site-name "CI 演示" \
+            --site-name 'CI Demo' \
             --site-id ci-demo \
             --domain example.com \
             --dir /tmp/skeleton
-          ls -la /tmp/skeleton/ci-demo
-
-      - name: 骨架必须不依赖本仓库的绝对路径
-        # 用户生成骨架后可以搬到任意位置，所以依赖得是 git tag 或
-        # crates.io，不能是 "../../../crates/..."。这是最容易犯又最难发现
-        # 的错：在仓库里 build 一切正常，搬出去就废了。
+      - name: Check generated dependency
         run: |
           set -euo pipefail
-          if grep -q 'path *=.*crates/ilp-plugin-wit' /tmp/skeleton/ci-demo/Cargo.toml; then
-            echo "::error::生成的骨架指向了仓库内相对路径，搬出去就编不过"
-            grep -n ilp-plugin-wit /tmp/skeleton/ci-demo/Cargo.toml
-            exit 1
-          fi
-          grep -n "ilp-plugin-wit" /tmp/skeleton/ci-demo/Cargo.toml
-
-      - name: 换成本仓库的 WIT 以便离线构建
-        # CI 不联网拉 git tag（也避免"测的是旧 tag"）。把依赖指向本仓库的
-        # crates/ilp-plugin-wit，验证当前提交的 WIT 与生成器输出仍然匹配。
+          file=/tmp/skeleton/ci-demo/Cargo.toml
+          ! grep -q 'path *=.*crates/ilp-plugin-wit' "$file"
+          grep -n ilp-plugin-wit "$file"
+      - name: Use current ABI source
         run: |
           set -euo pipefail
-          sed -i "s|git = \"https://github.com/ILP-Project/ILP\", tag = \"abi-v0.2.0\"|path = \"${{ github.workspace }}/crates/ilp-plugin-wit\"|" \
-            /tmp/skeleton/ci-demo/Cargo.toml
-          grep -n "ilp-plugin-wit" /tmp/skeleton/ci-demo/Cargo.toml
-
-      - name: 骨架必须能编译
+          file=/tmp/skeleton/ci-demo/Cargo.toml
+          sed -i "s|git = \"https://github.com/ILP-Project/ILP\", tag = \"abi-v0.2.0\"|path = \"${{ github.workspace }}/crates/ilp-plugin-wit\"|" "$file"
+      - name: Build skeleton
         working-directory: /tmp/skeleton/ci-demo
         run: |
           cargo fmt --check
           cargo clippy --target wasm32-wasip2 -- -D warnings
           cargo build --target wasm32-wasip2 --release
-
-      - name: 产物必须是合法 component
-        working-directory: /tmp/skeleton/ci-demo
+      - name: Verify component
         run: |
           set -euo pipefail
-          wasm=target/wasm32-wasip2/release/ilp_plugin_ci_demo.wasm
-          test -f "$wasm" || { echo "::error::没有产物 $wasm"; exit 1; }
-          echo "产物 $(stat -c%s "$wasm") 字节"
-          # 光"能 build"不够：纯 core module 也能 build 成功，但它不是合法的
-          # component，宿主加载时会失败。
-          #
-          # 判断依据是二进制头，不是 grep 字符串：component 的版本字段里
-          # 第 16 位（layer）为 1，即字节 6..8 是 0x0100。grep "component-type"
-          # 看着更直观，但那个串在产物里根本不存在（段名用的是别的编码），
-          # 会在产物完全正常时报错。
+          wasm=/tmp/skeleton/ci-demo/target/wasm32-wasip2/release/ilp_plugin_ci_demo.wasm
+          test -f "$wasm"
           python3 - "$wasm" <<'PY'
           import sys
           data = open(sys.argv[1], "rb").read()
-          if data[:4] != b"\0asm":
-              sys.exit("不是 wasm 文件")
-          if data[6:8] != b"\x01\x00":
-              sys.exit(f"不是 component（layer={data[6:8].hex()}，应为 0100）")
-          print("是合法的 component")
+          if data[:4] != b"\0asm" or data[6:8] != b"\x01\x00":
+              raise SystemExit("generated file is not a WebAssembly component")
           PY
