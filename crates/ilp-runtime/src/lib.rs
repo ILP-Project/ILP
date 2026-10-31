@@ -72,7 +72,11 @@ impl CapabilityPolicy {
     }
 
     pub fn check_domain(&self, domain: &str) -> Result<()> {
-        if self.allowed_domains.contains(domain) {
+        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+        if self.allowed_domains.iter().any(|allowed| {
+            let allowed = allowed.trim().trim_end_matches('.').to_ascii_lowercase();
+            allowed == "*" || allowed == domain
+        }) {
             Ok(())
         } else {
             Err(anyhow!("插件无权访问域名: {domain}"))
@@ -208,8 +212,35 @@ pub trait StorageBackend: Send + Sync {
     fn delete(&self, key: &str) -> Result<()>;
 }
 
+#[derive(Debug, Clone)]
+pub struct HttpRequest {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
 pub trait HttpBackend: Send + Sync {
     fn fetch(&self, url: &str, body: &[u8]) -> Result<Vec<u8>>;
+
+    fn fetch_request(&self, request: &HttpRequest) -> Result<HttpResponse> {
+        self.fetch(
+            request.url.as_str(),
+            request.body.as_deref().unwrap_or_default(),
+        )
+        .map(|body| HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body,
+        })
+    }
 }
 
 pub struct RuntimeHost {
@@ -218,6 +249,7 @@ pub struct RuntimeHost {
     pub storage: Option<Arc<dyn StorageBackend>>,
     pub secrets: Option<Arc<dyn SecretBackend>>,
     pub http: Option<Arc<dyn HttpBackend>>,
+    pub adapter: Option<Box<dyn HostAdapter>>,
 }
 
 impl RuntimeHost {
@@ -229,6 +261,7 @@ impl RuntimeHost {
             storage: None,
             secrets: None,
             http: None,
+            adapter: None,
         }
     }
 
@@ -247,16 +280,34 @@ impl RuntimeHost {
         self
     }
 
+    pub fn with_adapter(mut self, adapter: Box<dyn HostAdapter>) -> Self {
+        self.adapter = Some(adapter);
+        self
+    }
+
     pub fn fetch(&mut self, url: &str, body: &[u8]) -> std::result::Result<Vec<u8>, RuntimeError> {
-        validate_http_request(&self.policy, &mut self.capabilities, url)?;
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            url: url.to_string(),
+            headers: Vec::new(),
+            body: Some(body.to_vec()),
+        };
+        Ok(self.fetch_request(&request)?.body)
+    }
+
+    pub fn fetch_request(
+        &mut self,
+        request: &HttpRequest,
+    ) -> std::result::Result<HttpResponse, RuntimeError> {
+        validate_http_request(&self.policy, &mut self.capabilities, &request.url)?;
         let backend = self
             .http
             .as_ref()
             .ok_or_else(|| RuntimeError::ExecutionFailed("HTTP backend 未配置".into()))?;
         let response = backend
-            .fetch(url, body)
+            .fetch_request(request)
             .map_err(|error| RuntimeError::ExecutionFailed(error.to_string()))?;
-        if response.len() as u64 > self.policy.limits.max_response_bytes {
+        if response.body.len() as u64 > self.policy.limits.max_response_bytes {
             return Err(RuntimeError::ResourceLimit("插件响应超过大小限制".into()));
         }
         Ok(response)

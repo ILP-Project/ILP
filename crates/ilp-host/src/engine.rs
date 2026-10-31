@@ -214,7 +214,11 @@ impl CapabilityPolicy {
 
 fn runtime_policy(policy: &CapabilityPolicy) -> RuntimeCapabilityPolicy {
     RuntimeCapabilityPolicy {
-        allowed_domains: policy.allowed_domains.iter().cloned().collect(),
+        allowed_domains: if policy.allowed_domains.is_empty() {
+            ["*".to_string()].into_iter().collect()
+        } else {
+            policy.allowed_domains.iter().cloned().collect()
+        },
         allow_storage: policy.allows("storage-read") || policy.allows("storage-write"),
         limits: Default::default(),
     }
@@ -277,6 +281,63 @@ use ilp_types::{
 };
 
 /// 宿主给插件的全部能力对应的状态。
+struct HostLogAdapter;
+
+impl ilp_runtime::HostAdapter for HostLogAdapter {
+    fn log(&self, level: u8, message: &str) {
+        level_to_tracing(level, "runtime", message);
+    }
+
+    fn now_ms(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0)
+    }
+}
+
+struct HostHttpBackend;
+
+impl ilp_runtime::HttpBackend for HostHttpBackend {
+    fn fetch(&self, url: &str, body: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let request = ilp::plugin::types::HttpRequest {
+            method: "POST".to_string(),
+            url: url.to_string(),
+            headers: Vec::new(),
+            body: Some(body.to_vec()),
+        };
+        Ok(crate::http::send(&request)?.body)
+    }
+
+    fn fetch_request(
+        &self,
+        request: &ilp_runtime::HttpRequest,
+    ) -> anyhow::Result<ilp_runtime::HttpResponse> {
+        let response = crate::http::send(&ilp::plugin::types::HttpRequest {
+            method: request.method.clone(),
+            url: request.url.clone(),
+            headers: request
+                .headers
+                .iter()
+                .map(|(name, value)| ilp::plugin::types::HttpHeader {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+            body: request.body.clone(),
+        })?;
+        Ok(ilp_runtime::HttpResponse {
+            status: response.status,
+            headers: response
+                .headers
+                .into_iter()
+                .map(|header| (header.name, header.value))
+                .collect(),
+            body: response.body,
+        })
+    }
+}
+
 pub struct HostState {
     ctx: WasiCtx,
     table: ResourceTable,
@@ -353,6 +414,8 @@ impl HostState {
             timed_out: false,
             interrupted: false,
             runtime_host: RuntimeHost::new(runtime_policy(&policy))
+                .with_adapter(Box::new(HostLogAdapter))
+                .with_http_backend(Arc::new(HostHttpBackend))
                 .with_storage(Arc::new(
                     FileStorageBackend::new(storage_dir.clone())
                         .expect("创建插件 storage 后端失败"),
@@ -370,6 +433,37 @@ impl HostState {
         let out = f();
         self.host_wait += started.elapsed();
         out
+    }
+
+    fn runtime_http_fetch(
+        &mut self,
+        request: ilp::plugin::types::HttpRequest,
+    ) -> Result<ilp::plugin::types::HttpResponse, String> {
+        validate_http_request(&request)?;
+        self.policy.allows_url(&request.url)?;
+        let runtime_request = ilp_runtime::HttpRequest {
+            method: request.method,
+            url: request.url,
+            headers: request
+                .headers
+                .into_iter()
+                .map(|header| (header.name, header.value))
+                .collect(),
+            body: request.body,
+        };
+        let started = Instant::now();
+        let response = self.runtime_host.fetch_request(&runtime_request);
+        self.host_wait += started.elapsed();
+        let response = response.map_err(|error| error.to_string())?;
+        Ok(ilp::plugin::types::HttpResponse {
+            status: response.status,
+            headers: response
+                .headers
+                .into_iter()
+                .map(|(name, value)| ilp::plugin::types::HttpHeader { name, value })
+                .collect(),
+            body: response.body,
+        })
     }
 }
 
@@ -416,9 +510,7 @@ impl HostTrait for HostState {
     ) -> Result<ilp::plugin::types::HttpResponse, String> {
         validate_http_request(&request)?;
         self.policy.allows_url(&request.url)?;
-        let response = self
-            .time_host_call(|| crate::http::send(&request))
-            .map_err(|e| format!("{e:#}"))?;
+        let response = self.runtime_http_fetch(request)?;
         validate_http_response(&response)?;
         Ok(response)
     }
@@ -557,9 +649,7 @@ impl ilp::plugin::host::HostHttpHandle for HostState {
         crate::http::validate_plugin_url(&request.url).map_err(|e| format!("{e:#}"))?;
         validate_http_request(&request)?;
         self.policy.allows_url(&request.url)?;
-        let response = self
-            .time_host_call(|| crate::http::send(&request))
-            .map_err(|e| format!("{e:#}"))?;
+        let response = self.runtime_http_fetch(request)?;
         validate_http_response(&response)?;
         Ok(response)
     }
