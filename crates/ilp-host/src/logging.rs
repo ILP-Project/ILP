@@ -11,14 +11,28 @@ pub struct LogGuard {
     _file: WorkerGuard,
 }
 
-pub fn init(config: &Config) -> Result<LogGuard> {
+pub fn init(config: &Config, log_file: Option<&std::path::Path>) -> Result<LogGuard> {
     let level = parse_level(&config.log_level);
-    let log_dir = config.logs_dir();
-    std::fs::create_dir_all(&log_dir)
-        .with_context(|| format!("创建日志目录失败: {}", log_dir.display()))?;
-
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "ilp.log");
-    let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+    let (file_writer, guard) = match log_file {
+        Some(path) => {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("创建日志目录失败: {}", parent.display()))?;
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("打开日志文件失败: {}", path.display()))?;
+            tracing_appender::non_blocking(file)
+        }
+        None => {
+            let log_dir = config.logs_dir();
+            std::fs::create_dir_all(&log_dir)
+                .with_context(|| format!("创建日志目录失败: {}", log_dir.display()))?;
+            tracing_appender::non_blocking(tracing_appender::rolling::daily(&log_dir, "ilp.log"))
+        }
+    };
 
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(file_writer)

@@ -6,6 +6,7 @@ mod diagnostics;
 mod engine;
 mod exit;
 mod exporter;
+mod help;
 mod http;
 mod logging;
 mod messages;
@@ -35,9 +36,12 @@ fn run() -> anyhow::Result<()> {
     if parsed.verbose {
         std::env::set_var("RUST_LOG", "debug");
     }
+    if parsed.quiet {
+        std::env::set_var("ILP_QUIET", "1");
+    }
     let command = parsed.command;
     let config = config::Config::load("config.json")?;
-    let _log_guard = logging::init(&config)?;
+    let _log_guard = logging::init(&config, parsed.log_file.as_deref())?;
     commands::install_signal_handlers()?;
 
     // 配置里的异常值在日志起来之后重新报一遍，否则早先的告警会丢。
@@ -75,5 +79,8 @@ fn run() -> anyhow::Result<()> {
             yes,
         } => commands::do_doctor(&config, bundle, with_manifest, yes),
         cli::Command::Version => commands::do_version(&config),
+        cli::Command::Completion { shell, output } => {
+            help::write_completion(shell, output.as_deref())
+        }
     }
 }

@@ -44,7 +44,7 @@ fn jsonl_enabled() -> bool {
 }
 
 fn progress_enabled() -> bool {
-    !jsonl_enabled() && std::io::stdout().is_terminal()
+    !jsonl_enabled() && std::env::var_os("ILP_QUIET").is_none() && std::io::stdout().is_terminal()
 }
 
 fn validate_jsonl_event(event: &serde_json::Value) -> bool {

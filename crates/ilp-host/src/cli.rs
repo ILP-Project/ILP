@@ -1,5 +1,13 @@
 use clap::{Parser, Subcommand};
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum HelpFormat {
+    Bash,
+    Zsh,
+    Fish,
+    Man,
+}
+
 #[derive(Parser)]
 #[command(name = "ilp", version, about = "小说下载器")]
 pub struct Cli {
@@ -9,11 +17,17 @@ pub struct Cli {
     /// 输出更详细的运行日志
     #[arg(short, long, global = true)]
     pub verbose: bool,
+    /// 禁止标准错误上的进度和普通提示（日志文件仍保留）
+    #[arg(long, global = true)]
+    pub quiet: bool,
+    /// 将日志写入指定文件（覆盖配置中的滚动日志文件）
+    #[arg(long, global = true, value_name = "PATH")]
+    pub log_file: Option<std::path::PathBuf>,
     #[command(subcommand)]
     pub command: Command,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 pub enum Command {
     /// 获取小说内容
     Get {
@@ -67,9 +81,16 @@ pub enum Command {
     },
     /// 显示版本与已加载插件信息
     Version,
+    /// 生成 Shell completion 或 Unix man page
+    Completion {
+        #[arg(value_enum)]
+        shell: HelpFormat,
+        #[arg(long, value_name = "PATH")]
+        output: Option<std::path::PathBuf>,
+    },
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 pub enum PluginCommand {
     /// 从模板生成新插件骨架
     New {
@@ -112,4 +133,182 @@ pub enum PluginCommand {
 
 pub fn parse() -> Cli {
     Cli::parse()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command, PluginCommand};
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).expect("命令行参数应能解析")
+    }
+
+    #[test]
+    fn parses_get_with_short_and_long_options() {
+        let cli = parse(&[
+            "ilp",
+            "--jsonl",
+            "--verbose",
+            "--quiet",
+            "--log-file",
+            "/tmp/ilp.log",
+            "get",
+            "all",
+            "book-1",
+            "-s",
+            "fanqie",
+            "-f",
+        ]);
+        assert!(cli.jsonl);
+        assert!(cli.verbose);
+        assert!(cli.quiet);
+        assert_eq!(
+            cli.log_file.as_deref().and_then(|p| p.to_str()),
+            Some("/tmp/ilp.log")
+        );
+        match cli.command {
+            Command::Get {
+                kind,
+                id,
+                site_id,
+                force_update,
+            } => {
+                assert_eq!(kind, "all");
+                assert_eq!(id, "book-1");
+                assert_eq!(site_id, "fanqie");
+                assert!(force_update);
+            }
+            other => panic!("应解析为 get，实际为 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_update_without_apply_by_default() {
+        let cli = parse(&["ilp", "update", "book-1", "--site_id", "fanqie"]);
+        match cli.command {
+            Command::Update { id, site_id, apply } => {
+                assert_eq!(id, "book-1");
+                assert_eq!(site_id, "fanqie");
+                assert!(!apply);
+            }
+            other => panic!("应解析为 update，实际为 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_plugin_lifecycle_commands() {
+        for (args, expected) in [
+            (&["ilp", "plugin", "list"][..], "list"),
+            (&["ilp", "plugin", "info", "fanqie"][..], "info"),
+            (&["ilp", "plugin", "install", "fanqie@1.2.3"][..], "install"),
+            (&["ilp", "plugin", "uninstall", "fanqie"][..], "uninstall"),
+            (&["ilp", "plugin", "enable", "fanqie"][..], "enable"),
+            (&["ilp", "plugin", "disable", "fanqie"][..], "disable"),
+        ] {
+            let cli = parse(args);
+            let actual = match cli.command {
+                Command::Plugin {
+                    sub: PluginCommand::List,
+                } => "list",
+                Command::Plugin {
+                    sub: PluginCommand::Info { .. },
+                } => "info",
+                Command::Plugin {
+                    sub: PluginCommand::Install { .. },
+                } => "install",
+                Command::Plugin {
+                    sub: PluginCommand::Uninstall { .. },
+                } => "uninstall",
+                Command::Plugin {
+                    sub: PluginCommand::Enable { .. },
+                } => "enable",
+                Command::Plugin {
+                    sub: PluginCommand::Disable { .. },
+                } => "disable",
+                _ => "other",
+            };
+            assert_eq!(actual, expected, "参数: {args:?}");
+        }
+    }
+
+    #[test]
+    fn parses_doctor_flags_and_plugin_new_options() {
+        let doctor = parse(&[
+            "ilp",
+            "doctor",
+            "--bundle",
+            "/tmp/report.tar.gz",
+            "--with-manifest",
+            "-y",
+        ]);
+        match doctor.command {
+            Command::Doctor {
+                bundle,
+                with_manifest,
+                yes,
+            } => {
+                assert_eq!(bundle.unwrap().to_str(), Some("/tmp/report.tar.gz"));
+                assert!(with_manifest);
+                assert!(yes);
+            }
+            other => panic!("应解析为 doctor，实际为 {other:?}"),
+        }
+
+        let plugin = parse(&[
+            "ilp",
+            "plugin",
+            "new",
+            "my-site",
+            "--site-name",
+            "示例站",
+            "--site-id",
+            "example",
+            "--domain",
+            "example.com",
+            "--dir",
+            "/tmp/plugins",
+        ]);
+        match plugin.command {
+            Command::Plugin {
+                sub:
+                    PluginCommand::New {
+                        name,
+                        site_name,
+                        site_id,
+                        domain,
+                        dir,
+                    },
+            } => {
+                assert_eq!(name, "my-site");
+                assert_eq!(site_name.as_deref(), Some("示例站"));
+                assert_eq!(site_id.as_deref(), Some("example"));
+                assert_eq!(domain.as_deref(), Some("example.com"));
+                assert_eq!(dir.unwrap().to_str(), Some("/tmp/plugins"));
+            }
+            other => panic!("应解析为 plugin new，实际为 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_completion_command() {
+        let cli = parse(&["ilp", "completion", "bash", "--output", "/tmp/ilp.bash"]);
+        match cli.command {
+            Command::Completion {
+                shell: super::HelpFormat::Bash,
+                output,
+            } => {
+                assert_eq!(output.unwrap().to_str(), Some("/tmp/ilp.bash"));
+            }
+            other => panic!("应解析为 completion，实际为 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_missing_required_arguments() {
+        assert!(Cli::try_parse_from(["ilp", "get", "all", "book-1"]).is_err());
+        assert!(Cli::try_parse_from(["ilp", "search", "关键词"]).is_err());
+        assert!(Cli::try_parse_from(["ilp", "plugin", "info"]).is_err());
+        assert!(Cli::try_parse_from(["ilp", "unknown"]).is_err());
+    }
 }

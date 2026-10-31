@@ -22,6 +22,8 @@ ilp search <keyword> -s <site_id>
 ilp plugin list|info|install|update|uninstall|enable|disable ...
 ilp plugin new <name> [--site-name ..] [--domain ..]
 ilp doctor [--bundle <path>] [--with-manifest] [-y]
+ilp completion bash|zsh|fish|man [--output <path>]
+ilp --quiet --log-file <path> get all <id> -s <site_id>
 ilp --jsonl get all <id> -s <site_id>
 ilp --verbose get all <id> -s <site_id>
 ilp version
@@ -31,6 +33,8 @@ ilp version
 - `plugin update <name>` 默认只报告插件版本差异；`--apply` 才下载并替换插件。
 - `--jsonl` 输出 `update_report`、`chapter_added`、`chapter_downloaded` 等事件，不混入普通进度文本；字段约定见 [`docs/jsonl-events.md`](docs/jsonl-events.md)。
 - `--verbose` 提高日志级别；TTY 显示即时进度，管道和重定向保持稳定输出。
+- `--quiet` 禁止终端进度和普通提示；`--log-file <path>` 将本次运行日志追加到指定文件。
+- `completion` 生成 Bash、Zsh、Fish completion 或 Unix man page；不指定 `--output` 时写入标准输出。
 - `search` 在 TTY 中使用 `n`/回车下一页、`p` 上一页、`q` 退出；非 TTY 自动输出全部结果。
 - 退出码：`0` 成功，`1` 部分失败，`2` 致命错误。
 
