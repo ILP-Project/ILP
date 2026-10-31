@@ -28,7 +28,7 @@ ilp version
 ```
 
 - `update` 默认只生成新增章节报告；`--apply` 才保存新目录并下载。
-- `--jsonl` 输出 `update_report`、`chapter_added`、`chapter_downloaded` 等事件，不混入普通进度文本。
+- `--jsonl` 输出 `update_report`、`chapter_added`、`chapter_downloaded` 等事件，不混入普通进度文本；字段约定见 [`docs/jsonl-events.md`](docs/jsonl-events.md)。
 - `--verbose` 提高日志级别；TTY 显示即时进度，管道和重定向保持稳定输出。
 - `search` 在 TTY 中使用 `n`/回车下一页、`p` 上一页、`q` 退出；非 TTY 自动输出全部结果。
 - 退出码：`0` 成功，`1` 部分失败，`2` 致命错误。
@@ -61,6 +61,7 @@ ilp plugin new my-site --site-name '示例站' --domain example.com
 - `crates/ilp-host`：CLI、WASM 宿主、HTTP、存储、插件管理、诊断。
 - `crates/ilp-types`：共享类型、`ChapterResult`、章节顺序校验。
 - `crates/ilp-plugin-wit`：WIT ABI，当前支持 ABI `0.1.0` 和 `0.2.0`。
+- `docs/`：用户和自动化接口文档。
 - `scripts/`：安装器和无网络安装测试。
 - `.github/workflows/`：CI 与签名 Release 构建。
 

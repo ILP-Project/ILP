@@ -33,13 +33,14 @@ ilp --jsonl <command>
 ilp --verbose <command>
 ```
 
-`update` 默认 dry-run。`--jsonl` 只输出结构化事件；`--verbose` 提高日志级别。TTY 显示即时进度，非 TTY 不阻塞交互。
+`update` 默认 dry-run。`--jsonl` 只输出结构化事件，字段约定见 `docs/jsonl-events.md`；`--verbose` 提高日志级别。TTY 显示即时进度，非 TTY 不阻塞交互。
 
 ## 代码结构
 
 - `crates/ilp-host`：CLI、HTTP、存储、WASM 加载器、插件管理、诊断、导出器。
 - `crates/ilp-types`：共享 serde 类型、`ChapterResult`、章节顺序校验。
 - `crates/ilp-plugin-wit`：WIT ABI，支持 `0.1.0` 与 `0.2.0`。
+- `docs`：用户和自动化接口文档。
 - `scripts`：签名安装器和离线安装测试。
 - `.github/workflows`：CI 与 Release 构建。
 
