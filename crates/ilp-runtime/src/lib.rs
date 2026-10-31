@@ -64,8 +64,41 @@ pub struct PluginTrust {
     pub user_confirmed: bool,
 }
 
+pub const CURRENT_ABI: &str = "0.2.0";
+pub const SUPPORTED_ABIS: &[&str] = &["0.1.0", CURRENT_ABI];
+
 pub trait PluginRuntime: Send + Sync {
     fn load(&self, wasm: &[u8], policy: &CapabilityPolicy) -> Result<PluginTrust>;
+}
+
+pub fn validate_abi(abi: &str) -> std::result::Result<(), RuntimeError> {
+    if SUPPORTED_ABIS.contains(&abi) {
+        Ok(())
+    } else {
+        Err(RuntimeError::AbiMismatch(format!(
+            "不支持插件 ABI {abi}，支持版本: {}",
+            SUPPORTED_ABIS.join(", ")
+        )))
+    }
+}
+
+pub fn validate_metadata(
+    metadata: &ilp_types::PluginMetadata,
+) -> std::result::Result<(), RuntimeError> {
+    validate_abi(&metadata.abi_version)?;
+    if metadata.plugin_id.trim().is_empty() || metadata.site_id.trim().is_empty() {
+        return Err(RuntimeError::InvalidFormat(
+            "插件 ID 和站点 ID 不能为空".into(),
+        ));
+    }
+    for domain in &metadata.allowed_domains {
+        if domain.trim().is_empty() || domain.contains('/') || domain.contains(' ') {
+            return Err(RuntimeError::InvalidFormat(format!(
+                "非法允许域名: {domain}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,5 +156,28 @@ mod tests {
         let policy = CapabilityPolicy::deny_all().allow_domain("example.com");
         assert!(policy.check_domain("example.com").is_ok());
         assert!(policy.check_domain("other.example.com").is_err());
+    }
+
+    #[test]
+    fn abi_validation_accepts_legacy_and_current_versions() {
+        assert!(validate_abi("0.1.0").is_ok());
+        assert!(validate_abi(CURRENT_ABI).is_ok());
+        assert!(validate_abi("9.9.9").is_err());
+    }
+
+    #[test]
+    fn metadata_validation_rejects_invalid_identity_and_domains() {
+        let metadata = ilp_types::PluginMetadata {
+            abi_version: CURRENT_ABI.into(),
+            site_name: "site".into(),
+            site_id: "site".into(),
+            site_domain: "example.com".into(),
+            plugin_name: "plugin".into(),
+            plugin_id: "plugin".into(),
+            version: "0.1.0".into(),
+            permissions: vec![],
+            allowed_domains: vec!["https://example.com".into()],
+        };
+        assert!(validate_metadata(&metadata).is_err());
     }
 }
