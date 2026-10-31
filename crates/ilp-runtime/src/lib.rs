@@ -15,6 +15,15 @@ use wasmtime::{
     UpdateDeadline,
 };
 
+/// Wasmtime-side bindings for the current WIT ABI. Concrete host state is kept
+/// outside these generated types so adapters can be supplied by CLI/App.
+pub mod component_bindings {
+    wasmtime::component::bindgen!({
+        world: "novel-plugin",
+        path: "../ilp-plugin-wit/wit/v2",
+    });
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResourceLimits {
     pub max_memory_bytes: u64,
@@ -114,6 +123,7 @@ pub struct RuntimeStore {
     pub started: Instant,
     pub timeout: Duration,
     pub cancelled: bool,
+    pub host: Option<RuntimeHost>,
 }
 
 const EPOCH_TICK: Duration = Duration::from_millis(100);
@@ -153,12 +163,11 @@ pub fn shared_engine() -> &'static Engine {
 
 pub fn new_store_with_host(
     policy: &CapabilityPolicy,
-    _host: RuntimeHost,
+    host: RuntimeHost,
 ) -> Result<Store<RuntimeStore>> {
-    // Host callbacks are installed by the WIT adapter layer. Keeping the host
-    // value at this boundary makes capability ownership explicit without
-    // coupling the generic budget store to a concrete backend.
-    new_store(policy)
+    let mut store = new_store(policy)?;
+    store.data_mut().host = Some(host);
+    Ok(store)
 }
 
 pub fn new_store(policy: &CapabilityPolicy) -> Result<Store<RuntimeStore>> {
@@ -174,6 +183,7 @@ pub fn new_store(policy: &CapabilityPolicy) -> Result<Store<RuntimeStore>> {
             started: Instant::now(),
             timeout: Duration::from_millis(policy.limits.timeout_ms),
             cancelled: false,
+            host: None,
         },
     );
     store.limiter(|state| &mut state.limits);
@@ -398,6 +408,16 @@ impl HostCapabilities {
             _ => false,
         }
     }
+}
+
+pub fn instantiate_component(
+    component: &Component,
+    _store: &mut Store<RuntimeStore>,
+) -> std::result::Result<(), RuntimeError> {
+    let _ = component;
+    Err(RuntimeError::ExecutionFailed(
+        "WIT host capability adapter 尚未配置".into(),
+    ))
 }
 
 pub fn load_component(wasm: &[u8]) -> std::result::Result<Component, RuntimeError> {
