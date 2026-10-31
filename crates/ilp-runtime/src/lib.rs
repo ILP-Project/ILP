@@ -54,6 +54,7 @@ impl Default for ResourceLimits {
 pub struct CapabilityPolicy {
     pub allowed_domains: BTreeSet<String>,
     pub allow_storage: bool,
+    pub allow_secrets: bool,
     pub limits: ResourceLimits,
 }
 
@@ -62,6 +63,7 @@ impl CapabilityPolicy {
         Self {
             allowed_domains: BTreeSet::new(),
             allow_storage: false,
+            allow_secrets: false,
             limits: ResourceLimits::default(),
         }
     }
@@ -75,7 +77,11 @@ impl CapabilityPolicy {
         let domain = domain.trim_end_matches('.').to_ascii_lowercase();
         if self.allowed_domains.iter().any(|allowed| {
             let allowed = allowed.trim().trim_end_matches('.').to_ascii_lowercase();
-            allowed == "*" || allowed == domain
+            allowed == "*"
+                || allowed == domain
+                || (allowed
+                    .strip_prefix("*.")
+                    .is_some_and(|suffix| domain.ends_with(&format!(".{suffix}"))))
         }) {
             Ok(())
         } else {
@@ -90,13 +96,30 @@ impl CapabilityPolicy {
         if scheme != "https" {
             return Err(anyhow!("插件网络请求必须使用 HTTPS"));
         }
-        let host = rest
-            .split('/')
-            .next()
-            .unwrap_or_default()
-            .split(':')
-            .next()
-            .unwrap_or_default();
+        let authority = rest.split('/').next().unwrap_or_default();
+        if authority.is_empty()
+            || authority.contains('@')
+            || authority.chars().any(char::is_whitespace)
+        {
+            return Err(anyhow!("网络地址的 host 无效"));
+        }
+        let host = authority
+            .strip_prefix('[')
+            .and_then(|value| value.split_once(']').map(|(host, _)| host))
+            .unwrap_or_else(|| {
+                authority
+                    .rsplit_once(':')
+                    .map_or(authority, |(host, port)| {
+                        if port.chars().all(|character| character.is_ascii_digit()) {
+                            host
+                        } else {
+                            authority
+                        }
+                    })
+            });
+        if host.is_empty() {
+            return Err(anyhow!("网络地址缺少 host"));
+        }
         self.check_domain(host)
     }
 }
@@ -424,7 +447,16 @@ impl SecretBackend for FileSecretBackend {
         self.inner.get(key)
     }
     fn set(&self, key: &str, value: &[u8]) -> Result<()> {
-        self.inner.set(key, value)
+        self.inner.set(key, value)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                self.inner.root.join(key),
+                std::fs::Permissions::from_mode(0o600),
+            )?;
+        }
+        Ok(())
     }
     fn delete(&self, key: &str) -> Result<()> {
         self.inner.delete(key)
@@ -487,7 +519,7 @@ impl HostCapabilities {
         Self {
             allow_http: !policy.allowed_domains.is_empty(),
             allow_storage: policy.allow_storage,
-            allow_secrets: false,
+            allow_secrets: policy.allow_secrets,
             requests_used: 0,
             max_requests: policy.limits.max_requests,
         }
@@ -664,6 +696,8 @@ mod tests {
         assert!(policy.check_domain("other.example.com").is_err());
         assert!(policy.check_url("http://example.com").is_err());
         assert!(policy.check_url("https://example.com/path").is_ok());
+        assert!(policy.check_url("https://user@example.com/path").is_err());
+        assert!(policy.check_url("https://example.com:443/path").is_ok());
     }
 
     #[test]

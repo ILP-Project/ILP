@@ -220,7 +220,14 @@ fn runtime_policy(policy: &CapabilityPolicy) -> RuntimeCapabilityPolicy {
             policy.allowed_domains.iter().cloned().collect()
         },
         allow_storage: policy.allows("storage-read") || policy.allows("storage-write"),
-        limits: Default::default(),
+        allow_secrets: policy.allows("secret-read") || policy.allows("secret-write"),
+        limits: ilp_runtime::ResourceLimits {
+            max_memory_bytes: MAX_PLUGIN_MEMORY as u64,
+            max_response_bytes: MAX_HTTP_RESPONSE as u64,
+            max_requests: 100,
+            timeout_ms: MAX_PLUGIN_CALL.as_millis() as u64,
+            fuel: MAX_PLUGIN_FUEL,
+        },
     }
 }
 
@@ -343,7 +350,6 @@ pub struct HostState {
     table: ResourceTable,
     /// 插件名，用于隔离 storage 命名空间
     plugin_name: String,
-    secret_dir: PathBuf,
     policy: CapabilityPolicy,
     limits: StoreLimits,
     /// 本次插件调用的起点，epoch 回调用它算墙钟预算。
@@ -398,7 +404,6 @@ impl HostState {
             ctx: WasiCtx::builder().build(),
             table: ResourceTable::new(),
             plugin_name,
-            secret_dir: secret_dir.clone(),
             policy: policy.clone(),
             limits: StoreLimitsBuilder::new()
                 .memory_size(MAX_PLUGIN_MEMORY)
@@ -689,7 +694,7 @@ impl ilp::plugin::host::HostSecretHandle for HostState {
         if !self.policy.allows("secret-read") || !is_safe_key(&key) {
             return None;
         }
-        std::fs::read(self.secret_dir.join(key)).ok()
+        self.runtime_host.secret_get(&key).ok().flatten()
     }
 
     fn set(
@@ -707,21 +712,18 @@ impl ilp::plugin::host::HostSecretHandle for HostState {
         if value.len() > MAX_STORAGE_VALUE {
             return Err(format!("secret value 过大: {} 字节", value.len()));
         }
-        std::fs::create_dir_all(&self.secret_dir).map_err(|e| e.to_string())?;
-        let path = self.secret_dir.join(key);
-        atomic_write(&path, &value).map_err(|e| e.to_string())?;
-        restrict_secret_permissions(&path).map_err(|e| e.to_string())
+        self.runtime_host
+            .secret_set(&key, &value)
+            .map_err(|error| error.to_string())
     }
 
     fn delete(&mut self, _handle: Resource<SecretCapability>, key: String) -> Result<(), String> {
         if !self.policy.allows("secret-write") || !is_safe_key(&key) {
             return Err("permission-denied: secret-write".to_string());
         }
-        match std::fs::remove_file(self.secret_dir.join(key)) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.to_string()),
-        }
+        self.runtime_host
+            .secret_delete(&key)
+            .map_err(|error| error.to_string())
     }
 
     fn drop(&mut self, handle: Resource<SecretCapability>) -> wasmtime::Result<()> {
@@ -799,6 +801,7 @@ fn is_safe_key(key: &str) -> bool {
 
 /// 写临时文件再 rename：secret 里绝不能出现“写了一半的凭据”。
 /// 临时名带纳秒后缀，避免两个不同 key（`x.1` / `x.2`）坍缩到同一个临时文件。
+#[allow(dead_code)]
 fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -827,6 +830,7 @@ fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
 /// Unix 用 `0600`。Windows 默认继承父目录 ACL，可能让同机其他账户读到，
 /// 因此显式重写 DACL：先断开继承（`/inheritance:r`），再只授予当前用户。
 /// 失败必须上报——静默失败等于留下一个全世界可读的设备密钥。
+#[allow(dead_code)]
 fn restrict_secret_permissions(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
