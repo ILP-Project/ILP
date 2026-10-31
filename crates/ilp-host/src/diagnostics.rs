@@ -567,6 +567,7 @@ mod tests {
     #[test]
     fn config_summary_counts_keys_without_printing_them() {
         let mut config = Config::default();
+        config.plugin_trusted_keys.clear();
         config
             .plugin_trusted_keys
             .insert("release".into(), "AAAA".into());

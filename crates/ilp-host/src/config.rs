@@ -57,6 +57,9 @@ pub struct Config {
     raw: String,
 }
 
+pub const OFFICIAL_SIGNING_KEY_ID: &str = "release-2026";
+pub const OFFICIAL_SIGNING_PUBLIC_KEY: &str = "9OkAC+RgB0unksBeNi2GDG4HVfrIaT3QwfogV3YbKzk=";
+
 const KNOWN_FIELDS: [&str; 16] = [
     "data_folder",
     "novels_folder",
@@ -127,7 +130,12 @@ impl Default for Config {
             log_to_stderr: default_true(),
             proxy: None,
             no_proxy: default_no_proxy(),
-            plugin_trusted_keys: HashMap::new(),
+            plugin_trusted_keys: [(
+                OFFICIAL_SIGNING_KEY_ID.to_string(),
+                OFFICIAL_SIGNING_PUBLIC_KEY.to_string(),
+            )]
+            .into_iter()
+            .collect(),
             plugin_revoked_keys: Vec::new(),
             require_plugin_signatures: false,
             plugin_signature_threshold: default_signature_threshold(),
@@ -150,6 +158,9 @@ impl Config {
         let text = std::fs::read_to_string(p).with_context(|| format!("读取配置失败: {path}"))?;
         let mut cfg: Config =
             serde_json::from_str(&text).with_context(|| format!("解析配置失败: {path}"))?;
+        cfg.plugin_trusted_keys
+            .entry(OFFICIAL_SIGNING_KEY_ID.to_string())
+            .or_insert_with(|| OFFICIAL_SIGNING_PUBLIC_KEY.to_string());
         cfg.raw = text;
         Ok(cfg)
     }
