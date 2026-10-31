@@ -83,17 +83,25 @@ cp target/wasm32-wasip2/release/ilp_plugin_fanqie.wasm <宿主目录>/plugins/fa
 
 ```bash
 ilp get chapter|cover|author|title|all <id> -s <site_id> [-f]
+ilp update <id> -s <site_id> [--apply]  # 默认只预览变更
 ilp search <keyword> -s <site_id>
 ilp plugin list|uninstall|enable|disable <name>
 ilp plugin install <name>[@<version>]   # 省略版本即 latest
 ilp plugin new <name> [--site-name ..] [--domain ..]   # 生成插件骨架
 ilp doctor [--bundle <path>] [--with-manifest] [-y]
+ilp --jsonl get all <id> -s <site_id>   # JSONL 事件流
+ilp --verbose get all <id> -s <site_id>  # 详细日志
 ilp version
 ```
 
 - `get` 的 `kind` 可选 `chapter` / `cover` / `author` / `title` / `all`。
 - `-s/--site_id` 必须是已加载插件的 `site_id`。
 - `-f/--force_update` 只刷新元数据与目录；要重下正文请删掉对应章节文件或整本目录。
+- `update` 会刷新目录并输出新增章节报告；默认 dry-run，不修改缓存也不下载正文。
+  只有显式加 `--apply` 才会保存新目录并下载新增章节。
+- `--jsonl` 输出机器可消费的 JSONL 事件（例如 `update_report`、`chapter_added`、
+  `chapter_downloaded`），不会混入普通进度文本，适合 CI 和脚本。
+- `--verbose` 提高日志级别；TTY 中会额外显示即时进度，管道和重定向保持稳定的非交互输出。
 - `search` 的翻页键是 `n`/回车（下一页）、`p`（上一页，走缓存）、`q`（退出）。
   非终端场景（管道、重定向）会自动沿游标翻到底并逐行打印。
 
@@ -132,7 +140,8 @@ data/
 日志默认保留 7 天，过期自动清理：日志里必然有书名和章节标题，长期堆在
 一个没人看的目录里只会变成泄漏面。
 
-每次运行结束会在日志里留一行结构化摘要（target `ilp::summary`）：
+每次运行结束会在日志里留一行结构化摘要（target `ilp::summary`）。即使没有待下载章节，
+幂等运行也会记录摘要：
 
 ```text
 INFO ilp::summary: 运行摘要 site=fanqie book=7290175791344651298 ok=216 failed=0 total=216
@@ -142,9 +151,11 @@ INFO ilp::summary: 运行摘要 site=fanqie book=7290175791344651298 ok=216 fail
 
 | 路径 | 内容 |
 |---|---|
-| `crates/ilp-types` | 宿主与插件共享的 serde 类型 |
-| `crates/ilp-host` | 宿主二进制 `ilp`：CLI、配置、存储、HTTP、wasmtime 加载器、插件管理 |
+| `crates/ilp-types` | 宿主与插件共享的 serde 类型、章节结果和顺序校验 |
+| `crates/ilp-host` | 宿主二进制 `ilp`：CLI、配置、存储、HTTP、WASM 加载器、导出器、诊断与插件管理 |
 | `crates/ilp-plugin-wit` | 插件 ABI 定义（`wit/plugin.wit`），宿主与插件共享的唯一来源 |
+| `scripts/` | 发布安装脚本及无网络安装自测 |
+| `.github/workflows/` | 宿主 CI 与签名 Release 构建流程 |
 
 站点插件不在本仓库：统一放在 `ILP-Project/plugins`（一站点一子目录），
 产物经 Cloudflare Pages 的静态 registry 分发，默认地址

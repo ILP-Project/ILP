@@ -44,18 +44,29 @@
 子命令（原版 CLI11 结构）：
 
 - `get chapter|cover|author|all <id> -s <site_id> [-f/--force_update]`
+- `update <id> -s <site_id> [--apply]`（默认 dry-run，先报告新增章节）
 - `search <keyword> -s <site_id>`（分页交互：`n` 翻页 / 数字跳转 / `q` 退出）
+- 全局 `--jsonl` 输出结构化事件流；`--verbose` 提升日志级别
 - `plugin list|info|install <name>[@<version>]|uninstall|enable|disable <name>`
 - `version`
 
 `-s/--site_id` 需校验是否为已加载插件的 `site_id`（原版 `CLI::IsMember(site_ids)`）。
+
+宿主侧内容模型为 `ChapterResult`，保留 `ok`、`locked`、`captcha`、`auth-required`、
+`not-found`、`invalid`、`error` 状态及错误分类；只有成功且有正文的结果才写入文件。
+统一导出通过 `Exporter` trait，目前默认实现是保持既有格式的 `TxtExporter`。
+
+用户可见字符串集中在 `crates/ilp-host/src/messages.rs`，当前语言为中文，为未来 i18n
+保留替换边界。
 
 ## 插件接口（等价 trait）
 
 元数据：`site_name` / `site_id` / `site_domain` / `plugin_name` / `plugin_id` / `version`。
 方法：`init(id, force_update)`、`getContent(force_update)`（目录抓取 + 缓存）、`getTitle` / `getAuthor` / `getCover`、`fetchAllChapter`（并发 + 跳过已下载）、`search(keyword)`、`parseChapter`（HTML/JSON → 纯文本）。
 
-章节目录条目字段：`id`、`title`、`url`（阅读页）、`fetch_url`（内容 API，`fetchOneChapter` 用它）、`update_time`（Unix 时间戳）。
+章节目录条目字段：`id`、`title`、`url`（阅读页）、`fetch_url`（内容 API，`fetchOneChapter` 用它）、
+`update_time`（Unix 时间戳）、`order_key`（可选的稳定文档顺序键）。宿主拒绝重复的章节 ID
+和非空 `order_key`，避免统一文档模型出现歧义。ABI 0.1 没有 `order_key` 时保留原目录顺序。
 
 ## 原版依赖 → Rust 建议（非强制）
 
