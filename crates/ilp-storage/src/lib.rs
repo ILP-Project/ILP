@@ -103,6 +103,35 @@ impl SqliteStorage {
         &self.paths
     }
 
+    pub fn index_book(&self, book_id: &str, title: &str, author: &str) -> Result<()> {
+        self.db
+            .execute("DELETE FROM search_index WHERE book_id = ?1", [book_id])?;
+        self.db.execute(
+            "INSERT INTO search_index(book_id, title, author) VALUES (?1, ?2, ?3)",
+            params![book_id, title, author],
+        )?;
+        Ok(())
+    }
+
+    pub fn index_chapter(
+        &self,
+        book_id: &str,
+        chapter_id: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<()> {
+        self.db.execute(
+            "DELETE FROM search_index WHERE book_id = ?1 AND chapter_title = ?2",
+            params![book_id, title],
+        )?;
+        self.db.execute(
+            "INSERT INTO search_index(book_id, chapter_title, body) VALUES (?1, ?2, ?3)",
+            params![book_id, title, body],
+        )?;
+        let _ = chapter_id;
+        Ok(())
+    }
+
     pub fn save_chapter(&self, book_id: &str, chapter_id: &str, content: &[u8]) -> Result<PathBuf> {
         let safe_book = sanitize_component(book_id);
         let safe_chapter = sanitize_component(chapter_id);
