@@ -99,6 +99,39 @@ impl SqliteStorage {
         Ok(Self { db, paths })
     }
 
+    pub fn create_task(&self, id: &str, kind: &str, state: &str) -> Result<()> {
+        let now = unix_seconds()?;
+        self.db.execute(
+            "INSERT INTO tasks (id, kind, state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)",
+            params![id, kind, state, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_task_state(&self, id: &str, state: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE tasks SET state = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, state, unix_seconds()?],
+        )?;
+        Ok(())
+    }
+
+    pub fn next_event_sequence(&self) -> Result<u64> {
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO event_sequence (id, next_sequence) VALUES (1, 1)
+             ON CONFLICT(id) DO UPDATE SET next_sequence = next_sequence + 1",
+            [],
+        )?;
+        let value: i64 = tx.query_row(
+            "SELECT next_sequence FROM event_sequence WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(value as u64)
+    }
+
     pub fn paths(&self) -> &StoragePaths {
         &self.paths
     }
@@ -248,6 +281,17 @@ fn migrate(db: &Connection) -> Result<()> {
              bytes INTEGER NOT NULL, sha256 TEXT NOT NULL,
              PRIMARY KEY (book_id, chapter_id)
          );
+         CREATE TABLE IF NOT EXISTS tasks (
+             id TEXT PRIMARY KEY NOT NULL,
+             kind TEXT NOT NULL,
+             state TEXT NOT NULL,
+             created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS event_sequence (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             next_sequence INTEGER NOT NULL
+         );
          CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
              book_id UNINDEXED, title, author, chapter_title, body
          );",
@@ -341,6 +385,10 @@ impl LibraryStorage for SqliteStorage {
             .optional()
             .map_err(Into::into)
     }
+}
+
+fn unix_seconds() -> Result<i64> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64)
 }
 
 fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {

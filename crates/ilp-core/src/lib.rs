@@ -230,17 +230,23 @@ mod tests {
 
     #[test]
     fn builder_validates_and_exposes_structured_config() {
-        let core = CoreBuilder::new(CoreConfig::new("data")).build().unwrap();
+        let data = std::env::temp_dir().join(format!("ilp-core-test-{}", Uuid::new_v4()));
+        let core = CoreBuilder::new(CoreConfig::new(&data)).build().unwrap();
         assert_eq!(core.config().device_name, "设备");
         assert!(!core.new_task_id().is_nil());
+        drop(core);
+        let _ = std::fs::remove_dir_all(data);
     }
 
     #[test]
     fn search_rejects_empty_queries() {
-        let core = CoreBuilder::new(CoreConfig::new("data")).build().unwrap();
+        let data = std::env::temp_dir().join(format!("ilp-core-test-{}", Uuid::new_v4()));
+        let core = CoreBuilder::new(CoreConfig::new(&data)).build().unwrap();
         assert!(matches!(
             core.search("  "),
             Err(CoreError::InvalidArgument(_))
         ));
+        drop(core);
+        let _ = std::fs::remove_dir_all(data);
     }
 }
