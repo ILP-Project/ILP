@@ -28,6 +28,31 @@
 再把响应交回插件解析（`consume-fetch`）。这样"一次请求返回 30 章"的批量接口和
 "一章一请求"的网页接口共用同一套 ABI，并发策略不用在每个插件里重写一遍。
 
+## 安装
+
+```bash
+# 先看脚本再执行，别 curl | sh
+curl -fsSLO https://raw.githubusercontent.com/ILP-Project/ILP/main/scripts/install.sh
+less install.sh
+ILP_PUBKEY='release-2026:<base64 公钥>' sh install.sh
+```
+
+`ILP_PUBKEY` 的格式与 `config.json` 里的 `plugin_trusted_keys` 一致
+（`key_id:base64`）。设了它脚本会**先验签名再验校验和**——只验校验和没有
+意义，校验和文件本身是从同一个地方下载的，中间人换了二进制也能顺手换掉
+校验和。不设公钥会跳过验签并明确提示（不是静默跳过）。
+
+其余开关：`ILP_VERSION`（默认 `latest`）、`ILP_PREFIX`（默认
+`/usr/local/bin`）、`ILP_REPO`、`ILP_BASE_URL`（离线/镜像）。
+
+`scripts/install_test.sh` 是它的自测，不需要网络：篡改二进制、错误公钥、
+未知平台三条异常路径都必须被拒——安装脚本的失败模式不是"报个错"，而是
+"装了个被篡改的二进制还告诉用户成功了"。
+
+发布二进制用 musl 静态链接（Linux）：glibc 版本地狱是分发二进制最常见的
+故障，在 ubuntu-24.04 上构建的产物到了 glibc 2.31 的机器上直接
+`GLIBC_2.38 not found`。
+
 ## 构建
 
 需要 Rust 1.75+ 与 wasm 目标：
