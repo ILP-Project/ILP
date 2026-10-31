@@ -9,3 +9,4 @@ result
 /plan
 
 plugins/template/target/
+fixtures/*/target/

@@ -1,11 +1,11 @@
 wit_bindgen::generate!({
     world: "novel-plugin",
-    path: "../../../crates/ilp-plugin-wit/wit/v1",
+    path: "../../crates/ilp-plugin-wit/wit/v1",
     pub_export_macro: true,
 });
 
 use exports::ilp::plugin::plugin::Guest;
-use ilp::plugin::types::{ChapterEntry, ChapterResult, FetchTask, HttpResponse, PluginMetadata, SearchPage};
+use ilp::plugin::types::{ChapterContent, ChapterEntry, FetchTask, HttpResponse, PluginMetadata, SearchPage};
 
 struct Fixture;
 
@@ -28,7 +28,7 @@ impl Guest for Fixture {
         Ok(SearchPage { results: Vec::new(), cursor: String::new(), has_more: false })
     }
     fn plan_fetch(_: Vec<String>) -> Result<Vec<FetchTask>, String> { Ok(Vec::new()) }
-    fn consume_fetch(_: String, _: HttpResponse) -> Result<Vec<ChapterResult>, String> { Ok(Vec::new()) }
+    fn consume_fetch(_: String, _: HttpResponse) -> Result<Vec<ChapterContent>, String> { Ok(Vec::new()) }
 }
 
-export!(Fixture with_types_in ilp);
+export!(Fixture with_types_in self);

@@ -3,6 +3,9 @@ name = "ilp-fixture-component-v2"
 version = "0.1.0"
 edition = "2021"
 
+# 保持 source fixture 独立于仓库 workspace，同时允许从仓库根目录按 manifest 构建。
+[workspace]
+
 [lib]
 crate-type = ["cdylib"]
 

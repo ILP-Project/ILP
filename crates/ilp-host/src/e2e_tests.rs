@@ -54,18 +54,19 @@ fn wasm_path() -> PathBuf {
 
 /// 拿到已构建的插件；未构建则返回 None 让调用方跳过。
 fn fixture_wasm(variable: &str, version: &str) -> Option<PathBuf> {
-    let path = std::env::var_os(variable)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../fixtures")
-                .join(format!("component-{version}/target/wasm32-wasip2/release/ilp_fixture_component_{version}.wasm"))
-        });
+    let default_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures")
+        .join(format!(
+            "component-{version}/target/wasm32-wasip2/release/ilp_fixture_component_{version}.wasm"
+        ));
+    let (path, source) = std::env::var_os(variable)
+        .map(|path| (PathBuf::from(path), "环境变量"))
+        .unwrap_or_else(|| (default_path.clone(), "默认路径"));
     if path.exists() {
         Some(path)
     } else {
         eprintln!(
-            "跳过 Component fixture {version}：未找到 {}；请先按 fixtures/README.md 构建",
+            "跳过 Component fixture {version}：{source}指定的 wasm 产物不存在：{}\n  请在仓库根目录运行：cargo build --manifest-path fixtures/component-{version}/Cargo.toml --target wasm32-wasip2 --release\n  详见 fixtures/README.md；也可用 {variable} 指定其他产物路径",
             path.display()
         );
         None
