@@ -24,10 +24,6 @@ pub mod component_bindings {
     });
 }
 
-pub struct HttpHandle;
-pub struct StorageHandle;
-pub struct SecretHandle;
-
 pub trait HostAdapter: Send + Sync {
     fn log(&self, level: u8, message: &str);
     fn now_ms(&self) -> u64;
