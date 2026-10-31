@@ -793,4 +793,140 @@ mod tests {
         };
         assert!(validate_metadata(&metadata).is_err());
     }
+
+    struct FixedHttp(Vec<u8>);
+
+    impl HttpBackend for FixedHttp {
+        fn fetch(&self, _url: &str, _body: &[u8]) -> Result<Vec<u8>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn temp_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ilp-runtime-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn runtime_host_denies_every_capability_by_default() {
+        let mut host = RuntimeHost::new(CapabilityPolicy::deny_all());
+        assert!(matches!(
+            host.fetch("https://example.com", b""),
+            Err(RuntimeError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            host.storage_get("key"),
+            Err(RuntimeError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            host.secret_get("key"),
+            Err(RuntimeError::PermissionDenied(_))
+        ));
+    }
+
+    #[test]
+    fn domain_policy_requires_https_and_respects_wildcard_boundaries() {
+        let policy = CapabilityPolicy::deny_all().allow_domain("*.example.com");
+        assert!(policy.check_url("https://api.example.com/path").is_ok());
+        assert!(policy.check_url("https://example.com/path").is_err());
+        assert!(policy
+            .check_url("https://example.com.attacker.test")
+            .is_err());
+        assert!(policy.check_url("http://api.example.com/path").is_err());
+        assert!(policy
+            .check_url("https://user:pass@api.example.com")
+            .is_err());
+    }
+
+    #[test]
+    fn runtime_host_enforces_request_and_response_budgets() {
+        let mut policy = CapabilityPolicy::deny_all().allow_domain("example.com");
+        policy.limits.max_requests = 1;
+        policy.limits.max_response_bytes = 2;
+        let mut host =
+            RuntimeHost::new(policy).with_http_backend(Arc::new(FixedHttp(vec![1, 2, 3])));
+        assert!(matches!(
+            host.fetch("https://example.com", b""),
+            Err(RuntimeError::ResourceLimit(_))
+        ));
+        // 请求在调用后端前就已计数，响应过大时重试也不能绕过次数限制。
+        assert!(matches!(
+            host.fetch("https://example.com", b""),
+            Err(RuntimeError::ResourceLimit(_))
+        ));
+    }
+
+    #[test]
+    fn file_storage_isolated_by_root_and_rejects_unsafe_keys() {
+        let first_root = temp_root("storage-a");
+        let second_root = temp_root("storage-b");
+        let _ = std::fs::remove_dir_all(&first_root);
+        let _ = std::fs::remove_dir_all(&second_root);
+        let first = FileStorageBackend::new(first_root.clone()).unwrap();
+        let second = FileStorageBackend::new(second_root.clone()).unwrap();
+        first.set("same-key", b"first").unwrap();
+        assert_eq!(first.get("same-key").unwrap(), Some(b"first".to_vec()));
+        assert_eq!(second.get("same-key").unwrap(), None);
+        assert!(first.set("../escape", b"bad").is_err());
+        let _ = std::fs::remove_dir_all(first_root);
+        let _ = std::fs::remove_dir_all(second_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_secret_backend_writes_secrets_with_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_root("secrets");
+        let _ = std::fs::remove_dir_all(&root);
+        let backend = FileSecretBackend::new(root.clone()).unwrap();
+        backend.set("token", b"private").unwrap();
+        let mode = std::fs::metadata(root.join("token"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancellation_timeout_and_fuel_are_reported_separately() {
+        let mut policy = CapabilityPolicy::deny_all();
+        policy.limits.timeout_ms = 1;
+        let mut store = new_store(&policy).unwrap();
+        cancel(&mut store);
+        assert!(matches!(
+            check_execution_budget(&store),
+            Err(RuntimeError::ExecutionFailed(_))
+        ));
+        reset_execution_budget(&mut store, &policy).unwrap();
+        store.data_mut().started = Instant::now() - Duration::from_millis(10);
+        assert!(matches!(
+            check_execution_budget(&store),
+            Err(RuntimeError::ResourceLimit(_))
+        ));
+        reset_execution_budget(&mut store, &policy).unwrap();
+        store.set_fuel(0).unwrap();
+        assert!(matches!(
+            check_execution_budget(&store),
+            Err(RuntimeError::ResourceLimit(_))
+        ));
+    }
+
+    #[test]
+    fn metadata_validation_accepts_both_supported_abi_boundaries() {
+        for abi in ["0.1.0", "0.2.0"] {
+            let metadata = ilp_types::PluginMetadata {
+                abi_version: abi.into(),
+                site_name: "site".into(),
+                site_id: "site".into(),
+                site_domain: "example.com".into(),
+                plugin_name: "plugin".into(),
+                plugin_id: "plugin".into(),
+                version: "0.1.0".into(),
+                permissions: vec![],
+                allowed_domains: vec!["example.com".into()],
+            };
+            assert!(validate_metadata(&metadata).is_ok(), "ABI {abi}");
+        }
+    }
 }
