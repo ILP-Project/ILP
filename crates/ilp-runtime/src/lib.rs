@@ -10,7 +10,10 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use wasmtime::component::Component;
-use wasmtime::{Config as WasmtimeConfig, Engine, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{
+    Config as WasmtimeConfig, Engine, Store, StoreContextMut, StoreLimits, StoreLimitsBuilder,
+    UpdateDeadline,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResourceLimits {
@@ -113,13 +116,38 @@ pub struct RuntimeStore {
     pub cancelled: bool,
 }
 
+const EPOCH_TICK: Duration = Duration::from_millis(100);
+
+fn epoch_deadline(mut cx: StoreContextMut<'_, RuntimeStore>) -> wasmtime::Result<UpdateDeadline> {
+    let state = cx.data_mut();
+    if state.cancelled {
+        return Ok(UpdateDeadline::Interrupt);
+    }
+    let remaining = state.timeout.saturating_sub(state.started.elapsed());
+    if remaining.is_zero() {
+        return Ok(UpdateDeadline::Interrupt);
+    }
+    Ok(UpdateDeadline::Continue(
+        (remaining.as_millis() / EPOCH_TICK.as_millis()).max(1) as u64,
+    ))
+}
+
 pub fn shared_engine() -> &'static Engine {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
     ENGINE.get_or_init(|| {
         let mut config = WasmtimeConfig::new();
         config.consume_fuel(true);
         config.epoch_interruption(true);
-        Engine::new(&config).expect("创建 Wasmtime engine 失败")
+        let engine = Engine::new(&config).expect("创建 Wasmtime engine 失败");
+        let ticker = engine.clone();
+        std::thread::Builder::new()
+            .name("ilp-runtime-epoch".into())
+            .spawn(move || loop {
+                std::thread::sleep(EPOCH_TICK);
+                ticker.increment_epoch();
+            })
+            .expect("启动插件 epoch 线程失败");
+        engine
     })
 }
 
@@ -139,6 +167,8 @@ pub fn new_store(policy: &CapabilityPolicy) -> Result<Store<RuntimeStore>> {
         },
     );
     store.limiter(|state| &mut state.limits);
+    store.epoch_deadline_callback(epoch_deadline);
+    store.set_epoch_deadline((policy.limits.timeout_ms / EPOCH_TICK.as_millis() as u64).max(1));
     store
         .set_fuel(policy.limits.fuel)
         .map_err(|error| anyhow!("设置插件 fuel 失败: {error}"))?;
@@ -149,6 +179,24 @@ pub trait StorageBackend: Send + Sync {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
     fn set(&self, key: &str, value: &[u8]) -> Result<()>;
     fn delete(&self, key: &str) -> Result<()>;
+}
+
+pub trait HttpBackend: Send + Sync {
+    fn fetch(&self, url: &str, body: &[u8]) -> Result<Vec<u8>>;
+}
+
+pub fn validate_http_request(
+    policy: &CapabilityPolicy,
+    capabilities: &mut HostCapabilities,
+    url: &str,
+) -> std::result::Result<(), RuntimeError> {
+    if !capabilities.can_use("http") {
+        return Err(RuntimeError::PermissionDenied("插件未获 HTTP 权限".into()));
+    }
+    policy
+        .check_url(url)
+        .map_err(|error| RuntimeError::PermissionDenied(error.to_string()))?;
+    capabilities.consume_request()
 }
 
 pub trait SecretBackend: Send + Sync {
@@ -290,6 +338,7 @@ pub fn reset_execution_budget(
     store.data_mut().started = Instant::now();
     store.data_mut().timeout = Duration::from_millis(policy.limits.timeout_ms);
     store.data_mut().cancelled = false;
+    store.set_epoch_deadline((policy.limits.timeout_ms / EPOCH_TICK.as_millis() as u64).max(1));
     store
         .set_fuel(policy.limits.fuel)
         .map_err(|error| anyhow!("重置插件 fuel 失败: {error}"))?;
@@ -423,6 +472,20 @@ mod tests {
         assert!(capabilities.can_use("clock"));
         assert!(capabilities.consume_request().is_ok());
         assert!(capabilities.consume_request().is_err());
+    }
+
+    #[test]
+    fn http_validation_requires_permission_domain_and_budget() {
+        let mut policy = CapabilityPolicy::deny_all().allow_domain("example.com");
+        policy.limits.max_requests = 1;
+        let mut capabilities = HostCapabilities::from_policy(&policy);
+        assert!(validate_http_request(&policy, &mut capabilities, "https://example.com/a").is_ok());
+        assert!(
+            validate_http_request(&policy, &mut capabilities, "https://example.com/b").is_err()
+        );
+        assert!(
+            validate_http_request(&policy, &mut capabilities, "https://other.example/a").is_err()
+        );
     }
 
     #[test]
