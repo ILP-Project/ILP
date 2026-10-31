@@ -801,6 +801,7 @@ mod tests {
                 url: "a".into(),
                 fetch_url: "b".into(),
                 update_time: 0,
+                order_key: String::new(),
             }],
         };
         s.save_book("fanqie", "42", &book).expect("保存书籍");
@@ -832,6 +833,7 @@ mod tests {
                 url: "a".into(),
                 fetch_url: "b".into(),
                 update_time: 0,
+                order_key: String::new(),
             }],
         };
         s.save_book("fanqie", "42", &book).expect("保存书籍");
@@ -921,6 +923,7 @@ mod tests {
                 url: "a".to_string(),
                 fetch_url: "b".to_string(),
                 update_time: 0,
+                order_key: String::new(),
             }],
         };
         s.save_book("fanqie", "42", &book).expect("保存书籍");

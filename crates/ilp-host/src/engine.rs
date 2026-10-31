@@ -259,7 +259,10 @@ use current::ilp::plugin::types::{FetchTask, HttpResponse};
 
 pub use current::ilp::plugin::types as wit_types;
 
-use ilp_types::{ChapterEntry, ChapterResult, ChapterStatus, PluginMetadata, SearchResult};
+use ilp_types::{
+    validate_chapter_order, ChapterEntry, ChapterResult, ChapterStatus, PluginMetadata,
+    SearchResult,
+};
 
 /// 宿主给插件的全部能力对应的状态。
 pub struct HostState {
@@ -1059,20 +1062,20 @@ impl PluginInstance {
 
     pub fn catalog(&mut self, force: bool) -> Result<Vec<ChapterEntry>> {
         match &mut self.backend {
-            PluginBackend::Current { store, bindings } => Ok(guest_call(store, |s| {
-                bindings.ilp_plugin_plugin().call_catalog(s, force)
-            })?
-            .map_err(|e| anyhow!("plugin::{e}"))?
-            .into_iter()
-            .map(convert_entry)
-            .collect()),
-            PluginBackend::Legacy { store, bindings } => Ok(guest_call(store, |s| {
-                bindings.ilp_plugin_plugin().call_catalog(s, force)
-            })?
-            .map_err(|e| anyhow!("plugin::{e}"))?
-            .into_iter()
-            .map(convert_legacy_entry)
-            .collect()),
+            PluginBackend::Current { store, bindings } => {
+                let raw = guest_call(store, |s| {
+                    bindings.ilp_plugin_plugin().call_catalog(s, force)
+                })?
+                .map_err(|e| anyhow!("plugin::{e}"))?;
+                validate_catalog(raw.into_iter().map(convert_entry).collect())
+            }
+            PluginBackend::Legacy { store, bindings } => {
+                let raw = guest_call(store, |s| {
+                    bindings.ilp_plugin_plugin().call_catalog(s, force)
+                })?
+                .map_err(|e| anyhow!("plugin::{e}"))?;
+                validate_catalog(raw.into_iter().map(convert_legacy_entry).collect())
+            }
         }
     }
 
@@ -1159,6 +1162,11 @@ fn guest_call<T>(
     }
 }
 
+fn validate_catalog(chapters: Vec<ChapterEntry>) -> Result<Vec<ChapterEntry>> {
+    validate_chapter_order(&chapters).map_err(|e| anyhow!("目录顺序无效: {e}"))?;
+    Ok(chapters)
+}
+
 fn convert_chapter_result(c: ilp::plugin::types::ChapterResult) -> ChapterResult {
     ChapterResult {
         id: c.id,
@@ -1186,6 +1194,7 @@ fn convert_entry(e: ilp::plugin::types::ChapterEntry) -> ChapterEntry {
         url: e.url,
         fetch_url: e.fetch_url,
         update_time: e.update_time,
+        order_key: e.order_key,
     }
 }
 
@@ -1196,6 +1205,7 @@ fn convert_legacy_entry(e: legacy::ilp::plugin::types::ChapterEntry) -> ChapterE
         url: e.url,
         fetch_url: e.fetch_url,
         update_time: e.update_time,
+        order_key: String::new(),
     }
 }
 
