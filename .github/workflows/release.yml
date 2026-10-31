@@ -24,9 +24,6 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             name: linux-aarch64
-          - target: x86_64-apple-darwin
-            os: macos-13
-            name: macos-x86_64
           - target: aarch64-apple-darwin
             os: macos-14
             name: macos-aarch64
