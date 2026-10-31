@@ -171,12 +171,72 @@ impl IlpCore {
     }
 
     pub fn update_task_state(&self, task_id: Uuid, next: TaskState) -> Result<(), CoreError> {
-        let state = format!("{next:?}").to_lowercase();
-        self.storage
+        let storage = self
+            .storage
             .lock()
-            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?
-            .set_task_state(&task_id.to_string(), &state)
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?;
+        let id = task_id.to_string();
+        let current = storage
+            .task_state(&id)
+            .map_err(|error| CoreError::Storage(error.to_string()))?
+            .ok_or_else(|| CoreError::NotFound(id.clone()))?;
+        let current = parse_task_state(&current)
+            .ok_or_else(|| CoreError::Storage(format!("未知任务状态: {current}")))?;
+        if !current.can_transition_to(next) {
+            return Err(CoreError::Conflict(format!(
+                "任务状态不能从 {current:?} 转换为 {next:?}"
+            )));
+        }
+        storage
+            .set_task_state(&id, task_state_name(next))
             .map_err(|error| CoreError::Storage(error.to_string()))
+    }
+
+    pub fn recover_interrupted_tasks(&self) -> Result<Vec<Uuid>, CoreError> {
+        let storage = self
+            .storage
+            .lock()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?;
+        let tasks = storage
+            .task_states()
+            .map_err(|error| CoreError::Storage(error.to_string()))?;
+        let mut recovered = Vec::new();
+        for (id, state) in tasks {
+            if matches!(parse_task_state(&state), Some(TaskState::Running)) {
+                storage
+                    .set_task_state(&id, "interrupted")
+                    .map_err(|error| CoreError::Storage(error.to_string()))?;
+                if let Ok(task_id) = Uuid::parse_str(&id) {
+                    recovered.push(task_id);
+                }
+            }
+        }
+        Ok(recovered)
+    }
+}
+
+fn task_state_name(state: TaskState) -> &'static str {
+    match state {
+        TaskState::Queued => "queued",
+        TaskState::Running => "running",
+        TaskState::Paused => "paused",
+        TaskState::Completed => "completed",
+        TaskState::Failed => "failed",
+        TaskState::Cancelled => "cancelled",
+        TaskState::Interrupted => "interrupted",
+    }
+}
+
+fn parse_task_state(state: &str) -> Option<TaskState> {
+    match state {
+        "queued" => Some(TaskState::Queued),
+        "running" => Some(TaskState::Running),
+        "paused" => Some(TaskState::Paused),
+        "completed" => Some(TaskState::Completed),
+        "failed" => Some(TaskState::Failed),
+        "cancelled" => Some(TaskState::Cancelled),
+        "interrupted" => Some(TaskState::Interrupted),
+        _ => None,
     }
 }
 
