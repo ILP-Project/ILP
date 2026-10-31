@@ -133,7 +133,8 @@ fn arm_deadline(store: &mut Store<HostState>) {
     // fuel 也是“每次调用”的预算，不是整个进程的总量。
     // 不补充的话，第一个大章节批次就会烧完燃料，之后每次调用都直接
     // trap 成 “cannot enter component instance”。
-    if let Err(e) = store.set_fuel(MAX_PLUGIN_FUEL) {
+    let budget = store.data().fuel_budget;
+    if let Err(e) = store.set_fuel(budget) {
         tracing::warn!("补充插件 fuel 失败: {e}");
     }
 }
@@ -277,6 +278,9 @@ pub struct HostState {
     /// 本次调用里宿主函数（网络、磁盘）已经消耗的时间，不计入预算。
     host_wait: Duration,
     call_limit: Duration,
+    /// 单次调用可用的 fuel。测试需要把 fuel 让位给墙钟时改成 u64::MAX，
+    /// 否则 `arm_deadline` 每次调用都会把它补回默认值，测试前提被悄悄推翻。
+    fuel_budget: u64,
     /// epoch 回调因预算耗尽而中断过当前调用。
     timed_out: bool,
     /// epoch 回调因用户取消而中断过当前调用。
@@ -333,6 +337,7 @@ impl HostState {
             call_started: Instant::now(),
             host_wait: Duration::ZERO,
             call_limit: MAX_PLUGIN_CALL,
+            fuel_budget: MAX_PLUGIN_FUEL,
             timed_out: false,
             interrupted: false,
         }
@@ -1394,6 +1399,20 @@ mod tests {
     }
 
     #[test]
+    fn call_budget_is_rearmed_from_the_declared_fuel_budget() {
+        // 这条测试钉住的是不变量本身，不依赖机器快慢：
+        // `arm_deadline` 必须按 `fuel_budget` 补充燃料。之前它写死成
+        // MAX_PLUGIN_FUEL，把"测试想关掉 fuel"的意图悄悄覆盖掉，
+        // 于是死循环测试在 fuel 与墙钟之间形成竞速，偶发断言失败。
+        let engine = shared_engine();
+        let storage = std::env::temp_dir().join(format!("ilp-fuel-{}", std::process::id()));
+        let mut store = new_store(engine, HostState::new("fuel".to_string(), storage)).unwrap();
+        store.data_mut().fuel_budget = 7;
+        arm_deadline(&mut store);
+        assert_eq!(store.get_fuel().unwrap(), 7);
+    }
+
+    #[test]
     fn infinite_loop_is_interrupted_and_reported_as_timeout() {
         let engine = shared_engine();
         let module =
@@ -1404,6 +1423,12 @@ mod tests {
         let mut store =
             new_store(engine, HostState::new("spin".to_string(), storage.clone())).unwrap();
         // 关掉 fuel，否则先撞 fuel 而不是墙钟。
+        //
+        // 必须改 `fuel_budget` 而不是直接 `set_fuel`：`guest_call` 会先调
+        // `arm_deadline`，那里把 fuel 补回到预算值。只 `set_fuel` 的话，
+        // 死循环烧掉 1e9 指令所需的时间与 300ms 墙钟相当，两者形成竞速——
+        // 机器繁忙时 fuel 先耗尽，`timed_out` 就不会置位，这个断言随机失败。
+        store.data_mut().fuel_budget = u64::MAX;
         store.set_fuel(u64::MAX).unwrap();
         store.data_mut().call_limit = Duration::from_millis(300);
         let instance = wasmtime::Instance::new(&mut store, &module, &[]).expect("实例化");
