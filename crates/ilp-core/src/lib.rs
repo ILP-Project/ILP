@@ -150,6 +150,26 @@ impl IlpCore {
         self.runtime.block_on(future)
     }
 
+    pub async fn create_download_task_async(&self) -> Result<Uuid, CoreError> {
+        self.create_download_task()
+    }
+
+    pub async fn update_task_state_async(
+        &self,
+        task_id: Uuid,
+        next: TaskState,
+    ) -> Result<(), CoreError> {
+        self.update_task_state(task_id, next)
+    }
+
+    pub async fn events_after_async(
+        &self,
+        sequence: u64,
+        limit: u32,
+    ) -> Result<Vec<CoreEvent>, CoreError> {
+        self.events_after(sequence, limit)
+    }
+
     pub fn new_task_id(&self) -> Uuid {
         Uuid::new_v4()
     }
