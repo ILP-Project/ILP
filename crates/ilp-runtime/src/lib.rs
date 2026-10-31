@@ -24,6 +24,15 @@ pub mod component_bindings {
     });
 }
 
+pub struct HttpHandle;
+pub struct StorageHandle;
+pub struct SecretHandle;
+
+pub trait HostAdapter: Send + Sync {
+    fn log(&self, level: u8, message: &str);
+    fn now_ms(&self) -> u64;
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResourceLimits {
     pub max_memory_bytes: u64,
@@ -124,6 +133,7 @@ pub struct RuntimeStore {
     pub timeout: Duration,
     pub cancelled: bool,
     pub host: Option<RuntimeHost>,
+    pub adapter: Option<Box<dyn HostAdapter>>,
 }
 
 const EPOCH_TICK: Duration = Duration::from_millis(100);
@@ -184,6 +194,7 @@ pub fn new_store(policy: &CapabilityPolicy) -> Result<Store<RuntimeStore>> {
             timeout: Duration::from_millis(policy.limits.timeout_ms),
             cancelled: false,
             host: None,
+            adapter: None,
         },
     );
     store.limiter(|state| &mut state.limits);
