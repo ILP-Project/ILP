@@ -584,6 +584,10 @@ fn verify_artifact(bytes: &[u8], p: &RegistryPlugin) -> Result<()> {
     validate_wasm(bytes)
 }
 
+fn update_available(current: &str, latest: &str) -> bool {
+    current != latest
+}
+
 fn update(config: &Config, name: &str, apply: bool) -> Result<()> {
     let name = safe_plugin_name(name)?;
     let installed = config.plugins_dir().join(format!("{name}.wasm"));
@@ -608,7 +612,7 @@ fn update(config: &Config, name: &str, apply: bool) -> Result<()> {
         "插件 {name}: 当前 {}，registry latest {}",
         current.metadata.version, latest
     );
-    if current.metadata.version == *latest {
+    if !update_available(&current.metadata.version, latest) {
         println!("插件 {name} 已是最新版本");
         return Ok(());
     }
@@ -947,6 +951,20 @@ mod tests {
     use super::*;
     use crate::signing::SignatureEntry;
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+    #[test]
+    fn update_preview_only_reports_version_difference() {
+        assert!(!update_available("1.0.0", "1.0.0"));
+        assert!(update_available("1.0.0", "1.0.1"));
+        assert!(update_available("0.2.0", "1.0.0"));
+    }
+
+    #[test]
+    fn update_requires_an_installed_safe_name() {
+        assert!(safe_plugin_name("fanqie").is_ok());
+        assert!(safe_plugin_name("../fanqie").is_err());
+        assert!(safe_plugin_name("fanqie/other").is_err());
+    }
 
     #[test]
     fn source_accepts_name_and_optional_version() {
