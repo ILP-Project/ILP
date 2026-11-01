@@ -256,9 +256,7 @@ impl IlpCore {
         &self,
         plugin_id: &str,
     ) -> Result<Option<PluginRegistration>, CoreError> {
-        if plugin_id.trim().is_empty() {
-            return Err(CoreError::InvalidArgument("插件 ID 不能为空".into()));
-        }
+        validate_plugin_identifier("插件 ID", plugin_id)?;
         let storage = self
             .storage
             .lock()
@@ -680,6 +678,11 @@ fn unix_timestamp() -> String {
         .unwrap_or_else(|_| "0".into())
 }
 
+const MAX_PLUGIN_TEXT_CHARS: usize = 256;
+const MAX_PLUGIN_DOMAIN_CHARS: usize = 253;
+const MAX_PLUGIN_PERMISSIONS: usize = 32;
+const MAX_PLUGIN_DOMAINS: usize = 64;
+
 fn validate_registration(
     policy: &CapabilityPolicy,
     request: &PluginRegistrationRequest,
@@ -692,19 +695,26 @@ fn validate_registration(
         ("插件名称", metadata.plugin_name.as_str()),
         ("插件版本", metadata.version.as_str()),
     ] {
-        if value.trim().is_empty() {
-            return Err(CoreError::InvalidArgument(format!("{label}不能为空")));
-        }
-        if value.chars().any(char::is_control) {
-            return Err(CoreError::Plugin(format!("{label}包含控制字符")));
-        }
+        validate_plugin_text(label, value, MAX_PLUGIN_TEXT_CHARS)?;
     }
-    if metadata
-        .site_domain
-        .chars()
-        .any(|character| character == '/' || character.is_whitespace())
-    {
-        return Err(CoreError::Plugin("站点域名无效".into()));
+    for (label, value) in [
+        ("站点 ID", metadata.site_id.as_str()),
+        ("插件 ID", metadata.plugin_id.as_str()),
+    ] {
+        validate_plugin_identifier(label, value)?;
+    }
+    validate_plugin_domain("站点域名", &metadata.site_domain)?;
+    if metadata.permissions.len() > MAX_PLUGIN_PERMISSIONS {
+        return Err(CoreError::Plugin("插件权限数量超过限制".into()));
+    }
+    if metadata.allowed_domains.len() > MAX_PLUGIN_DOMAINS {
+        return Err(CoreError::Plugin("插件允许域名数量超过限制".into()));
+    }
+    for permission in &metadata.permissions {
+        validate_plugin_text("插件权限", permission, MAX_PLUGIN_TEXT_CHARS)?;
+    }
+    for domain in &metadata.allowed_domains {
+        validate_plugin_domain("允许域名", domain)?;
     }
     let hash = request.trust.content_hash.trim();
     if hash.len() != 64 || !hash.chars().all(|character| character.is_ascii_hexdigit()) {
@@ -713,15 +723,16 @@ fn validate_registration(
     if !request.trust.user_confirmed {
         return Err(CoreError::Plugin("插件尚未获得用户确认".into()));
     }
-    if request.trust.source.trim().is_empty() || request.trust.source.chars().any(char::is_control)
-    {
-        return Err(CoreError::Plugin("插件来源无效".into()));
-    }
+    validate_plugin_text("插件来源", &request.trust.source, MAX_PLUGIN_TEXT_CHARS)?;
     if request
         .trust
         .signature_key_id
         .as_deref()
-        .is_some_and(|key_id| key_id.trim().is_empty() || key_id.chars().any(char::is_control))
+        .is_some_and(|key_id| {
+            key_id.trim().is_empty()
+                || key_id.chars().any(char::is_control)
+                || key_id.chars().count() > MAX_PLUGIN_TEXT_CHARS
+        })
     {
         return Err(CoreError::Plugin("插件签名密钥 ID 无效".into()));
     }
@@ -744,7 +755,16 @@ fn validate_registration(
         .iter()
         .any(|permission| permission == "http")
     {
+        if metadata.allowed_domains.is_empty() {
+            return Err(CoreError::Plugin("申请 HTTP 权限时必须声明允许域名".into()));
+        }
+        policy
+            .check_domain(&metadata.site_domain)
+            .map_err(|error| CoreError::Plugin(error.to_string()))?;
         for domain in &metadata.allowed_domains {
+            if domain.contains('*') {
+                return Err(CoreError::Plugin("允许域名不支持通配符".into()));
+            }
             policy
                 .check_domain(domain)
                 .map_err(|error| CoreError::Plugin(error.to_string()))?;
@@ -761,6 +781,37 @@ fn validate_registration(
             user_confirmed: true,
         },
     })
+}
+
+fn validate_plugin_text(label: &str, value: &str, max_chars: usize) -> Result<(), CoreError> {
+    if value.trim().is_empty() {
+        return Err(CoreError::InvalidArgument(format!("{label}不能为空")));
+    }
+    if value.chars().count() > max_chars {
+        return Err(CoreError::Plugin(format!("{label}长度超过限制")));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(CoreError::Plugin(format!("{label}包含控制字符")));
+    }
+    Ok(())
+}
+
+fn validate_plugin_identifier(label: &str, value: &str) -> Result<(), CoreError> {
+    validate_plugin_text(label, value, MAX_PLUGIN_TEXT_CHARS)?;
+    if value.chars().any(char::is_whitespace) {
+        return Err(CoreError::Plugin(format!("{label}包含空白字符")));
+    }
+    Ok(())
+}
+
+fn validate_plugin_domain(label: &str, value: &str) -> Result<(), CoreError> {
+    validate_plugin_text(label, value, MAX_PLUGIN_DOMAIN_CHARS)?;
+    if value.chars().any(|character| {
+        character.is_whitespace() || matches!(character, '/' | ':' | '@' | '[' | ']')
+    }) {
+        return Err(CoreError::Plugin(format!("{label}无效")));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -881,11 +932,92 @@ mod tests {
             Err(CoreError::Plugin(message)) if message.contains("无权访问域名")
         ));
 
+        let mut storage_permission = plugin_request();
+        storage_permission.metadata.permissions = vec!["storage-read".into()];
+        storage_permission.metadata.allowed_domains.clear();
+        assert!(matches!(
+            PluginService::validate_registration(&core, &storage_permission),
+            Err(CoreError::Plugin(message)) if message.contains("未获授权能力")
+        ));
+
         let mut wrong_site = plugin_request();
         wrong_site.metadata.site_id = "other-site".into();
         assert!(matches!(
             PluginService::register(&core, &wrong_site),
             Err(CoreError::Conflict(message)) if message.contains("example")
+        ));
+        drop(core);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn plugin_registration_rejects_oversized_and_malformed_identity_fields() {
+        let data = std::env::temp_dir().join(format!("ilp-core-plugin-{}", Uuid::new_v4()));
+        let core = CoreBuilder::new(CoreConfig::new(&data)).build().unwrap();
+
+        let mut oversized = plugin_request();
+        oversized.metadata.plugin_id = "x".repeat(MAX_PLUGIN_TEXT_CHARS + 1);
+        assert!(matches!(
+            PluginService::validate_registration(&core, &oversized),
+            Err(CoreError::Plugin(message)) if message.contains("长度超过限制")
+        ));
+
+        let mut malformed_domain = plugin_request();
+        malformed_domain.metadata.site_domain = "https://example.com/path".into();
+        assert!(matches!(
+            PluginService::validate_registration(&core, &malformed_domain),
+            Err(CoreError::Plugin(message)) if message.contains("无效")
+        ));
+
+        let mut malformed_permission = plugin_request();
+        malformed_permission.metadata.permissions = vec!["unknown".into()];
+        malformed_permission.metadata.allowed_domains.clear();
+        assert!(matches!(
+            PluginService::validate_registration(&core, &malformed_permission),
+            Err(CoreError::Plugin(message)) if message.contains("未获授权能力")
+        ));
+        drop(core);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn plugin_registration_rejects_unbounded_and_ambiguous_metadata() {
+        let data = std::env::temp_dir().join(format!("ilp-core-plugin-{}", Uuid::new_v4()));
+        let mut config = CoreConfig::new(&data);
+        config.plugin_policy = CapabilityPolicy::deny_all().allow_domain("example.com");
+        let core = CoreBuilder::new(config).build().unwrap();
+
+        let mut missing_domains = plugin_request();
+        missing_domains.metadata.allowed_domains.clear();
+        assert!(matches!(
+            PluginService::validate_registration(&core, &missing_domains),
+            Err(CoreError::Plugin(message)) if message.contains("必须声明允许域名")
+        ));
+
+        let mut wildcard = plugin_request();
+        wildcard.metadata.allowed_domains = vec!["*.example.com".into()];
+        assert!(matches!(
+            PluginService::validate_registration(&core, &wildcard),
+            Err(CoreError::Plugin(message)) if message.contains("不支持通配符")
+        ));
+
+        let mut oversized = plugin_request();
+        oversized.metadata.plugin_name = "x".repeat(MAX_PLUGIN_TEXT_CHARS + 1);
+        assert!(matches!(
+            PluginService::validate_registration(&core, &oversized),
+            Err(CoreError::Plugin(message)) if message.contains("长度超过限制")
+        ));
+
+        let mut wrong_site_domain = plugin_request();
+        wrong_site_domain.metadata.site_domain = "other.example".into();
+        assert!(matches!(
+            PluginService::validate_registration(&core, &wrong_site_domain),
+            Err(CoreError::Plugin(message)) if message.contains("无权访问域名")
+        ));
+
+        assert!(matches!(
+            PluginService::registered_plugin(&core, "  "),
+            Err(CoreError::InvalidArgument(_))
         ));
         drop(core);
         let _ = std::fs::remove_dir_all(data);
