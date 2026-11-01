@@ -19,7 +19,7 @@ ILP_PUBKEY='release-2026:<base64-public-key>' sh install.sh
 ilp get chapter|cover|author|title|all <id> -s <site_id> [-f]
 ilp update <id> -s <site_id> [--apply]
 ilp search <keyword> -s <site_id>
-ilp plugin list|info|install|update|uninstall|enable|disable ...
+ilp plugin list|info|validate|install|update|uninstall|enable|disable ...
 ilp plugin new <name> [--site-name ..] [--domain ..]
 ilp doctor [--bundle <path>] [--with-manifest] [-y]
 ilp completion bash|zsh|fish|man [--output <path>]
@@ -31,7 +31,7 @@ ilp version
 
 - `update` 默认只生成新增章节报告；`--apply` 才保存新目录并下载。
 - `plugin update <name>` 默认只报告插件版本差异；`--apply` 才下载并替换插件。
-- `--jsonl` 输出 `update_report`、`chapter_added`、`chapter_downloaded` 等事件，不混入普通进度文本；字段约定见 [`docs/jsonl-events.md`](docs/jsonl-events.md)。
+- `--jsonl` 输出 `update_report`、`chapter_added`、`chapter_downloaded`、`plugin_list` 等事件，不混入普通进度文本；字段约定见 [`docs/jsonl-events.md`](docs/jsonl-events.md)。
 - `--verbose` 提高日志级别；TTY 显示即时进度，管道和重定向保持稳定输出。
 - `--quiet` 禁止终端进度和普通提示；`--log-file <path>` 将本次运行日志追加到指定文件。
 - `completion` 生成 Bash、Zsh、Fish completion 或 Unix man page；不指定 `--output` 时写入标准输出。
@@ -72,7 +72,7 @@ ilp plugin new my-site --site-name '示例站' --domain example.com
 
 插件通过 `plan-fetch` 生成请求，宿主执行请求，再由 `consume-fetch` 解析响应。插件不能直接访问网络、文件或数据库。
 
-`PluginInstance::load` 仅用于无授权的 metadata 加载，默认 deny-all，不会根据插件 metadata 自动发放能力；CLI 的插件发现、`plugin info` 和更新预览因此也保持 deny-all。只有可信调用方应使用 `load_with_policy` 显式传入 host ceiling，安装前校验则临时使用 registry 声明的 ceiling。
+`PluginInstance::load` 仅用于无授权的 metadata 加载，默认 deny-all，不会根据插件 metadata 自动发放能力；CLI 的插件发现、`plugin info` 和更新预览因此也保持 deny-all。`plugin list` 只读取 Core `PluginService::registered` 返回的已注册记录，不扫描插件目录，也不会把未注册 WASM 当作可信插件。只有可信调用方应使用 `load_with_policy` 显式传入 host ceiling，安装前校验则临时使用 registry 声明的 ceiling。
 
 正文结果保留 `ok`、`locked`、`captcha`、`auth-required`、`not-found`、`invalid`、`error` 状态；只有成功且有正文的结果才会写入文件。导出通过 `Exporter` trait，目前使用 `TxtExporter`。
 

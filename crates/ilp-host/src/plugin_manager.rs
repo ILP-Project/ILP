@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::collections::HashMap;
 use std::fs;
@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::cli::PluginCommand;
 use crate::config::Config;
 use crate::signing::SignatureSet;
+use ilp_core::{CoreBuilder, CoreConfig, PluginRegistration, PluginService};
 use ilp_types::PluginMetadata;
 
 /// 站点只发布一个 ABI 版本。必须与 `ilp-plugin-wit` 里
@@ -349,27 +350,85 @@ fn validate_domain(domain: &str) -> Result<()> {
     Ok(())
 }
 
-fn list(config: &Config) -> Result<()> {
-    let enabled = list_wasm(&config.plugins_dir());
-    let disabled = list_wasm(&config.disabled_plugins_dir());
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct PluginListItem {
+    plugin_id: String,
+    plugin_name: String,
+    site_id: String,
+    site_name: String,
+    version: String,
+    abi_version: String,
+    source: String,
+    signature_key_id: Option<String>,
+}
 
-    if enabled.is_empty() && disabled.is_empty() {
-        println!("没有已安装的插件。用 `ilp plugin install <name>` 安装。");
-        return Ok(());
-    }
-    if !enabled.is_empty() {
-        println!("已启用:");
-        for name in &enabled {
-            println!("  {name}");
-        }
-    }
-    if !disabled.is_empty() {
-        println!("已禁用:");
-        for name in &disabled {
-            println!("  {name}");
-        }
+fn list(config: &Config) -> Result<()> {
+    // 列表只读取 Core 的 registration authority；插件目录里的 WASM 可能是
+    // 未注册、未验证或已被替换的文件，不能因为文件存在就出现在信任列表中。
+    let registrations = registered_plugins(config)?;
+    if jsonl_enabled() {
+        println!("{}", plugin_list_json(&registrations));
+    } else {
+        print!("{}", plugin_list_text(&registrations));
     }
     Ok(())
+}
+
+fn registered_plugins(config: &Config) -> Result<Vec<PluginRegistration>> {
+    let core = CoreBuilder::new(CoreConfig::new(&config.data_folder))
+        .build()
+        .map_err(|error| anyhow!("读取 Core 插件注册表失败: {error}"))?;
+    PluginService::registered(&core).map_err(|error| anyhow!("读取 Core 插件注册表失败: {error}"))
+}
+
+fn jsonl_enabled() -> bool {
+    std::env::var_os("ILP_JSONL").is_some() || std::env::var_os("ILP_JSON").is_some()
+}
+
+fn plugin_list_item(registration: &PluginRegistration) -> PluginListItem {
+    PluginListItem {
+        plugin_id: registration.metadata.plugin_id.clone(),
+        plugin_name: registration.metadata.plugin_name.clone(),
+        site_id: registration.metadata.site_id.clone(),
+        site_name: registration.metadata.site_name.clone(),
+        version: registration.metadata.version.clone(),
+        abi_version: registration.metadata.abi_version.clone(),
+        source: registration.trust.source.clone(),
+        signature_key_id: registration.trust.signature_key_id.clone(),
+    }
+}
+
+fn plugin_list_json(registrations: &[PluginRegistration]) -> serde_json::Value {
+    let plugins: Vec<PluginListItem> = registrations.iter().map(plugin_list_item).collect();
+    serde_json::json!({
+        "event": "plugin_list",
+        "plugins": plugins,
+    })
+}
+
+fn plugin_list_text(registrations: &[PluginRegistration]) -> String {
+    if registrations.is_empty() {
+        return "没有已注册的插件。未注册的 WASM 不会列出。\n".into();
+    }
+
+    let mut output = String::from("已注册插件:\n");
+    for registration in registrations {
+        let signature = registration
+            .trust
+            .signature_key_id
+            .as_deref()
+            .unwrap_or("无");
+        output.push_str(&format!(
+            "  {} {}（站点: {}，ABI: {}，来源: {}，签名: {}）\n",
+            registration.metadata.plugin_id,
+            registration.metadata.version,
+            registration.metadata.site_id,
+            registration.metadata.abi_version,
+            registration.trust.source,
+            signature,
+        ));
+    }
+    output
 }
 
 fn validate_local(_config: &Config, path: &Path) -> Result<()> {
@@ -490,22 +549,6 @@ fn print_metadata(m: &PluginMetadata) {
         domains.sort();
         println!("声明的域名: {}", domains.join(", "));
     }
-}
-
-fn list_wasm(dir: &Path) -> Vec<String> {
-    let mut names = Vec::new();
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("wasm") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    names.push(stem.to_string());
-                }
-            }
-        }
-    }
-    names.sort();
-    names
 }
 
 /// 解析 `name[@version]`。两段都会进 URL 和文件名，必须白名单化。
@@ -1026,6 +1069,72 @@ mod tests {
     use super::*;
     use crate::signing::SignatureEntry;
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+    fn sample_registration() -> PluginRegistration {
+        PluginRegistration {
+            metadata: PluginMetadata {
+                abi_version: CURRENT_ABI.into(),
+                site_name: "示例站".into(),
+                site_id: "example".into(),
+                site_domain: "example.com".into(),
+                plugin_name: "示例插件".into(),
+                plugin_id: "plugin-example".into(),
+                version: "1.2.3".into(),
+                permissions: Vec::new(),
+                allowed_domains: Vec::new(),
+            },
+            trust: ilp_runtime::PluginTrust {
+                content_hash: "a".repeat(64),
+                signature_key_id: Some("release-2026".into()),
+                source: "registry:test".into(),
+                user_confirmed: true,
+            },
+        }
+    }
+
+    #[test]
+    fn plugin_list_text_contains_registered_metadata_and_trust_source() {
+        let output = plugin_list_text(&[sample_registration()]);
+        assert!(output.contains("plugin-example 1.2.3"));
+        assert!(output.contains("站点: example"));
+        assert!(output.contains("来源: registry:test"));
+        assert!(output.contains("签名: release-2026"));
+    }
+
+    #[test]
+    fn plugin_list_json_is_structured_and_does_not_expose_wasm_paths() {
+        let value = plugin_list_json(&[sample_registration()]);
+        assert_eq!(value["event"], "plugin_list");
+        assert_eq!(value["plugins"][0]["plugin_id"], "plugin-example");
+        assert_eq!(value["plugins"][0]["source"], "registry:test");
+        assert!(value["plugins"][0].get("path").is_none());
+    }
+
+    #[test]
+    fn plugin_list_reads_core_registrations_not_unregistered_wasm_files() {
+        let root = std::env::temp_dir().join(format!(
+            "ilp-plugin-list-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("系统时间应有效")
+                .as_nanos()
+        ));
+        let mut config = Config::default();
+        config.data_folder = root.join("data").display().to_string();
+        config.plugins_folder = root.join("plugins").display().to_string();
+        fs::create_dir_all(config.plugins_dir()).expect("创建插件目录");
+        fs::write(
+            config.plugins_dir().join("unregistered.wasm"),
+            b"not trusted",
+        )
+        .expect("写入未注册文件");
+
+        let registrations = registered_plugins(&config).expect("Core 注册表应可读取");
+        assert!(registrations.is_empty());
+        assert!(config.plugins_dir().join("unregistered.wasm").exists());
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn validate_command_rejects_missing_local_artifact_without_installing() {

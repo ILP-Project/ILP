@@ -37,6 +37,15 @@ ilp --jsonl update <book-id> -s <site-id> --apply
 
 `chapter_downloaded.status` 当前成功值为 `ok`。下载失败不会伪造成功事件；失败详情写入日志和最终统计。
 
+### `plugin_list`
+
+```json
+{"event":"plugin_list","plugins":[{"plugin_id":"plugin-example","plugin_name":"示例插件","site_id":"example","site_name":"示例站","version":"1.2.3","abi_version":"0.2.0","source":"registry:test","signature_key_id":"release-2026"}]}
+```
+
+`plugin list` 只从 Core 的 `PluginService::registered` 读取已注册记录；不会扫描插件
+目录，也不会列出或信任未注册的 WASM。空列表仍输出 `plugins: []`。
+
 ## 兼容规则
 
 - `event` 是事件类型，未知类型必须忽略而不是中止。

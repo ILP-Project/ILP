@@ -35,6 +35,11 @@ WASM，校验组件格式并在 deny-all 策略下读取和校验 metadata，然
 `plugin_registration` 的 trusted registration 或写入 Core 的信任记录。
 
 因此，`plugin info` 和 `plugin validate` 都是 inspection/validation，不是信任授予。
+`plugin list` 也只读 Core `PluginService::registered` 返回的注册记录：它不会扫描插件
+目录，不会加载或信任未注册的 WASM，也不会自动注册任何插件。文本输出显示已注册插件
+的 ID、版本、站点、来源和签名 key；`--jsonl plugin list` 输出一个 `plugin_list` 对象，
+其中 `plugins` 数组包含同一组摘要。
+
 只有上层取得可靠的用户确认、来源和签名验证结果后，才能调用
 `build_local_registration_request` / `register_local_plugin`；没有这样的交互式
 确认与签名流程时，不应把 `plugin_manager` 的安装结果自动接入 Core registration。
