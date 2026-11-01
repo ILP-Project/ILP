@@ -32,6 +32,49 @@ pub fn recover_interrupted_tasks(config: &crate::config::Config) -> Result<usize
     Ok(recovered.len())
 }
 
+pub fn resume_download(
+    plugins: &mut Vec<PluginInstance>,
+    config: &Config,
+    task_id: uuid::Uuid,
+) -> Result<()> {
+    let core = CoreBuilder::new(CoreConfig::new(&config.data_folder))
+        .build()
+        .map_err(|error| anyhow!("初始化 Core 恢复失败: {error}"))?;
+    let request = core
+        .download_request(task_id)
+        .map_err(|error| anyhow!("读取下载请求失败: {error}"))?
+        .ok_or_else(|| anyhow!("任务 {task_id} 没有可恢复的下载请求"))?;
+    let index = plugins
+        .iter()
+        .position(|plugin| plugin.metadata.plugin_id == request.plugin_id)
+        .ok_or_else(|| anyhow!("未找到任务所需的已加载插件 {}", request.plugin_id))?;
+    let plugin = plugins.swap_remove(index);
+    let backend =
+        crate::download_backend::PluginDownloadBackend::new(plugin, config.effective_max_workers());
+    let registration = ilp_core::PluginService::registered_plugin(&core, &request.plugin_id)
+        .map_err(|error| anyhow!("读取 Core 插件注册失败: {error}"))?
+        .ok_or_else(|| anyhow!("插件 {} 尚未注册到 Core", request.plugin_id))?;
+    let workflow =
+        crate::download_backend::HostDownloadWorkflow::new(&core, registration, Box::new(backend))
+            .map_err(|error| anyhow!("建立 Core 恢复工作流失败: {error}"))?;
+    let report = workflow
+        .resume_task(task_id)
+        .map_err(|error| anyhow!("恢复下载失败: {error}"))?;
+    if report.progress.failed > 0 {
+        return Err(anyhow::Error::new(crate::exit::PartialFailure(format!(
+            "有 {} 章下载失败（task {}）",
+            report.progress.failed, report.task_id
+        ))));
+    }
+    println!(
+        "{}: {} 成功，共 {} 章",
+        messages::DOWNLOAD_DONE,
+        report.progress.completed,
+        report.progress.total
+    );
+    Ok(())
+}
+
 pub fn install_signal_handlers() -> Result<()> {
     let mut error = None;
     SIGNALS_INSTALLED.call_once(|| {

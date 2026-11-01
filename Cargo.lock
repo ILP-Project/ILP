@@ -1415,6 +1415,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "uuid",
  "wasmtime",
  "wasmtime-wasi",
  "wiremock",

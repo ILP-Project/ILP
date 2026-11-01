@@ -189,6 +189,11 @@ impl<'a> HostDownloadWorkflow<'a> {
         self.run_with_mode(request, true)
     }
 
+    pub fn resume_task(&self, task_id: uuid::Uuid) -> Result<DownloadReport, CoreError> {
+        self.verify_registration()?;
+        DownloadWorkflow::new(self.core, self.backend.as_ref()).resume_task(task_id)
+    }
+
     fn run_with_mode(
         &self,
         request: DownloadRequest,

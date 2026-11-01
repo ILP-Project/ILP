@@ -62,6 +62,12 @@ pub enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// 恢复指定的中断下载任务
+    Resume {
+        /// 任务 UUID
+        #[arg(value_name = "TASK_ID")]
+        task_id: uuid::Uuid,
+    },
     /// 插件管理
     Plugin {
         #[command(subcommand)]
