@@ -821,8 +821,73 @@ fn install(config: &Config, source: &str) -> Result<()> {
     verdict?;
 
     write_atomic(&dest, &bytes)?;
+    if let Err(error) = register_verified_plugin(config, &dest, &bytes, p, &want) {
+        let _ = fs::remove_file(&dest);
+        return Err(error);
+    }
     println!("已安装插件 {name} {want} 到 {}", dest.display());
     Ok(())
+}
+
+/// 将已完成产物、签名和能力核对的插件写入 Core registration authority。
+///
+/// 安装是唯一会建立这条信任记录的产品路径；加载目录中的旧 WASM 不会
+/// 自动注册。Core 的 capability policy 使用安装时审核过的 metadata 作为
+/// ceiling，运行时仍会再次应用 host policy 和插件声明。
+fn register_verified_plugin(
+    config: &Config,
+    path: &Path,
+    bytes: &[u8],
+    registry: &RegistryPlugin,
+    version: &str,
+) -> Result<()> {
+    let host_policy = capability_policy(&registry.permissions, &registry.allowed_domains);
+    let plugin = crate::engine::PluginInstance::load_with_policy(
+        path,
+        &Path::new(&config.data_folder).join("plugins"),
+        host_policy,
+    )
+    .with_context(|| format!("读取已安装插件 {} 的 metadata 失败", registry.name))?;
+    let signature_key_id = registry
+        .signatures
+        .get(version)
+        .and_then(|signatures| signatures.iter().next())
+        .map(|signature| signature.key_id.clone());
+    let trust = crate::plugin_registration::LocalPluginTrustInputs {
+        content_hash: format!("{:x}", sha2::Sha256::digest(bytes)),
+        source: format!("registry:{}@{}", registry.name, version),
+        signature_key_id,
+        user_confirmed: true,
+    };
+    let mut core_config = CoreConfig::new(&config.data_folder);
+    core_config.plugin_policy = ilp_runtime::CapabilityPolicy {
+        allowed_domains: registry.allowed_domains.iter().cloned().collect(),
+        allow_storage: registry
+            .permissions
+            .iter()
+            .any(|permission| permission == "storage-read" || permission == "storage-write"),
+        allow_secrets: registry
+            .permissions
+            .iter()
+            .any(|permission| permission == "secret-read" || permission == "secret-write"),
+        limits: ilp_runtime::ResourceLimits::default(),
+    };
+    let core = CoreBuilder::new(core_config)
+        .build()
+        .map_err(|error| anyhow!("初始化 Core 插件注册失败: {error}"))?;
+    crate::plugin_registration::register_local_plugin(&core, plugin.metadata, bytes, Some(&trust))
+        .map_err(|error| anyhow!("写入 Core 插件注册失败: {error}"))?;
+    Ok(())
+}
+
+fn capability_policy(
+    permissions: &[String],
+    domains: &[String],
+) -> crate::engine::CapabilityPolicy {
+    crate::engine::CapabilityPolicy {
+        permissions: permissions.iter().cloned().collect(),
+        allowed_domains: domains.to_vec(),
+    }
 }
 
 /// 核对 registry 声明的权限与 WASM 自己的声明。
