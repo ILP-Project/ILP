@@ -625,6 +625,10 @@ impl IlpCore {
         Ok(())
     }
 
+    /// 将进程异常退出留下的运行中任务标记为 `interrupted`。
+    ///
+    /// 该接口只做状态恢复，不会猜测插件、书籍或下载请求，也不会自动重新执行。
+    /// 调用方必须取得原始请求并显式选择 `run_resumable`，避免缺少元数据时误抓取。
     pub fn recover_interrupted_tasks(&self) -> Result<Vec<Uuid>, CoreError> {
         let recovered = self
             .storage
