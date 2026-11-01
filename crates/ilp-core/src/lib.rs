@@ -662,6 +662,19 @@ impl<'a> DownloadWorkflow<'a> {
     }
 
     pub fn run(&self, request: DownloadRequest) -> Result<DownloadReport, CoreError> {
+        self.run_with_resume(request, false)
+    }
+
+    /// 继续下载时复用已经完整落盘的章节；默认 `run` 仍会重新抓取全部章节。
+    pub fn run_resumable(&self, request: DownloadRequest) -> Result<DownloadReport, CoreError> {
+        self.run_with_resume(request, true)
+    }
+
+    fn run_with_resume(
+        &self,
+        request: DownloadRequest,
+        resume: bool,
+    ) -> Result<DownloadReport, CoreError> {
         validate_download_request(&request)?;
         let plugin = self
             .core
@@ -710,6 +723,16 @@ impl<'a> DownloadWorkflow<'a> {
                 return Err(CoreError::Cancelled);
             }
             progress.current_chapter_id = Some(chapter.id.clone());
+            if resume && self.has_persisted_chapter(&request, chapter)? {
+                progress.completed += 1;
+                results.push(ChapterResult::ok(
+                    chapter.id.clone(),
+                    chapter.title.clone(),
+                    String::new(),
+                ));
+                self.core.append_progress_event(task_id, &progress)?;
+                continue;
+            }
             let result = self.fetch_chapter_with_retries(task_id, &plugin, &request, chapter)?;
             let result = normalize_chapter_result(chapter, result);
             if result.status == ChapterStatus::Ok {
@@ -754,6 +777,20 @@ impl<'a> DownloadWorkflow<'a> {
             progress,
             chapters: results,
         })
+    }
+
+    fn has_persisted_chapter(
+        &self,
+        request: &DownloadRequest,
+        chapter: &ChapterEntry,
+    ) -> Result<bool, CoreError> {
+        self.core
+            .storage
+            .lock()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?
+            .read_chapter(&request.book_id, &chapter.id)
+            .map(|content| content.is_some())
+            .map_err(|error| CoreError::Storage(error.to_string()))
     }
 
     fn fetch_chapter_with_retries(
@@ -1595,6 +1632,20 @@ mod tests {
             Some(CoreEvent::TaskStateChanged { task_id, state: TaskState::Completed, .. })
                 if *task_id == report.task_id
         ));
+
+        let resumed = DownloadWorkflow::new(&core, &backend)
+            .run_resumable(DownloadRequest {
+                plugin_id: "plugin-example".into(),
+                book_id: "book-1".into(),
+                title: "测试书".into(),
+                author: "测试作者".into(),
+                source_type: "fixture".into(),
+                source_id: "book-1".into(),
+            })
+            .unwrap();
+        assert_eq!(resumed.progress.completed, 2);
+        assert_eq!(backend.attempts.lock().unwrap().get("ch-1"), Some(&2));
+        assert_eq!(backend.attempts.lock().unwrap().get("ch-2"), Some(&2));
         drop(core);
         let _ = std::fs::remove_dir_all(data);
     }
