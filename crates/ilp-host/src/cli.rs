@@ -113,6 +113,11 @@ pub enum PluginCommand {
     List,
     /// 显示插件元数据与完整性信息
     Info { name: String },
+    /// 仅校验本地 WASM 与 metadata，不联网、不安装、不写入信任记录
+    Validate {
+        /// 本地 WASM 文件路径
+        path: std::path::PathBuf,
+    },
     /// 安装插件（name 或 name@version，省略版本即 latest）
     Install { source: String },
     /// 检查插件更新；默认只生成报告
@@ -201,6 +206,10 @@ mod tests {
         for (args, expected) in [
             (&["ilp", "plugin", "list"][..], "list"),
             (&["ilp", "plugin", "info", "fanqie"][..], "info"),
+            (
+                &["ilp", "plugin", "validate", "./plugin.wasm"][..],
+                "validate",
+            ),
             (&["ilp", "plugin", "install", "fanqie@1.2.3"][..], "install"),
             (&["ilp", "plugin", "uninstall", "fanqie"][..], "uninstall"),
             (&["ilp", "plugin", "enable", "fanqie"][..], "enable"),
@@ -214,6 +223,9 @@ mod tests {
                 Command::Plugin {
                     sub: PluginCommand::Info { .. },
                 } => "info",
+                Command::Plugin {
+                    sub: PluginCommand::Validate { .. },
+                } => "validate",
                 Command::Plugin {
                     sub: PluginCommand::Install { .. },
                 } => "install",

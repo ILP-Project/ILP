@@ -174,6 +174,7 @@ pub fn run(config: &Config, cmd: PluginCommand) -> Result<()> {
         } => new_plugin(&name, site_name, site_id, domain, dir),
         PluginCommand::List => list(config),
         PluginCommand::Info { name } => info(config, &name),
+        PluginCommand::Validate { path } => validate_local(config, &path),
         PluginCommand::Install { source } => install(config, &source),
         PluginCommand::Update { name, apply } => update(config, &name, apply),
         PluginCommand::Uninstall { name } => uninstall(config, &name),
@@ -368,6 +369,44 @@ fn list(config: &Config) -> Result<()> {
             println!("  {name}");
         }
     }
+    Ok(())
+}
+
+fn validate_local(_config: &Config, path: &Path) -> Result<()> {
+    if !path.is_file() {
+        return Err(anyhow!("本地插件文件不存在: {}", path.display()));
+    }
+    let bytes = fs::read(path).with_context(|| format!("读取本地插件失败: {}", path.display()))?;
+    validate_wasm(&bytes)?;
+
+    // PluginInstance 初始化运行时后端时会创建 storage/secret 目录。dry-run
+    // 不应触碰用户数据目录，因此只允许它写入一次性临时目录，并在结束后清理。
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temp_root = std::env::temp_dir().join(format!("ilp-plugin-validate-{nonce}"));
+    let result = (|| {
+        let plugin = crate::engine::PluginInstance::load_with_policy(
+            path,
+            &temp_root,
+            crate::engine::CapabilityPolicy::deny_all(),
+        )
+        .with_context(|| format!("读取本地插件 metadata 失败: {}", path.display()))?;
+        validate_inspected_metadata(&plugin.metadata)?;
+        Ok::<_, anyhow::Error>(plugin.metadata)
+    })();
+    let _ = fs::remove_dir_all(&temp_root);
+    let metadata = result?;
+
+    println!("本地插件校验通过（仅 dry-run，未联网、未安装、未写入信任记录）");
+    print_metadata(&metadata);
+    println!(
+        "文件: {}\n大小: {} 字节\nSHA-256: {:x}",
+        path.display(),
+        bytes.len(),
+        sha2::Sha256::digest(&bytes)
+    );
     Ok(())
 }
 
@@ -987,6 +1026,18 @@ mod tests {
     use super::*;
     use crate::signing::SignatureEntry;
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+    #[test]
+    fn validate_command_rejects_missing_local_artifact_without_installing() {
+        let root = std::env::temp_dir().join(format!("ilp-validate-test-{}", std::process::id()));
+        let mut config = Config::default();
+        config.data_folder = root.join("data").display().to_string();
+        let missing = root.join("missing.wasm");
+
+        let error = validate_local(&config, &missing).expect_err("缺少本地产物必须拒绝");
+        assert!(error.to_string().contains("本地插件文件不存在"));
+        assert!(!root.exists(), "校验失败也不应创建用户数据或信任记录");
+    }
 
     #[test]
     fn update_preview_only_reports_version_difference() {

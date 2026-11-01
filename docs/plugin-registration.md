@@ -26,3 +26,15 @@ registration。成功请求仍必须通过 Core `PluginService::register`，由 
 
 当前适配器只覆盖已有本地 metadata 和明确 trust inputs；网络下载、registry
 签名、产物签名验证和用户交互不属于该 API 的职责。
+
+## CLI 边界
+
+`ilp plugin validate <path>` 是本地插件的显式 dry-run 入口。它只读取给定的
+WASM，校验组件格式并在 deny-all 策略下读取和校验 metadata，然后打印摘要。该命令
+不会访问 registry 或下载网络产物，不会安装、启用插件，也不会调用
+`plugin_registration` 的 trusted registration 或写入 Core 的信任记录。
+
+因此，`plugin info` 和 `plugin validate` 都是 inspection/validation，不是信任授予。
+只有上层取得可靠的用户确认、来源和签名验证结果后，才能调用
+`build_local_registration_request` / `register_local_plugin`；没有这样的交互式
+确认与签名流程时，不应把 `plugin_manager` 的安装结果自动接入 Core registration。
