@@ -3,8 +3,8 @@
 //! Core 不读取命令行、不输出人类文本，也不直接暴露底层数据库；调用方通过
 //! 服务接口提交预定义用例，并订阅结构化事件。
 
-use ilp_runtime::{validate_metadata, CapabilityPolicy, ResourceLimits};
-use ilp_storage::{LibraryStorage, SqliteStorage, StoragePaths, StoredBook};
+use ilp_runtime::{validate_metadata, CapabilityPolicy, PluginTrust, ResourceLimits};
+use ilp_storage::{LibraryStorage, SqliteStorage, StoragePaths, StoredBook, StoredPlugin};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -64,6 +64,20 @@ impl TaskState {
 pub struct TaskSnapshot {
     pub task_id: Uuid,
     pub state: TaskState,
+}
+
+/// 已通过宿主完整性和信任检查后，交给 Core 注册的插件输入。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginRegistrationRequest {
+    pub metadata: ilp_types::PluginMetadata,
+    pub trust: PluginTrust,
+}
+
+/// Core 注册成功后返回的插件摘要；不包含 WASM 字节。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginRegistration {
+    pub metadata: ilp_types::PluginMetadata,
+    pub trust: PluginTrust,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -182,6 +196,91 @@ impl IlpCore {
 
     pub fn validate_plugin(&self, metadata: &ilp_types::PluginMetadata) -> Result<(), CoreError> {
         validate_metadata(metadata).map_err(|error| CoreError::Plugin(error.to_string()))
+    }
+
+    pub fn validate_plugin_registration(
+        &self,
+        request: &PluginRegistrationRequest,
+    ) -> Result<PluginRegistration, CoreError> {
+        validate_registration(&self.config.plugin_policy, request)
+    }
+
+    pub fn register_plugin(
+        &self,
+        request: &PluginRegistrationRequest,
+    ) -> Result<PluginRegistration, CoreError> {
+        let registration = self.validate_plugin_registration(request)?;
+        let plugin_id = registration.metadata.plugin_id.as_str();
+        let site_id = registration.metadata.site_id.as_str();
+        let mut storage = self
+            .storage
+            .lock()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?;
+        if let Some(existing) = storage
+            .list_plugins()
+            .map_err(|error| CoreError::Storage(error.to_string()))?
+            .into_iter()
+            .find(|plugin| {
+                plugin.metadata.site_id == site_id && plugin.metadata.plugin_id != plugin_id
+            })
+        {
+            return Err(CoreError::Conflict(format!(
+                "站点 {site_id} 已由插件 {} 注册",
+                existing.metadata.plugin_id
+            )));
+        }
+        if let Some(existing) = storage
+            .load_plugin(plugin_id)
+            .map_err(|error| CoreError::Storage(error.to_string()))?
+        {
+            if existing.metadata.site_id != site_id {
+                return Err(CoreError::Conflict(format!(
+                    "插件 {plugin_id} 已注册到站点 {}",
+                    existing.metadata.site_id
+                )));
+            }
+        }
+        storage
+            .save_plugin(&StoredPlugin {
+                metadata: registration.metadata.clone(),
+                content_hash: registration.trust.content_hash.clone(),
+                signature_key_id: registration.trust.signature_key_id.clone(),
+                source: registration.trust.source.clone(),
+                trusted_at: Some(unix_timestamp()),
+            })
+            .map_err(|error| CoreError::Storage(error.to_string()))?;
+        Ok(registration)
+    }
+
+    pub fn registered_plugin(
+        &self,
+        plugin_id: &str,
+    ) -> Result<Option<PluginRegistration>, CoreError> {
+        if plugin_id.trim().is_empty() {
+            return Err(CoreError::InvalidArgument("插件 ID 不能为空".into()));
+        }
+        let storage = self
+            .storage
+            .lock()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?;
+        storage
+            .load_plugin(plugin_id)
+            .map_err(|error| CoreError::Storage(error.to_string()))?
+            .map(|stored| plugin_registration_from_stored(&self.config.plugin_policy, stored))
+            .transpose()
+    }
+
+    pub fn registered_plugins(&self) -> Result<Vec<PluginRegistration>, CoreError> {
+        let storage = self
+            .storage
+            .lock()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?;
+        storage
+            .list_plugins()
+            .map_err(|error| CoreError::Storage(error.to_string()))?
+            .into_iter()
+            .map(|stored| plugin_registration_from_stored(&self.config.plugin_policy, stored))
+            .collect()
     }
 
     pub fn save_book(&self, book: &StoredBook) -> Result<(), CoreError> {
@@ -462,6 +561,31 @@ pub trait SyncService {
 pub trait PluginService {
     fn policy(&self) -> &CapabilityPolicy;
     fn resource_limits(&self) -> &ResourceLimits;
+
+    fn registered_plugin(&self, plugin_id: &str) -> Result<Option<PluginRegistration>, CoreError> {
+        let _ = plugin_id;
+        Err(CoreError::Plugin("插件注册服务未实现".into()))
+    }
+
+    fn validate_registration(
+        &self,
+        request: &PluginRegistrationRequest,
+    ) -> Result<PluginRegistration, CoreError> {
+        let _ = request;
+        Err(CoreError::Plugin("插件注册服务未实现".into()))
+    }
+
+    fn register(
+        &self,
+        request: &PluginRegistrationRequest,
+    ) -> Result<PluginRegistration, CoreError> {
+        let _ = request;
+        Err(CoreError::Plugin("插件注册服务未实现".into()))
+    }
+
+    fn registered(&self) -> Result<Vec<PluginRegistration>, CoreError> {
+        Err(CoreError::Plugin("插件注册服务未实现".into()))
+    }
 }
 
 impl LibraryService for IlpCore {
@@ -507,11 +631,167 @@ impl PluginService for IlpCore {
     fn resource_limits(&self) -> &ResourceLimits {
         &self.config.plugin_policy.limits
     }
+
+    fn validate_registration(
+        &self,
+        request: &PluginRegistrationRequest,
+    ) -> Result<PluginRegistration, CoreError> {
+        self.validate_plugin_registration(request)
+    }
+
+    fn register(
+        &self,
+        request: &PluginRegistrationRequest,
+    ) -> Result<PluginRegistration, CoreError> {
+        self.register_plugin(request)
+    }
+
+    fn registered_plugin(&self, plugin_id: &str) -> Result<Option<PluginRegistration>, CoreError> {
+        IlpCore::registered_plugin(self, plugin_id)
+    }
+
+    fn registered(&self) -> Result<Vec<PluginRegistration>, CoreError> {
+        self.registered_plugins()
+    }
+}
+
+fn plugin_registration_from_stored(
+    policy: &CapabilityPolicy,
+    stored: StoredPlugin,
+) -> Result<PluginRegistration, CoreError> {
+    validate_registration(
+        policy,
+        &PluginRegistrationRequest {
+            metadata: stored.metadata,
+            trust: PluginTrust {
+                content_hash: stored.content_hash,
+                signature_key_id: stored.signature_key_id,
+                source: stored.source,
+                user_confirmed: true,
+            },
+        },
+    )
+}
+
+fn unix_timestamp() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".into())
+}
+
+fn validate_registration(
+    policy: &CapabilityPolicy,
+    request: &PluginRegistrationRequest,
+) -> Result<PluginRegistration, CoreError> {
+    validate_metadata(&request.metadata).map_err(|error| CoreError::Plugin(error.to_string()))?;
+    let metadata = &request.metadata;
+    for (label, value) in [
+        ("站点名称", metadata.site_name.as_str()),
+        ("站点域名", metadata.site_domain.as_str()),
+        ("插件名称", metadata.plugin_name.as_str()),
+        ("插件版本", metadata.version.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(CoreError::InvalidArgument(format!("{label}不能为空")));
+        }
+        if value.chars().any(char::is_control) {
+            return Err(CoreError::Plugin(format!("{label}包含控制字符")));
+        }
+    }
+    if metadata
+        .site_domain
+        .chars()
+        .any(|character| character == '/' || character.is_whitespace())
+    {
+        return Err(CoreError::Plugin("站点域名无效".into()));
+    }
+    let hash = request.trust.content_hash.trim();
+    if hash.len() != 64 || !hash.chars().all(|character| character.is_ascii_hexdigit()) {
+        return Err(CoreError::Plugin("插件内容 SHA-256 无效".into()));
+    }
+    if !request.trust.user_confirmed {
+        return Err(CoreError::Plugin("插件尚未获得用户确认".into()));
+    }
+    if request.trust.source.trim().is_empty() || request.trust.source.chars().any(char::is_control)
+    {
+        return Err(CoreError::Plugin("插件来源无效".into()));
+    }
+    if request
+        .trust
+        .signature_key_id
+        .as_deref()
+        .is_some_and(|key_id| key_id.trim().is_empty() || key_id.chars().any(char::is_control))
+    {
+        return Err(CoreError::Plugin("插件签名密钥 ID 无效".into()));
+    }
+    for permission in &metadata.permissions {
+        let allowed = match permission.as_str() {
+            "http" => !policy.allowed_domains.is_empty(),
+            "storage-read" | "storage-write" => policy.allow_storage,
+            "secret-read" | "secret-write" => policy.allow_secrets,
+            "clock" => true,
+            _ => false,
+        };
+        if !allowed {
+            return Err(CoreError::Plugin(format!(
+                "插件请求未获授权能力: {permission}"
+            )));
+        }
+    }
+    if metadata
+        .permissions
+        .iter()
+        .any(|permission| permission == "http")
+    {
+        for domain in &metadata.allowed_domains {
+            policy
+                .check_domain(domain)
+                .map_err(|error| CoreError::Plugin(error.to_string()))?;
+        }
+    } else if !metadata.allowed_domains.is_empty() {
+        return Err(CoreError::Plugin("未申请 HTTP 权限却声明了允许域名".into()));
+    }
+    Ok(PluginRegistration {
+        metadata: metadata.clone(),
+        trust: PluginTrust {
+            content_hash: hash.to_ascii_lowercase(),
+            signature_key_id: request.trust.signature_key_id.clone(),
+            source: request.trust.source.clone(),
+            user_confirmed: true,
+        },
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plugin_metadata() -> ilp_types::PluginMetadata {
+        ilp_types::PluginMetadata {
+            abi_version: ilp_runtime::CURRENT_ABI.into(),
+            site_name: "示例站".into(),
+            site_id: "example".into(),
+            site_domain: "example.com".into(),
+            plugin_name: "example-plugin".into(),
+            plugin_id: "plugin-example".into(),
+            version: "1.0.0".into(),
+            permissions: vec!["http".into()],
+            allowed_domains: vec!["example.com".into()],
+        }
+    }
+
+    fn plugin_request() -> PluginRegistrationRequest {
+        PluginRegistrationRequest {
+            metadata: plugin_metadata(),
+            trust: PluginTrust {
+                content_hash: "A".repeat(64),
+                signature_key_id: Some("release-2026".into()),
+                source: "registry:test".into(),
+                user_confirmed: true,
+            },
+        }
+    }
 
     #[test]
     fn task_state_machine_rejects_terminal_restarts() {
@@ -526,6 +806,87 @@ mod tests {
         let core = CoreBuilder::new(CoreConfig::new(&data)).build().unwrap();
         assert_eq!(core.config().device_name, "设备");
         assert!(!core.new_task_id().is_nil());
+        drop(core);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn plugin_registration_validates_trust_and_policy_and_persists() {
+        let data = std::env::temp_dir().join(format!("ilp-core-plugin-{}", Uuid::new_v4()));
+        let mut config = CoreConfig::new(&data);
+        config.plugin_policy = CapabilityPolicy::deny_all().allow_domain("example.com");
+        let core = CoreBuilder::new(config).build().unwrap();
+        let request = plugin_request();
+
+        let registered = PluginService::register(&core, &request).unwrap();
+        assert_eq!(registered.trust.content_hash, "a".repeat(64));
+        assert_eq!(
+            PluginService::registered(&core).unwrap(),
+            vec![registered.clone()]
+        );
+        assert_eq!(
+            PluginService::register(&core, &request).unwrap(),
+            registered
+        );
+        assert_eq!(
+            PluginService::registered_plugin(&core, "plugin-example").unwrap(),
+            Some(registered.clone())
+        );
+        assert!(PluginService::registered_plugin(&core, "missing")
+            .unwrap()
+            .is_none());
+
+        let mut invalid = request;
+        invalid.trust.user_confirmed = false;
+        assert!(matches!(
+            PluginService::validate_registration(&core, &invalid),
+            Err(CoreError::Plugin(message)) if message.contains("用户确认")
+        ));
+        drop(core);
+
+        let mut config = CoreConfig::new(&data);
+        config.plugin_policy = CapabilityPolicy::deny_all().allow_domain("example.com");
+        let reopened = CoreBuilder::new(config).build().unwrap();
+        assert_eq!(
+            PluginService::registered_plugin(&reopened, "plugin-example")
+                .unwrap()
+                .unwrap()
+                .trust
+                .content_hash,
+            "a".repeat(64)
+        );
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn plugin_registration_rejects_site_conflicts_and_unauthorized_domains() {
+        let data = std::env::temp_dir().join(format!("ilp-core-plugin-{}", Uuid::new_v4()));
+        let mut config = CoreConfig::new(&data);
+        config.plugin_policy = CapabilityPolicy::deny_all().allow_domain("example.com");
+        let core = CoreBuilder::new(config).build().unwrap();
+        PluginService::register(&core, &plugin_request()).unwrap();
+
+        let mut conflict = plugin_request();
+        conflict.metadata.plugin_id = "other-plugin".into();
+        assert!(matches!(
+            PluginService::register(&core, &conflict),
+            Err(CoreError::Conflict(message)) if message.contains("example")
+        ));
+
+        let mut unauthorized = plugin_request();
+        unauthorized.metadata.allowed_domains = vec!["attacker.example".into()];
+        assert!(matches!(
+            PluginService::validate_registration(&core, &unauthorized),
+            Err(CoreError::Plugin(message)) if message.contains("无权访问域名")
+        ));
+
+        let mut wrong_site = plugin_request();
+        wrong_site.metadata.site_id = "other-site".into();
+        assert!(matches!(
+            PluginService::register(&core, &wrong_site),
+            Err(CoreError::Conflict(message)) if message.contains("example")
+        ));
         drop(core);
         let _ = std::fs::remove_dir_all(data);
     }
