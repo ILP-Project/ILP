@@ -550,6 +550,18 @@ impl IlpCore {
             .collect())
     }
 
+    pub fn task_state(&self, task_id: Uuid) -> Result<TaskState, CoreError> {
+        let id = task_id.to_string();
+        let state = self
+            .storage
+            .lock()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?
+            .task_state(&id)
+            .map_err(|error| CoreError::Storage(error.to_string()))?
+            .ok_or(CoreError::NotFound(id))?;
+        parse_task_state(&state).ok_or_else(|| CoreError::Storage(format!("未知任务状态: {state}")))
+    }
+
     pub fn update_task_state(&self, task_id: Uuid, next: TaskState) -> Result<(), CoreError> {
         let storage = self
             .storage
@@ -680,6 +692,9 @@ impl<'a> DownloadWorkflow<'a> {
         };
         let mut results = Vec::with_capacity(chapters.len());
         for chapter in &chapters {
+            if self.core.task_state(task_id)? == TaskState::Cancelled {
+                return Err(CoreError::Cancelled);
+            }
             progress.current_chapter_id = Some(chapter.id.clone());
             let result = match self.backend.fetch_chapter(&plugin, &request, chapter) {
                 Ok(result) => result,
@@ -719,6 +734,9 @@ impl<'a> DownloadWorkflow<'a> {
             }
             results.push(result);
             self.core.append_progress_event(task_id, &progress)?;
+            if self.core.task_state(task_id)? == TaskState::Cancelled {
+                return Err(CoreError::Cancelled);
+            }
         }
         progress.current_chapter_id = None;
         let final_state = if progress.failed == 0 {
@@ -1550,6 +1568,21 @@ mod tests {
         );
         drop(core);
         assert!(matches!(error, Err(DownloadBackendError::Unavailable(_))));
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn task_state_reads_persisted_state_for_cancellation_checks() {
+        let data = std::env::temp_dir().join(format!("ilp-core-task-state-{}", Uuid::new_v4()));
+        let core = CoreBuilder::new(CoreConfig::new(&data)).build().unwrap();
+        let task_id = core.create_download_task().unwrap();
+        assert_eq!(core.task_state(task_id).unwrap(), TaskState::Queued);
+        core.update_task_state(task_id, TaskState::Running).unwrap();
+        assert_eq!(core.task_state(task_id).unwrap(), TaskState::Running);
+        core.update_task_state(task_id, TaskState::Cancelled)
+            .unwrap();
+        assert_eq!(core.task_state(task_id).unwrap(), TaskState::Cancelled);
+        drop(core);
         let _ = std::fs::remove_dir_all(data);
     }
 
