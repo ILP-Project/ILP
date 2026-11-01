@@ -182,6 +182,18 @@ impl<'a> HostDownloadWorkflow<'a> {
 
     /// 执行下载；请求的 plugin_id 必须与构造时绑定的 registration 一致。
     pub fn run(&self, request: DownloadRequest) -> Result<DownloadReport, CoreError> {
+        self.run_with_mode(request, false)
+    }
+
+    pub fn run_resumable(&self, request: DownloadRequest) -> Result<DownloadReport, CoreError> {
+        self.run_with_mode(request, true)
+    }
+
+    fn run_with_mode(
+        &self,
+        request: DownloadRequest,
+        resume: bool,
+    ) -> Result<DownloadReport, CoreError> {
         if request.plugin_id != self.registration.metadata.plugin_id {
             return Err(CoreError::InvalidArgument(
                 "下载请求插件 ID 与已验证 registration 不一致".into(),
@@ -190,7 +202,12 @@ impl<'a> HostDownloadWorkflow<'a> {
         // Core 注册表可能在构造服务后被其他调用方修改；执行前再次确认，
         // 避免把旧 registration 与新的宿主状态拼接使用。
         self.verify_registration()?;
-        DownloadWorkflow::new(self.core, self.backend.as_ref()).run(request)
+        let workflow = DownloadWorkflow::new(self.core, self.backend.as_ref());
+        if resume {
+            workflow.run_resumable(request)
+        } else {
+            workflow.run(request)
+        }
     }
 
     fn verify_registration(&self) -> Result<(), CoreError> {

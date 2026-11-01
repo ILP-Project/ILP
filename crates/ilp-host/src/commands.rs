@@ -179,6 +179,7 @@ pub fn do_update(
             site_id,
             old_book.title,
             old_book.author,
+            true,
         );
     }
 
@@ -242,7 +243,7 @@ fn do_get_all_core(
     let mut plugin = plugins.swap_remove(index);
     let title = plugin.title()?;
     let author = plugin.author()?;
-    run_core_download(config, plugin, book_id, site_id, title, author)
+    run_core_download(config, plugin, book_id, site_id, title, author, false)
 }
 
 fn run_core_download(
@@ -252,6 +253,7 @@ fn run_core_download(
     site_id: &str,
     title: String,
     author: String,
+    resume: bool,
 ) -> Result<()> {
     let plugin_id = plugin.metadata.plugin_id.clone();
     let core = CoreBuilder::new(CoreConfig::new(&config.data_folder))
@@ -267,16 +269,20 @@ fn run_core_download(
     let workflow =
         crate::download_backend::HostDownloadWorkflow::new(&core, registration, Box::new(backend))
             .map_err(|error| anyhow!("建立 Core 下载工作流失败: {error}"))?;
-    let report = workflow
-        .run(DownloadRequest {
-            plugin_id,
-            book_id: book_id.to_string(),
-            title,
-            author,
-            source_type: site_id.to_string(),
-            source_id: book_id.to_string(),
-        })
-        .map_err(|error| anyhow!("Core 下载失败: {error}"))?;
+    let request = DownloadRequest {
+        plugin_id,
+        book_id: book_id.to_string(),
+        title,
+        author,
+        source_type: site_id.to_string(),
+        source_id: book_id.to_string(),
+    };
+    let report = if resume {
+        workflow.run_resumable(request)
+    } else {
+        workflow.run(request)
+    }
+    .map_err(|error| anyhow!("Core 下载失败: {error}"))?;
     if jsonl_enabled() {
         println!(
             "{}",
