@@ -16,6 +16,22 @@ const BATCH_SIZE: usize = 30;
 
 static SIGNALS_INSTALLED: Once = Once::new();
 
+/// 启动时把上次进程中断留下的任务恢复为 `interrupted`，由 Core 统一写入状态事件。
+///
+/// 宿主只负责生命周期边界，不直接读取或修改任务表；这样恢复逻辑与其他入口保持一致。
+pub fn recover_interrupted_tasks(config: &crate::config::Config) -> Result<usize> {
+    let core = CoreBuilder::new(CoreConfig::new(&config.data_folder))
+        .build()
+        .map_err(|error| anyhow!("初始化 Core 任务恢复失败: {error}"))?;
+    let recovered = core
+        .recover_interrupted_tasks()
+        .map_err(|error| anyhow!("恢复中断任务失败: {error}"))?;
+    if !recovered.is_empty() {
+        tracing::info!(count = recovered.len(), "已恢复上次中断的下载任务");
+    }
+    Ok(recovered.len())
+}
+
 pub fn install_signal_handlers() -> Result<()> {
     let mut error = None;
     SIGNALS_INSTALLED.call_once(|| {
