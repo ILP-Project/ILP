@@ -90,6 +90,19 @@ fn validate_jsonl_event(event: &serde_json::Value) -> bool {
                     .get("status")
                     .is_some_and(serde_json::Value::is_string)
         }
+        "download_report" => {
+            event
+                .get("task_id")
+                .is_some_and(serde_json::Value::is_string)
+                && event
+                    .get("book_id")
+                    .is_some_and(serde_json::Value::is_string)
+                && event
+                    .get("completed")
+                    .is_some_and(serde_json::Value::is_u64)
+                && event.get("failed").is_some_and(serde_json::Value::is_u64)
+                && event.get("total").is_some_and(serde_json::Value::is_u64)
+        }
         _ => false,
     }
 }
@@ -101,7 +114,7 @@ fn emit_event(event: serde_json::Value) {
 }
 
 pub fn do_update(
-    plugins: &mut [PluginInstance],
+    plugins: &mut Vec<PluginInstance>,
     config: &Config,
     book_id: &str,
     site_id: &str,
@@ -153,6 +166,22 @@ pub fn do_update(
     if !apply || added.is_empty() {
         return Ok(());
     }
+    if std::env::var_os("ILP_LEGACY_DOWNLOAD").is_none() {
+        let index = plugins
+            .iter()
+            .position(|candidate| candidate.site_id() == site_id)
+            .ok_or_else(|| anyhow!("未找到 site_id 为 {site_id} 的已加载插件"))?;
+        let plugin = plugins.swap_remove(index);
+        return run_core_download(
+            config,
+            plugin,
+            book_id,
+            site_id,
+            old_book.title,
+            old_book.author,
+        );
+    }
+
     let updated = Book {
         chapters: new_chapters,
         ..old_book
@@ -213,6 +242,17 @@ fn do_get_all_core(
     let mut plugin = plugins.swap_remove(index);
     let title = plugin.title()?;
     let author = plugin.author()?;
+    run_core_download(config, plugin, book_id, site_id, title, author)
+}
+
+fn run_core_download(
+    config: &Config,
+    plugin: PluginInstance,
+    book_id: &str,
+    site_id: &str,
+    title: String,
+    author: String,
+) -> Result<()> {
     let plugin_id = plugin.metadata.plugin_id.clone();
     let core = CoreBuilder::new(CoreConfig::new(&config.data_folder))
         .build()
