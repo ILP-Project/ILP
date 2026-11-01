@@ -414,11 +414,22 @@ fn info(config: &Config, name: &str) -> Result<()> {
         &storage_root,
         crate::engine::CapabilityPolicy::deny_all(),
     ) {
-        Ok(plugin) => print_metadata(&plugin.metadata),
+        Ok(plugin) => match validate_inspected_metadata(&plugin.metadata) {
+            Ok(()) => print_metadata(&plugin.metadata),
+            Err(error) => println!("\n插件 metadata 未通过 Core 校验: {error:#}"),
+        },
         // 加载失败不该让 info 整个失败：元数据与完整性信息本身是有用的。
         Err(e) => println!("\n无法读取插件内声明的元数据: {e:#}"),
     }
     Ok(())
+}
+
+/// 检查 info 读取到的 metadata，但不建立 trusted registration。
+///
+/// info 没有签名、来源或用户确认材料；即使 metadata 合法，也只能作为
+/// inspect 结果展示，不能写入 Core 的 StoredPlugin 或放宽运行时策略。
+fn validate_inspected_metadata(metadata: &PluginMetadata) -> Result<()> {
+    ilp_core::validate_plugin_metadata(metadata).map_err(|error| anyhow!(error.to_string()))
 }
 
 fn print_metadata(m: &PluginMetadata) {
@@ -1005,6 +1016,17 @@ mod tests {
             parse_source("my-plugin_2@0.1.0").expect("应接受"),
             ("my-plugin_2".to_string(), "0.1.0".to_string())
         );
+    }
+
+    #[test]
+    fn info_metadata_validation_uses_core_business_rules() {
+        let valid = meta(&["http"], &["example.com"]);
+        assert!(validate_inspected_metadata(&valid).is_ok());
+
+        let mut invalid = valid;
+        invalid.site_domain = "https://example.com/path".into();
+        let error = validate_inspected_metadata(&invalid).expect_err("无效 metadata 应拒绝");
+        assert!(error.to_string().contains("无效"));
     }
 
     #[test]

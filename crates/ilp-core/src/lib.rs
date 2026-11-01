@@ -195,7 +195,7 @@ impl IlpCore {
     }
 
     pub fn validate_plugin(&self, metadata: &ilp_types::PluginMetadata) -> Result<(), CoreError> {
-        validate_metadata(metadata).map_err(|error| CoreError::Plugin(error.to_string()))
+        validate_plugin_metadata(metadata)
     }
 
     pub fn validate_plugin_registration(
@@ -683,12 +683,12 @@ const MAX_PLUGIN_DOMAIN_CHARS: usize = 253;
 const MAX_PLUGIN_PERMISSIONS: usize = 32;
 const MAX_PLUGIN_DOMAINS: usize = 64;
 
-fn validate_registration(
-    policy: &CapabilityPolicy,
-    request: &PluginRegistrationRequest,
-) -> Result<PluginRegistration, CoreError> {
-    validate_metadata(&request.metadata).map_err(|error| CoreError::Plugin(error.to_string()))?;
-    let metadata = &request.metadata;
+/// 校验插件 metadata 的业务边界，不检查来源、签名或宿主授权。
+///
+/// 这是 inspect/info 可以复用的纯校验入口；它不能替代
+/// [`PluginService::validate_registration`]，后者还必须检查信任材料和能力策略。
+pub fn validate_plugin_metadata(metadata: &ilp_types::PluginMetadata) -> Result<(), CoreError> {
+    validate_metadata(metadata).map_err(|error| CoreError::Plugin(error.to_string()))?;
     for (label, value) in [
         ("站点名称", metadata.site_name.as_str()),
         ("站点域名", metadata.site_domain.as_str()),
@@ -716,6 +716,15 @@ fn validate_registration(
     for domain in &metadata.allowed_domains {
         validate_plugin_domain("允许域名", domain)?;
     }
+    Ok(())
+}
+
+fn validate_registration(
+    policy: &CapabilityPolicy,
+    request: &PluginRegistrationRequest,
+) -> Result<PluginRegistration, CoreError> {
+    validate_plugin_metadata(&request.metadata)?;
+    let metadata = &request.metadata;
     let hash = request.trust.content_hash.trim();
     if hash.len() != 64 || !hash.chars().all(|character| character.is_ascii_hexdigit()) {
         return Err(CoreError::Plugin("插件内容 SHA-256 无效".into()));
@@ -859,6 +868,19 @@ mod tests {
         assert!(!core.new_task_id().is_nil());
         drop(core);
         let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn plugin_metadata_validation_is_separate_from_trusted_registration() {
+        let metadata = plugin_metadata();
+        assert!(validate_plugin_metadata(&metadata).is_ok());
+
+        let mut malformed = metadata;
+        malformed.site_domain = "https://example.com/path".into();
+        assert!(matches!(
+            validate_plugin_metadata(&malformed),
+            Err(CoreError::Plugin(message)) if message.contains("无效")
+        ));
     }
 
     #[test]

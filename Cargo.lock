@@ -1403,6 +1403,7 @@ dependencies = [
  "ctrlc",
  "ed25519-dalek",
  "flate2",
+ "ilp-core",
  "ilp-runtime",
  "ilp-types",
  "reqwest",
