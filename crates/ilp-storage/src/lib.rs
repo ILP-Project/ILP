@@ -326,6 +326,47 @@ impl SqliteStorage {
         Ok(())
     }
 
+    pub fn save_chapter_and_index(
+        &self,
+        book_id: &str,
+        chapter_id: &str,
+        title: &str,
+        content: &[u8],
+        body: &str,
+    ) -> Result<PathBuf> {
+        let safe_book = sanitize_component(book_id);
+        let safe_chapter = sanitize_component(chapter_id);
+        let dir = self.paths.content_dir.join(&safe_book);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{safe_chapter}.txt"));
+        atomic_write(&path, content)?;
+        let digest = format!("{:x}", Sha256::digest(content));
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO chapter_files (book_id, chapter_id, path, bytes, sha256)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(book_id, chapter_id) DO UPDATE SET
+                 path=excluded.path, bytes=excluded.bytes, sha256=excluded.sha256",
+            params![
+                book_id,
+                chapter_id,
+                path.to_string_lossy(),
+                content.len() as i64,
+                digest
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM search_index WHERE book_id = ?1 AND chapter_title = ?2",
+            params![book_id, title],
+        )?;
+        tx.execute(
+            "INSERT INTO search_index(book_id, chapter_title, body) VALUES (?1, ?2, ?3)",
+            params![book_id, title, body],
+        )?;
+        tx.commit()?;
+        Ok(path)
+    }
+
     pub fn save_chapter(&self, book_id: &str, chapter_id: &str, content: &[u8]) -> Result<PathBuf> {
         let safe_book = sanitize_component(book_id);
         let safe_chapter = sanitize_component(chapter_id);

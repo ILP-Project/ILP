@@ -5,6 +5,7 @@
 
 use ilp_runtime::{validate_metadata, CapabilityPolicy, PluginTrust, ResourceLimits};
 use ilp_storage::{LibraryStorage, SqliteStorage, StoragePaths, StoredBook, StoredPlugin};
+use ilp_types::{validate_chapter_order, ChapterEntry, ChapterResult, ChapterStatus};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -22,6 +23,11 @@ pub enum CoreEvent {
         sequence: u64,
         task_id: Uuid,
         state: TaskState,
+    },
+    TaskProgress {
+        sequence: u64,
+        task_id: Uuid,
+        progress: DownloadProgress,
     },
     ResyncRequired {
         sequence: u64,
@@ -64,6 +70,77 @@ impl TaskState {
 pub struct TaskSnapshot {
     pub task_id: Uuid,
     pub state: TaskState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DownloadProgress {
+    pub completed: u32,
+    pub failed: u32,
+    pub total: u32,
+    pub current_chapter_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DownloadRequest {
+    pub plugin_id: String,
+    pub book_id: String,
+    pub title: String,
+    pub author: String,
+    pub source_type: String,
+    pub source_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadReport {
+    pub task_id: Uuid,
+    pub book_id: String,
+    pub progress: DownloadProgress,
+    pub chapters: Vec<ChapterResult>,
+}
+
+#[derive(Debug, Error)]
+pub enum DownloadBackendError {
+    #[error("下载后端不可用: {0}")]
+    Unavailable(String),
+    #[error("下载后端执行失败: {0}")]
+    Execution(String),
+}
+
+pub trait DownloadBackend: Send + Sync {
+    fn list_chapters(
+        &self,
+        plugin: &PluginRegistration,
+        request: &DownloadRequest,
+    ) -> Result<Vec<ChapterEntry>, DownloadBackendError>;
+
+    fn fetch_chapter(
+        &self,
+        plugin: &PluginRegistration,
+        request: &DownloadRequest,
+        chapter: &ChapterEntry,
+    ) -> Result<ChapterResult, DownloadBackendError>;
+}
+
+/// Core 默认不联网；前端必须显式注入一个下载后端。
+pub struct NoNetworkDownloadBackend;
+
+impl DownloadBackend for NoNetworkDownloadBackend {
+    fn list_chapters(
+        &self,
+        _plugin: &PluginRegistration,
+        _request: &DownloadRequest,
+    ) -> Result<Vec<ChapterEntry>, DownloadBackendError> {
+        Err(DownloadBackendError::Unavailable("未配置下载后端".into()))
+    }
+
+    fn fetch_chapter(
+        &self,
+        _plugin: &PluginRegistration,
+        _request: &DownloadRequest,
+        _chapter: &ChapterEntry,
+    ) -> Result<ChapterResult, DownloadBackendError> {
+        Err(DownloadBackendError::Unavailable("未配置下载后端".into()))
+    }
 }
 
 /// 已通过宿主完整性和信任检查后，交给 Core 注册的插件输入。
@@ -111,6 +188,8 @@ pub enum CoreError {
     Storage(String),
     #[error("插件错误: {0}")]
     Plugin(String),
+    #[error("下载后端错误: {0}")]
+    DownloadBackend(String),
     #[error("任务已取消")]
     Cancelled,
 }
@@ -477,6 +556,22 @@ impl IlpCore {
             .map_err(|error| CoreError::Storage(error.to_string()))
     }
 
+    fn append_progress_event(
+        &self,
+        task_id: Uuid,
+        progress: &DownloadProgress,
+    ) -> Result<(), CoreError> {
+        self.append_event_with_payload("task_progress", |sequence| {
+            serde_json::to_string(&CoreEvent::TaskProgress {
+                sequence,
+                task_id,
+                progress: progress.clone(),
+            })
+            .map_err(Into::into)
+        })?;
+        Ok(())
+    }
+
     pub fn recover_interrupted_tasks(&self) -> Result<Vec<Uuid>, CoreError> {
         let recovered = self
             .storage
@@ -499,10 +594,179 @@ impl IlpCore {
     }
 }
 
+/// 下载编排的最小 Core 闭环。网络、插件运行时和解析均由调用方注入，
+/// Core 只负责选择已注册插件、任务状态、结构化进度和持久化边界。
+pub struct DownloadWorkflow<'a> {
+    core: &'a IlpCore,
+    backend: &'a dyn DownloadBackend,
+}
+
+impl<'a> DownloadWorkflow<'a> {
+    pub fn new(core: &'a IlpCore, backend: &'a dyn DownloadBackend) -> Self {
+        Self { core, backend }
+    }
+
+    pub fn run(&self, request: DownloadRequest) -> Result<DownloadReport, CoreError> {
+        validate_download_request(&request)?;
+        let plugin = self
+            .core
+            .registered_plugin(&request.plugin_id)?
+            .ok_or_else(|| CoreError::NotFound(format!("插件 {}", request.plugin_id)))?;
+        let task_id = self.core.create_download_task()?;
+        self.core.update_task_state(task_id, TaskState::Running)?;
+
+        let chapters = match self.backend.list_chapters(&plugin, &request) {
+            Ok(chapters) => chapters,
+            Err(error) => {
+                let _ = self.core.update_task_state(task_id, TaskState::Failed);
+                return Err(CoreError::DownloadBackend(error.to_string()));
+            }
+        };
+        validate_chapter_order(&chapters).map_err(|error| {
+            let _ = self.core.update_task_state(task_id, TaskState::Failed);
+            CoreError::InvalidArgument(error)
+        })?;
+
+        let book = StoredBook {
+            id: request.book_id.clone(),
+            title: request.title.clone(),
+            author: request.author.clone(),
+            source_type: request.source_type.clone(),
+            source_id: request.source_id.clone(),
+            authorized: true,
+            chapters: chapters.clone(),
+        };
+        if let Err(error) = self.core.save_book(&book) {
+            let _ = self.core.update_task_state(task_id, TaskState::Failed);
+            return Err(error);
+        }
+
+        let total = u32::try_from(chapters.len())
+            .map_err(|_| CoreError::InvalidArgument("章节数量超过限制".into()))?;
+        let mut progress = DownloadProgress {
+            completed: 0,
+            failed: 0,
+            total,
+            current_chapter_id: None,
+        };
+        let mut results = Vec::with_capacity(chapters.len());
+        for chapter in &chapters {
+            progress.current_chapter_id = Some(chapter.id.clone());
+            let result = match self.backend.fetch_chapter(&plugin, &request, chapter) {
+                Ok(result) => result,
+                Err(error) => ChapterResult {
+                    id: chapter.id.clone(),
+                    title: chapter.title.clone(),
+                    status: ChapterStatus::Error,
+                    text: None,
+                    error_code: "backend_error".into(),
+                    retryable: true,
+                    message: Some(error.to_string()),
+                },
+            };
+            let result = normalize_chapter_result(chapter, result);
+            if result.status == ChapterStatus::Ok {
+                if let Some(text) = result.text.as_deref() {
+                    if let Err(error) = self.persist_chapter(&request, chapter, text) {
+                        progress.failed += 1;
+                        results.push(ChapterResult {
+                            id: chapter.id.clone(),
+                            title: chapter.title.clone(),
+                            status: ChapterStatus::Error,
+                            text: None,
+                            error_code: "storage_error".into(),
+                            retryable: true,
+                            message: Some(error.to_string()),
+                        });
+                        self.core.append_progress_event(task_id, &progress)?;
+                        continue;
+                    }
+                    progress.completed += 1;
+                } else {
+                    progress.failed += 1;
+                }
+            } else {
+                progress.failed += 1;
+            }
+            results.push(result);
+            self.core.append_progress_event(task_id, &progress)?;
+        }
+        progress.current_chapter_id = None;
+        let final_state = if progress.failed == 0 {
+            TaskState::Completed
+        } else {
+            TaskState::Failed
+        };
+        self.core.update_task_state(task_id, final_state)?;
+        Ok(DownloadReport {
+            task_id,
+            book_id: request.book_id,
+            progress,
+            chapters: results,
+        })
+    }
+
+    fn persist_chapter(
+        &self,
+        request: &DownloadRequest,
+        chapter: &ChapterEntry,
+        text: &str,
+    ) -> Result<(), CoreError> {
+        self.core
+            .storage
+            .lock()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?
+            .save_chapter_and_index(
+                &request.book_id,
+                &chapter.id,
+                &chapter.title,
+                text.as_bytes(),
+                text,
+            )
+            .map(|_| ())
+            .map_err(|error| CoreError::Storage(error.to_string()))
+    }
+}
+
+fn validate_download_request(request: &DownloadRequest) -> Result<(), CoreError> {
+    for (label, value) in [
+        ("插件 ID", request.plugin_id.as_str()),
+        ("书籍 ID", request.book_id.as_str()),
+        ("书名", request.title.as_str()),
+        ("作者", request.author.as_str()),
+        ("来源类型", request.source_type.as_str()),
+        ("来源 ID", request.source_id.as_str()),
+    ] {
+        if value.trim().is_empty() || value.chars().any(char::is_control) {
+            return Err(CoreError::InvalidArgument(format!("{label}无效")));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_chapter_result(chapter: &ChapterEntry, mut result: ChapterResult) -> ChapterResult {
+    if result.id != chapter.id {
+        result.status = ChapterStatus::Invalid;
+        result.text = None;
+        result.error_code = "chapter_id_mismatch".into();
+        result.retryable = false;
+        result.message = Some("插件返回了不匹配的章节 ID".into());
+    } else if result.status == ChapterStatus::Ok && result.text.as_deref().is_none_or(str::is_empty)
+    {
+        result.status = ChapterStatus::Invalid;
+        result.text = None;
+        result.error_code = "empty_body".into();
+        result.retryable = false;
+        result.message = Some("章节正文为空".into());
+    }
+    result
+}
+
 fn event_kind(event: &CoreEvent) -> &'static str {
     match event {
         CoreEvent::TaskCreated { .. } => "task_created",
         CoreEvent::TaskStateChanged { .. } => "task_state_changed",
+        CoreEvent::TaskProgress { .. } => "task_progress",
         CoreEvent::ResyncRequired { .. } => "resync_required",
     }
 }
@@ -511,6 +775,7 @@ fn event_sequence(event: &CoreEvent) -> u64 {
     match event {
         CoreEvent::TaskCreated { sequence, .. }
         | CoreEvent::TaskStateChanged { sequence, .. }
+        | CoreEvent::TaskProgress { sequence, .. }
         | CoreEvent::ResyncRequired { sequence } => *sequence,
     }
 }
@@ -1113,6 +1378,128 @@ mod tests {
             events[1]
         );
         drop(core);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    struct FakeDownloadBackend {
+        chapters: Vec<ChapterEntry>,
+        bodies: std::collections::HashMap<String, String>,
+    }
+
+    impl DownloadBackend for FakeDownloadBackend {
+        fn list_chapters(
+            &self,
+            _plugin: &PluginRegistration,
+            _request: &DownloadRequest,
+        ) -> Result<Vec<ChapterEntry>, DownloadBackendError> {
+            Ok(self.chapters.clone())
+        }
+
+        fn fetch_chapter(
+            &self,
+            _plugin: &PluginRegistration,
+            _request: &DownloadRequest,
+            chapter: &ChapterEntry,
+        ) -> Result<ChapterResult, DownloadBackendError> {
+            self.bodies
+                .get(&chapter.id)
+                .cloned()
+                .map(|body| ChapterResult::ok(chapter.id.clone(), chapter.title.clone(), body))
+                .ok_or_else(|| DownloadBackendError::Execution("fixture 缺少章节正文".into()))
+        }
+    }
+
+    #[test]
+    fn download_workflow_runs_fake_backend_end_to_end() {
+        let data = std::env::temp_dir().join(format!("ilp-core-download-{}", Uuid::new_v4()));
+        let mut config = CoreConfig::new(&data);
+        config.plugin_policy = CapabilityPolicy::deny_all().allow_domain("example.com");
+        let core = CoreBuilder::new(config).build().unwrap();
+        PluginService::register(&core, &plugin_request()).unwrap();
+        let chapters = vec![
+            ChapterEntry {
+                id: "ch-1".into(),
+                title: "第一章".into(),
+                url: "https://example.com/book/ch-1".into(),
+                fetch_url: "https://example.com/api/ch-1".into(),
+                update_time: 1,
+                order_key: "001".into(),
+            },
+            ChapterEntry {
+                id: "ch-2".into(),
+                title: "第二章".into(),
+                url: "https://example.com/book/ch-2".into(),
+                fetch_url: "https://example.com/api/ch-2".into(),
+                update_time: 2,
+                order_key: "002".into(),
+            },
+        ];
+        let backend = FakeDownloadBackend {
+            chapters: chapters.clone(),
+            bodies: [
+                ("ch-1".into(), "第一章正文".into()),
+                ("ch-2".into(), "第二章正文".into()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let report = DownloadWorkflow::new(&core, &backend)
+            .run(DownloadRequest {
+                plugin_id: "plugin-example".into(),
+                book_id: "book-1".into(),
+                title: "测试书".into(),
+                author: "测试作者".into(),
+                source_type: "fixture".into(),
+                source_id: "book-1".into(),
+            })
+            .unwrap();
+
+        assert_eq!(report.progress.completed, 2);
+        assert_eq!(report.progress.failed, 0);
+        assert_eq!(report.progress.total, 2);
+        assert!(report
+            .chapters
+            .iter()
+            .all(|chapter| chapter.status == ChapterStatus::Ok));
+        assert_eq!(core.list_books().unwrap(), vec!["book-1"]);
+        assert_eq!(core.search("第一章正文").unwrap(), vec!["book-1"]);
+        let events = core.events_after(0, 20).unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            CoreEvent::TaskProgress { task_id, progress, .. }
+                if *task_id == report.task_id && progress.completed == 2
+        )));
+        assert!(matches!(
+            events.last(),
+            Some(CoreEvent::TaskStateChanged { task_id, state: TaskState::Completed, .. })
+                if *task_id == report.task_id
+        ));
+        drop(core);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn default_download_backend_never_attempts_network() {
+        let data = std::env::temp_dir().join(format!("ilp-core-no-network-{}", Uuid::new_v4()));
+        let core = CoreBuilder::new(CoreConfig::new(&data)).build().unwrap();
+        let registration = PluginRegistration {
+            metadata: plugin_metadata(),
+            trust: plugin_request().trust,
+        };
+        let error = DownloadBackend::list_chapters(
+            &NoNetworkDownloadBackend,
+            &registration,
+            &DownloadRequest {
+                plugin_id: "plugin-example".into(),
+                book_id: "book-1".into(),
+                title: "测试书".into(),
+                author: "测试作者".into(),
+                source_type: "fixture".into(),
+                source_id: "book-1".into(),
+            },
+        );
+        drop(core);
+        assert!(matches!(error, Err(DownloadBackendError::Unavailable(_))));
         let _ = std::fs::remove_dir_all(data);
     }
 
