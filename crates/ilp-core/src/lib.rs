@@ -482,14 +482,26 @@ impl IlpCore {
     }
 
     pub fn create_download_task(&self) -> Result<Uuid, CoreError> {
+        self.create_download_task_for_request(None)
+    }
+
+    pub fn create_download_task_for_request(
+        &self,
+        request: Option<&DownloadRequest>,
+    ) -> Result<Uuid, CoreError> {
         let task_id = self.new_task_id();
+        let request_json = request
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| CoreError::InvalidArgument(format!("下载请求序列化失败: {error}")))?;
         self.storage
             .lock()
             .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?
-            .create_task_with_event(
+            .create_task_with_request_event(
                 &task_id.to_string(),
                 "download",
                 "queued",
+                request_json.as_deref(),
                 "task_created",
                 |sequence| {
                     serde_json::to_string(&CoreEvent::TaskCreated { sequence, task_id })
@@ -498,6 +510,20 @@ impl IlpCore {
             )
             .map_err(|error| CoreError::Storage(error.to_string()))?;
         Ok(task_id)
+    }
+
+    pub fn download_request(&self, task_id: Uuid) -> Result<Option<DownloadRequest>, CoreError> {
+        let raw = self
+            .storage
+            .lock()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?
+            .task_request(&task_id.to_string())
+            .map_err(|error| CoreError::Storage(error.to_string()))?;
+        raw.map(|value| {
+            serde_json::from_str(&value)
+                .map_err(|error| CoreError::Storage(format!("下载请求反序列化失败: {error}")))
+        })
+        .transpose()
     }
 
     pub fn task_event(&self, task_id: Uuid) -> Result<CoreEvent, CoreError> {
@@ -684,7 +710,7 @@ impl<'a> DownloadWorkflow<'a> {
             .core
             .registered_plugin(&request.plugin_id)?
             .ok_or_else(|| CoreError::NotFound(format!("插件 {}", request.plugin_id)))?;
-        let task_id = self.core.create_download_task()?;
+        let task_id = self.core.create_download_task_for_request(Some(&request))?;
         self.core.update_task_state(task_id, TaskState::Running)?;
 
         let chapters = match self.backend.list_chapters(&plugin, &request) {
@@ -1676,6 +1702,32 @@ mod tests {
         );
         drop(core);
         assert!(matches!(error, Err(DownloadBackendError::Unavailable(_))));
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn download_request_is_persisted_for_explicit_recovery() {
+        let data = std::env::temp_dir().join(format!("ilp-core-request-{}", Uuid::new_v4()));
+        let core = CoreBuilder::new(CoreConfig::new(&data)).build().unwrap();
+        let request = DownloadRequest {
+            plugin_id: "plugin-example".into(),
+            book_id: "book-1".into(),
+            title: "测试书".into(),
+            author: "测试作者".into(),
+            source_type: "fixture".into(),
+            source_id: "book-1".into(),
+        };
+        let task_id = core
+            .create_download_task_for_request(Some(&request))
+            .unwrap();
+        assert_eq!(
+            core.download_request(task_id).unwrap(),
+            Some(request.clone())
+        );
+        drop(core);
+        let reopened = CoreBuilder::new(CoreConfig::new(&data)).build().unwrap();
+        assert_eq!(reopened.download_request(task_id).unwrap(), Some(request));
+        drop(reopened);
         let _ = std::fs::remove_dir_all(data);
     }
 

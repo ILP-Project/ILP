@@ -134,11 +134,26 @@ impl SqliteStorage {
     where
         F: FnOnce(u64) -> Result<String>,
     {
+        self.create_task_with_request_event(id, kind, state, None, event_kind, make_payload)
+    }
+
+    pub fn create_task_with_request_event<F>(
+        &self,
+        id: &str,
+        kind: &str,
+        state: &str,
+        request: Option<&str>,
+        event_kind: &str,
+        make_payload: F,
+    ) -> Result<u64>
+    where
+        F: FnOnce(u64) -> Result<String>,
+    {
         let tx = self.db.unchecked_transaction()?;
         let now = unix_seconds()?;
         tx.execute(
-            "INSERT INTO tasks (id, kind, state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)",
-            params![id, kind, state, now],
+            "INSERT INTO tasks (id, kind, state, request, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![id, kind, state, request, now],
         )?;
         let sequence = next_event_sequence_tx(&tx)?;
         let payload = make_payload(sequence)?;
@@ -210,6 +225,15 @@ impl SqliteStorage {
         }
         tx.commit()?;
         Ok(recovered)
+    }
+
+    pub fn task_request(&self, id: &str) -> Result<Option<String>> {
+        self.db
+            .query_row("SELECT request FROM tasks WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn task_state(&self, id: &str) -> Result<Option<String>> {
@@ -562,6 +586,7 @@ fn migrate(db: &Connection) -> Result<()> {
              id TEXT PRIMARY KEY NOT NULL,
              kind TEXT NOT NULL,
              state TEXT NOT NULL,
+             request TEXT,
              created_at INTEGER NOT NULL,
              updated_at INTEGER NOT NULL
          );
@@ -588,6 +613,15 @@ fn migrate(db: &Connection) -> Result<()> {
              book_id UNINDEXED, title, author, chapter_title, body
          );",
     )?;
+    let has_request: bool = transaction
+        .prepare("PRAGMA table_info(tasks)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .any(|name| name == "request");
+    if !has_request {
+        transaction.execute("ALTER TABLE tasks ADD COLUMN request TEXT", [])?;
+    }
     transaction.execute(
         "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
