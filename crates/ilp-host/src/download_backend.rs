@@ -9,7 +9,10 @@
 //! 可信插件输入和能力授权边界稳定前，不能伪造注册信息或绕过 deny-all。
 
 use crate::engine::{self, PluginInstance};
-use ilp_core::{DownloadBackend, DownloadBackendError, DownloadRequest, PluginRegistration};
+use ilp_core::{
+    CoreError, DownloadBackend, DownloadBackendError, DownloadReport, DownloadRequest,
+    DownloadWorkflow, IlpCore, PluginRegistration,
+};
 use ilp_types::{
     validate_chapter_order, ChapterEntry, ChapterResult, ChapterStatus, PluginMetadata,
 };
@@ -140,6 +143,65 @@ impl PluginDownloadBackend {
     }
 }
 
+/// 已验证插件注册与宿主下载后端组成的 host-facing 下载服务。
+///
+/// 构造时只接受 Core 中已经存在且完全一致的 registration；该服务不会自动注册
+/// 插件，也不会因为传入了已加载实例而放宽 Core 的 capability policy。后端由调用方
+/// 注入并由服务持有，旧 CLI 不经过此入口。
+pub struct HostDownloadWorkflow<'a> {
+    core: &'a IlpCore,
+    registration: PluginRegistration,
+    backend: Box<dyn DownloadBackend>,
+}
+
+impl<'a> HostDownloadWorkflow<'a> {
+    /// 绑定一个已经通过宿主校验并加载的插件与 Core 下载编排。
+    pub fn new(
+        core: &'a IlpCore,
+        registration: PluginRegistration,
+        backend: Box<dyn DownloadBackend>,
+    ) -> Result<Self, CoreError> {
+        let service = Self {
+            core,
+            registration,
+            backend,
+        };
+        service.verify_registration()?;
+        Ok(service)
+    }
+
+    /// 执行下载；请求的 plugin_id 必须与构造时绑定的 registration 一致。
+    pub fn run(&self, request: DownloadRequest) -> Result<DownloadReport, CoreError> {
+        if request.plugin_id != self.registration.metadata.plugin_id {
+            return Err(CoreError::InvalidArgument(
+                "下载请求插件 ID 与已验证 registration 不一致".into(),
+            ));
+        }
+        // Core 注册表可能在构造服务后被其他调用方修改；执行前再次确认，
+        // 避免把旧 registration 与新的宿主状态拼接使用。
+        self.verify_registration()?;
+        DownloadWorkflow::new(self.core, self.backend.as_ref()).run(request)
+    }
+
+    fn verify_registration(&self) -> Result<(), CoreError> {
+        let registered = self
+            .core
+            .registered_plugin(&self.registration.metadata.plugin_id)?
+            .ok_or_else(|| {
+                CoreError::NotFound(format!(
+                    "插件 {} 未在 Core 注册",
+                    self.registration.metadata.plugin_id
+                ))
+            })?;
+        if registered != self.registration {
+            return Err(CoreError::Conflict(
+                "传入的插件 registration 与 Core 注册记录不一致".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl DownloadBackend for PluginDownloadBackend {
     fn list_chapters(
         &self,
@@ -241,6 +303,8 @@ fn require_single_chapter_result(
 mod tests {
     use super::*;
     use ilp_core::DownloadBackend;
+    use ilp_core::{CoreBuilder, CoreConfig, LibraryService, PluginService, SearchService};
+    use ilp_runtime::CapabilityPolicy;
 
     fn metadata() -> PluginMetadata {
         PluginMetadata {
@@ -276,6 +340,54 @@ mod tests {
             author: "测试作者".into(),
             source_type: "test".into(),
             source_id: "book-1".into(),
+        }
+    }
+
+    fn core_with_registration() -> (ilp_core::IlpCore, PluginRegistration, std::path::PathBuf) {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let data = std::env::temp_dir().join(format!("ilp-host-workflow-{suffix}"));
+        let mut config = CoreConfig::new(&data);
+        config.plugin_policy = CapabilityPolicy::deny_all().allow_domain("example.com");
+        let core = CoreBuilder::new(config).build().unwrap();
+        let registration = registration();
+        PluginService::register(
+            &core,
+            &ilp_core::PluginRegistrationRequest {
+                metadata: registration.metadata.clone(),
+                trust: registration.trust.clone(),
+            },
+        )
+        .unwrap();
+        (core, registration, data)
+    }
+
+    struct FixtureBackend {
+        chapters: Vec<ChapterEntry>,
+    }
+
+    impl DownloadBackend for FixtureBackend {
+        fn list_chapters(
+            &self,
+            _plugin: &PluginRegistration,
+            _request: &DownloadRequest,
+        ) -> Result<Vec<ChapterEntry>, DownloadBackendError> {
+            Ok(self.chapters.clone())
+        }
+
+        fn fetch_chapter(
+            &self,
+            _plugin: &PluginRegistration,
+            _request: &DownloadRequest,
+            chapter: &ChapterEntry,
+        ) -> Result<ChapterResult, DownloadBackendError> {
+            Ok(ChapterResult::ok(
+                chapter.id.clone(),
+                chapter.title.clone(),
+                "fixture 正文".into(),
+            ))
         }
     }
 
@@ -476,6 +588,81 @@ mod tests {
         let error = require_single_chapter_result(vec![result], "ch-1")
             .expect_err("章节 ID 不匹配必须拒绝");
         assert!(error.to_string().contains("预期 ch-1"));
+    }
+
+    #[test]
+    fn host_workflow_runs_registered_plugin_backend_end_to_end() {
+        let (core, registration, data) = core_with_registration();
+        let workflow = HostDownloadWorkflow::new(
+            &core,
+            registration,
+            Box::new(FixtureBackend {
+                chapters: vec![chapter("ch-1")],
+            }),
+        )
+        .unwrap();
+        let report = workflow.run(request()).unwrap();
+
+        assert_eq!(report.progress.completed, 1);
+        assert_eq!(report.progress.failed, 0);
+        assert_eq!(report.chapters[0].text.as_deref(), Some("fixture 正文"));
+        assert_eq!(core.list_books().unwrap(), vec!["book-1"]);
+        assert_eq!(core.search("fixture 正文").unwrap(), vec!["book-1"]);
+        drop(workflow);
+        drop(core);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn host_workflow_rejects_registration_drift_and_unregistered_plugin() {
+        let (core, mut registration, data) = core_with_registration();
+        registration.trust.source = "different-source".into();
+        let error = HostDownloadWorkflow::new(
+            &core,
+            registration.clone(),
+            Box::new(FixtureBackend { chapters: vec![] }),
+        )
+        .err()
+        .expect("registration 漂移必须拒绝");
+        assert!(matches!(error, CoreError::Conflict(message) if message.contains("不一致")));
+
+        registration.metadata.plugin_id = "not-registered".into();
+        let error = HostDownloadWorkflow::new(
+            &core,
+            registration,
+            Box::new(FixtureBackend { chapters: vec![] }),
+        )
+        .err()
+        .expect("未注册插件必须拒绝");
+        assert!(
+            matches!(error, CoreError::NotFound(message) if message.contains("未在 Core 注册"))
+        );
+        drop(core);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn host_workflow_rejects_request_for_a_different_plugin_before_backend() {
+        let (core, registration, data) = core_with_registration();
+        let workflow = HostDownloadWorkflow::new(
+            &core,
+            registration,
+            Box::new(FixtureBackend {
+                chapters: vec![chapter("ch-1")],
+            }),
+        )
+        .unwrap();
+        let mut different_plugin = request();
+        different_plugin.plugin_id = "other-plugin".into();
+        let error = workflow
+            .run(different_plugin)
+            .expect_err("请求插件 ID 漂移必须拒绝");
+        assert!(
+            matches!(error, CoreError::InvalidArgument(message) if message.contains("registration"))
+        );
+        drop(workflow);
+        drop(core);
+        let _ = std::fs::remove_dir_all(data);
     }
 
     #[test]
