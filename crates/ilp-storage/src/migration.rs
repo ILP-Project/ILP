@@ -451,10 +451,74 @@ fn default_backup_path(data_dir: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SqliteStorage;
+    use crate::{LibraryStorage, SqliteStorage};
+    use rusqlite::params;
 
     fn temp_dir(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("ilp-storage-{name}-{}", std::process::id()))
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ilp-storage-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    struct TestDetector {
+        report: LegacyDetectionReport,
+    }
+
+    impl LegacyDetector for TestDetector {
+        fn detect(&self, paths: &StoragePaths) -> Result<LegacyDetectionReport> {
+            assert_eq!(&self.report.data_dir, &paths.data_dir);
+            Ok(self.report.clone())
+        }
+    }
+
+    struct TestMigrator {
+        fail: bool,
+    }
+
+    impl LegacyMigrator for TestMigrator {
+        fn format(&self) -> &str {
+            "test-legacy"
+        }
+
+        fn migrate(
+            &self,
+            _detection: &LegacyDetectionReport,
+            transaction: &Transaction<'_>,
+        ) -> Result<u64> {
+            transaction.execute(
+                "INSERT INTO books
+                 (id, title, author, source_type, source_id, authorized, chapters, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    "migrated-book",
+                    "迁移测试",
+                    "测试作者",
+                    "legacy",
+                    "legacy-1",
+                    false,
+                    "[]",
+                    0_i64,
+                ],
+            )?;
+            if self.fail {
+                return Err(anyhow!("测试迁移失败"));
+            }
+            Ok(1)
+        }
+    }
+
+    fn known_detection(data_dir: &Path) -> LegacyDetectionReport {
+        LegacyDetectionReport {
+            data_dir: data_dir.to_path_buf(),
+            format: LegacyFormat::Known("test-legacy".into()),
+            artifacts: vec![LegacyArtifact {
+                path: data_dir.join("legacy.txt"),
+                kind: LegacyArtifactKind::File,
+                bytes: 6,
+            }],
+        }
     }
 
     #[test]
@@ -493,6 +557,7 @@ mod tests {
             "正文".as_bytes()
         );
         assert!(backup_cannot_overwrite(&paths, &detection, &destination));
+        assert_eq!(fs::read(destination.join("cache.db")).unwrap(), b"cache");
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(destination);
     }
@@ -503,6 +568,90 @@ mod tests {
         destination: &Path,
     ) -> bool {
         backup_legacy_data_to(paths, detection, destination).is_err()
+    }
+
+    #[test]
+    fn migration_api_smoke_returns_structured_report_and_commits() {
+        let root = temp_dir("migration-smoke");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("legacy.txt"), b"legacy").unwrap();
+        let paths = StoragePaths::new(&root);
+        let mut storage = SqliteStorage::open(paths.clone()).unwrap();
+        let detector = TestDetector {
+            report: known_detection(&root),
+        };
+        let migrator = TestMigrator { fail: false };
+        let report = storage
+            .migrate_legacy_with(&detector, Some(&migrator))
+            .unwrap();
+
+        assert_eq!(report.status, MigrationStatus::Migrated);
+        assert_eq!(report.records_migrated, 1);
+        assert_eq!(report.backup.as_ref().unwrap().files, 1);
+        assert_eq!(storage.list_book_ids().unwrap(), vec!["migrated-book"]);
+        let structured = serde_json::to_value(&report).unwrap();
+        assert_eq!(structured["status"], "Migrated");
+        assert_eq!(structured["records_migrated"], 1);
+        let backup = report.backup.as_ref().unwrap().destination.clone();
+        assert!(backup.exists());
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(backup);
+    }
+
+    #[test]
+    fn failed_migration_rolls_back_database_and_keeps_backup() {
+        let root = temp_dir("migration-rollback");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("legacy.txt"), b"legacy").unwrap();
+        let paths = StoragePaths::new(&root);
+        let mut storage = SqliteStorage::open(paths.clone()).unwrap();
+        let backup_prefix = "ilp-storage-migration-rollback-";
+        let backups_before = fs::read_dir(root.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(backup_prefix))
+            })
+            .collect::<std::collections::HashSet<_>>();
+        storage
+            .save_book(&crate::StoredBook {
+                id: "existing-book".into(),
+                title: "迁移前的书".into(),
+                author: "测试作者".into(),
+                source_type: "test".into(),
+                source_id: "existing-1".into(),
+                authorized: false,
+                chapters: Vec::new(),
+            })
+            .unwrap();
+        let detector = TestDetector {
+            report: known_detection(&root),
+        };
+        let migrator = TestMigrator { fail: true };
+        let error = storage
+            .migrate_legacy_with(&detector, Some(&migrator))
+            .unwrap_err();
+        assert!(matches!(error, MigrationError::Transaction(_)));
+        assert_eq!(storage.list_book_ids().unwrap(), vec!["existing-book"]);
+        assert_eq!(fs::read(root.join("legacy.txt")).unwrap(), b"legacy");
+        let backups = fs::read_dir(root.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(backup_prefix))
+            })
+            .filter(|path| !backups_before.contains(path))
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read(backups[0].join("legacy.txt")).unwrap(), b"legacy");
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(&backups[0]);
     }
 
     #[test]
