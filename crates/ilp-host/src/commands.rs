@@ -57,21 +57,22 @@ pub fn resume_download(
     let workflow =
         crate::download_backend::HostDownloadWorkflow::new(&core, registration, Box::new(backend))
             .map_err(|error| anyhow!("建立 Core 恢复工作流失败: {error}"))?;
-    let report = workflow
-        .resume_task(task_id)
-        .map_err(|error| anyhow!("恢复下载失败: {error}"))?;
+    let report = workflow.resume_task(task_id).map_err(download_error)?;
+    emit_download_report(&report);
     if report.progress.failed > 0 {
         return Err(anyhow::Error::new(crate::exit::PartialFailure(format!(
             "有 {} 章下载失败（task {}）",
             report.progress.failed, report.task_id
         ))));
     }
-    println!(
-        "{}: {} 成功，共 {} 章",
-        messages::DOWNLOAD_DONE,
-        report.progress.completed,
-        report.progress.total
-    );
+    if !jsonl_enabled() {
+        println!(
+            "{}: {} 成功，共 {} 章",
+            messages::DOWNLOAD_DONE,
+            report.progress.completed,
+            report.progress.total
+        );
+    }
     Ok(())
 }
 
@@ -153,6 +154,27 @@ fn validate_jsonl_event(event: &serde_json::Value) -> bool {
 fn emit_event(event: serde_json::Value) {
     if jsonl_enabled() && validate_jsonl_event(&event) {
         println!("{event}");
+    }
+}
+
+fn emit_download_report(report: &ilp_core::DownloadReport) {
+    if jsonl_enabled() {
+        emit_event(serde_json::json!({
+            "event": "download_report",
+            "task_id": report.task_id,
+            "book_id": report.book_id,
+            "completed": report.progress.completed,
+            "failed": report.progress.failed,
+            "total": report.progress.total,
+        }));
+    }
+}
+
+fn download_error(error: ilp_core::CoreError) -> anyhow::Error {
+    if matches!(error, ilp_core::CoreError::Cancelled) {
+        anyhow::Error::new(crate::cancel::Cancelled).context("下载中途")
+    } else {
+        anyhow!("Core 下载失败: {error}")
     }
 }
 
@@ -325,20 +347,9 @@ fn run_core_download(
     } else {
         workflow.run(request)
     }
-    .map_err(|error| anyhow!("Core 下载失败: {error}"))?;
-    if jsonl_enabled() {
-        println!(
-            "{}",
-            serde_json::json!({
-                "event": "download_report",
-                "task_id": report.task_id,
-                "book_id": report.book_id,
-                "completed": report.progress.completed,
-                "failed": report.progress.failed,
-                "total": report.progress.total,
-            })
-        );
-    } else {
+    .map_err(download_error)?;
+    emit_download_report(&report);
+    if !jsonl_enabled() {
         println!(
             "{}: {} 成功，{} 失败，共 {} 章",
             messages::DOWNLOAD_DONE,
