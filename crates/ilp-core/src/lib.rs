@@ -692,25 +692,40 @@ impl<'a> DownloadWorkflow<'a> {
     }
 
     pub fn run(&self, request: DownloadRequest) -> Result<DownloadReport, CoreError> {
-        self.run_with_resume(request, false)
+        self.run_with_resume(request, false, None)
     }
 
     /// 继续下载时复用已经完整落盘的章节；默认 `run` 仍会重新抓取全部章节。
     pub fn run_resumable(&self, request: DownloadRequest) -> Result<DownloadReport, CoreError> {
-        self.run_with_resume(request, true)
+        self.run_with_resume(request, true, None)
+    }
+
+    /// 使用任务自身持久化的请求恢复一个 interrupted 下载任务。
+    pub fn resume_task(&self, task_id: Uuid) -> Result<DownloadReport, CoreError> {
+        if self.core.task_state(task_id)? != TaskState::Interrupted {
+            return Err(CoreError::Conflict("只有 interrupted 任务可以恢复".into()));
+        }
+        let request = self
+            .core
+            .download_request(task_id)?
+            .ok_or_else(|| CoreError::Conflict("任务没有可恢复的下载请求".into()))?;
+        self.core.update_task_state(task_id, TaskState::Queued)?;
+        self.run_with_resume(request, true, Some(task_id))
     }
 
     fn run_with_resume(
         &self,
         request: DownloadRequest,
         resume: bool,
+        existing_task_id: Option<Uuid>,
     ) -> Result<DownloadReport, CoreError> {
         validate_download_request(&request)?;
         let plugin = self
             .core
             .registered_plugin(&request.plugin_id)?
             .ok_or_else(|| CoreError::NotFound(format!("插件 {}", request.plugin_id)))?;
-        let task_id = self.core.create_download_task_for_request(Some(&request))?;
+        let task_id =
+            existing_task_id.unwrap_or(self.core.create_download_task_for_request(Some(&request))?);
         self.core.update_task_state(task_id, TaskState::Running)?;
 
         let chapters = match self.backend.list_chapters(&plugin, &request) {
@@ -1745,6 +1760,10 @@ mod tests {
         assert!(matches!(
             core.cancel_task(Uuid::new_v4()),
             Err(CoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            DownloadWorkflow::new(&core, &NoNetworkDownloadBackend).resume_task(task_id),
+            Err(CoreError::Conflict(message)) if message.contains("只有 interrupted")
         ));
         drop(core);
         let _ = std::fs::remove_dir_all(data);
