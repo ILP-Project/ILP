@@ -562,6 +562,18 @@ impl IlpCore {
         parse_task_state(&state).ok_or_else(|| CoreError::Storage(format!("未知任务状态: {state}")))
     }
 
+    /// 请求取消任务。重复取消已经取消的任务保持幂等；已完成或失败的任务
+    /// 不允许被改写，避免前端把历史结果重新解释为取消。
+    pub fn cancel_task(&self, task_id: Uuid) -> Result<(), CoreError> {
+        match self.task_state(task_id)? {
+            TaskState::Cancelled => Ok(()),
+            TaskState::Queued | TaskState::Running | TaskState::Paused | TaskState::Interrupted => {
+                self.update_task_state(task_id, TaskState::Cancelled)
+            }
+            state => Err(CoreError::Conflict(format!("任务处于 {state:?}，不能取消"))),
+        }
+    }
+
     pub fn update_task_state(&self, task_id: Uuid, next: TaskState) -> Result<(), CoreError> {
         let storage = self
             .storage
@@ -1579,9 +1591,13 @@ mod tests {
         assert_eq!(core.task_state(task_id).unwrap(), TaskState::Queued);
         core.update_task_state(task_id, TaskState::Running).unwrap();
         assert_eq!(core.task_state(task_id).unwrap(), TaskState::Running);
-        core.update_task_state(task_id, TaskState::Cancelled)
-            .unwrap();
+        core.cancel_task(task_id).unwrap();
+        core.cancel_task(task_id).unwrap();
         assert_eq!(core.task_state(task_id).unwrap(), TaskState::Cancelled);
+        assert!(matches!(
+            core.cancel_task(Uuid::new_v4()),
+            Err(CoreError::NotFound(_))
+        ));
         drop(core);
         let _ = std::fs::remove_dir_all(data);
     }
