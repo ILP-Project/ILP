@@ -5,7 +5,7 @@ use crate::engine::PluginInstance;
 use crate::exporter::{Document, DocumentChapter, Exporter, TxtExporter};
 use crate::messages;
 use crate::storage::{Book, Storage};
-use ilp_core::{CoreBuilder, CoreConfig};
+use ilp_core::{CoreBuilder, CoreConfig, StoredBook};
 use ilp_types::{ChapterResult, ChapterStatus};
 use std::io::IsTerminal;
 use std::sync::Once;
@@ -141,6 +141,7 @@ pub fn do_update(
         chapters: new_chapters,
         ..old_book
     };
+    core_validate_book(config, site_id, book_id, &updated)?;
     storage.save_book(site_id, book_id, &updated)?;
     let _lock = storage.lock_book(site_id, book_id)?;
     fetch_all(plugin, &storage, config, site_id, book_id, &updated)
@@ -187,6 +188,23 @@ fn core_validate_chapters(config: &Config, chapters: &[ilp_types::ChapterEntry])
         .map_err(|error| anyhow!("Core 拒绝章节目录: {error}"))
 }
 
+fn core_validate_book(config: &Config, site_id: &str, book_id: &str, book: &Book) -> Result<()> {
+    let core = CoreBuilder::new(CoreConfig::new(&config.data_folder))
+        .build()
+        .map_err(|error| anyhow!("初始化 Core 书籍校验失败: {error}"))?;
+    let stored = StoredBook {
+        id: book_id.to_string(),
+        title: book.title.clone(),
+        author: book.author.clone(),
+        source_type: site_id.to_string(),
+        source_id: book_id.to_string(),
+        authorized: true,
+        chapters: book.chapters.clone(),
+    };
+    core.validate_book(&stored)
+        .map_err(|error| anyhow!("Core 拒绝保存书籍: {error}"))
+}
+
 fn do_chapters(
     plugin: &mut PluginInstance,
     storage: &Storage,
@@ -222,6 +240,7 @@ fn do_chapters(
                 cover_url,
                 chapters,
             };
+            core_validate_book(config, site_id, book_id, &b)?;
             storage.save_book(site_id, book_id, &b)?;
             b
         }

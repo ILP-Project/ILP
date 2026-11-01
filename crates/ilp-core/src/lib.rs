@@ -4,7 +4,8 @@
 //! 服务接口提交预定义用例，并订阅结构化事件。
 
 use ilp_runtime::{validate_metadata, CapabilityPolicy, PluginTrust, ResourceLimits};
-use ilp_storage::{LibraryStorage, SqliteStorage, StoragePaths, StoredBook, StoredPlugin};
+pub use ilp_storage::StoredBook;
+use ilp_storage::{LibraryStorage, SqliteStorage, StoragePaths, StoredPlugin};
 use ilp_types::{validate_chapter_order, ChapterEntry, ChapterResult, ChapterStatus};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -285,6 +286,25 @@ impl IlpCore {
         validate_chapter_order(chapters).map_err(CoreError::InvalidArgument)
     }
 
+    /// 校验书籍保存请求的通用不变量。
+    ///
+    /// 宿主可以继续使用兼容缓存格式，但不得把缺少身份信息或无效目录的书籍
+    /// 写入缓存。此方法只做纯校验，不读取或修改 Core 存储。
+    pub fn validate_book(&self, book: &StoredBook) -> Result<(), CoreError> {
+        for (name, value) in [
+            ("书籍 ID", book.id.as_str()),
+            ("书名", book.title.as_str()),
+            ("作者", book.author.as_str()),
+            ("来源类型", book.source_type.as_str()),
+            ("来源 ID", book.source_id.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(CoreError::InvalidArgument(format!("{name}不能为空")));
+            }
+        }
+        self.validate_chapters(&book.chapters)
+    }
+
     pub fn validate_plugin_registration(
         &self,
         request: &PluginRegistrationRequest,
@@ -369,6 +389,7 @@ impl IlpCore {
     }
 
     pub fn save_book(&self, book: &StoredBook) -> Result<(), CoreError> {
+        self.validate_book(book)?;
         self.storage
             .lock()
             .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?
@@ -1124,6 +1145,27 @@ mod tests {
                 user_confirmed: true,
             },
         }
+    }
+
+    #[test]
+    fn validate_book_rejects_missing_identity_and_invalid_chapters() {
+        let data = std::env::temp_dir().join(format!("ilp-core-test-{}", Uuid::new_v4()));
+        let core = CoreBuilder::new(CoreConfig::new(&data)).build().unwrap();
+        let book = StoredBook {
+            id: String::new(),
+            title: "书".into(),
+            author: "作者".into(),
+            source_type: "fixture".into(),
+            source_id: "book-1".into(),
+            authorized: true,
+            chapters: Vec::new(),
+        };
+        assert!(matches!(
+            core.validate_book(&book),
+            Err(CoreError::InvalidArgument(message)) if message.contains("书籍 ID")
+        ));
+        drop(core);
+        let _ = std::fs::remove_dir_all(data);
     }
 
     #[test]
