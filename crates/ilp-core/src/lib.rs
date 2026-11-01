@@ -277,6 +277,14 @@ impl IlpCore {
         validate_plugin_metadata(metadata)
     }
 
+    /// 校验插件返回的章节目录，避免宿主在落盘前重复 ID 或 `order_key`。
+    ///
+    /// 该入口只做纯校验，不读取或修改 Core 存储；CLI 等前端可以在迁移期间
+    /// 继续使用自己的缓存格式，同时复用 Core 的目录不变量。
+    pub fn validate_chapters(&self, chapters: &[ChapterEntry]) -> Result<(), CoreError> {
+        validate_chapter_order(chapters).map_err(CoreError::InvalidArgument)
+    }
+
     pub fn validate_plugin_registration(
         &self,
         request: &PluginRegistrationRequest,

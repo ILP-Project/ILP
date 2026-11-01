@@ -5,6 +5,7 @@ use crate::engine::PluginInstance;
 use crate::exporter::{Document, DocumentChapter, Exporter, TxtExporter};
 use crate::messages;
 use crate::storage::{Book, Storage};
+use ilp_core::{CoreBuilder, CoreConfig};
 use ilp_types::{ChapterResult, ChapterStatus};
 use std::io::IsTerminal;
 use std::sync::Once;
@@ -99,6 +100,8 @@ pub fn do_update(
         ));
     };
     let new_chapters = plugin.catalog(true)?;
+    // 迁移边界：目录不变量由 Core 统一校验，旧缓存格式和下载流程暂不改变。
+    core_validate_chapters(config, &new_chapters)?;
     let old_ids: std::collections::HashSet<&str> = old_book
         .chapters
         .iter()
@@ -176,6 +179,14 @@ pub fn do_get(
     Ok(())
 }
 
+fn core_validate_chapters(config: &Config, chapters: &[ilp_types::ChapterEntry]) -> Result<()> {
+    let core = CoreBuilder::new(CoreConfig::new(&config.data_folder))
+        .build()
+        .map_err(|error| anyhow!("初始化 Core 目录校验失败: {error}"))?;
+    core.validate_chapters(chapters)
+        .map_err(|error| anyhow!("Core 拒绝章节目录: {error}"))
+}
+
 fn do_chapters(
     plugin: &mut PluginInstance,
     storage: &Storage,
@@ -203,6 +214,8 @@ fn do_chapters(
                 }
             }
             let chapters = plugin.catalog(force_update)?;
+            // 迁移边界：目录不变量由 Core 统一校验，避免宿主单独维护 schema 规则。
+            core_validate_chapters(config, &chapters)?;
             let b = Book {
                 title,
                 author,
