@@ -71,7 +71,7 @@ pub struct StoredBook {
     pub chapters: Vec<ChapterEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredPlugin {
     pub metadata: PluginMetadata,
     pub content_hash: String,
@@ -386,6 +386,81 @@ impl SqliteStorage {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// 以插件 ID 幂等保存已通过 Core 信任边界的插件记录。
+    pub fn save_plugin(&mut self, plugin: &StoredPlugin) -> Result<()> {
+        let metadata = serde_json::to_string(&plugin.metadata)?;
+        self.db.execute(
+            "INSERT INTO plugins
+             (plugin_id, site_id, metadata, content_hash, signature_key_id, source, trusted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(plugin_id) DO UPDATE SET site_id=excluded.site_id,
+                 metadata=excluded.metadata, content_hash=excluded.content_hash,
+                 signature_key_id=excluded.signature_key_id, source=excluded.source,
+                 trusted_at=excluded.trusted_at",
+            params![
+                plugin.metadata.plugin_id,
+                plugin.metadata.site_id,
+                metadata,
+                plugin.content_hash,
+                plugin.signature_key_id,
+                plugin.source,
+                plugin.trusted_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_plugin(&self, plugin_id: &str) -> Result<Option<StoredPlugin>> {
+        self.db
+            .query_row(
+                "SELECT metadata, content_hash, signature_key_id, source, trusted_at
+                 FROM plugins WHERE plugin_id = ?1",
+                [plugin_id],
+                |row| {
+                    let metadata: String = row.get(0)?;
+                    Ok(StoredPlugin {
+                        metadata: serde_json::from_str(&metadata).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?,
+                        content_hash: row.get(1)?,
+                        signature_key_id: row.get(2)?,
+                        source: row.get(3)?,
+                        trusted_at: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_plugins(&self) -> Result<Vec<StoredPlugin>> {
+        let mut stmt = self.db.prepare(
+            "SELECT metadata, content_hash, signature_key_id, source, trusted_at
+             FROM plugins ORDER BY plugin_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let metadata: String = row.get(0)?;
+            Ok(StoredPlugin {
+                metadata: serde_json::from_str(&metadata).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                content_hash: row.get(1)?,
+                signature_key_id: row.get(2)?,
+                source: row.get(3)?,
+                trusted_at: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn search(&self, query: &str) -> Result<Vec<String>> {
         if query.trim().is_empty() {
             return Ok(Vec::new());
@@ -448,6 +523,15 @@ fn migrate(db: &Connection) -> Result<()> {
              state TEXT NOT NULL,
              created_at INTEGER NOT NULL,
              updated_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS plugins (
+             plugin_id TEXT PRIMARY KEY NOT NULL,
+             site_id TEXT NOT NULL UNIQUE,
+             metadata TEXT NOT NULL,
+             content_hash TEXT NOT NULL,
+             signature_key_id TEXT,
+             source TEXT NOT NULL,
+             trusted_at TEXT
          );
          CREATE TABLE IF NOT EXISTS event_sequence (
              id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -627,6 +711,57 @@ mod tests {
             .unwrap();
         assert_eq!(storage.search("正文").unwrap(), vec!["book/1"]);
         assert_eq!(storage.schema_version().unwrap(), SchemaVersion::CURRENT);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sqlite_storage_persists_plugin_records_and_updates_by_id() {
+        let root = std::env::temp_dir().join(format!(
+            "ilp-storage-plugin-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = StoragePaths::new(&root);
+        let plugin = StoredPlugin {
+            metadata: PluginMetadata {
+                abi_version: "0.2.0".into(),
+                site_name: "示例站".into(),
+                site_id: "example".into(),
+                site_domain: "example.com".into(),
+                plugin_name: "示例插件".into(),
+                plugin_id: "example-plugin".into(),
+                version: "1.0.0".into(),
+                permissions: vec!["http".into()],
+                allowed_domains: vec!["example.com".into()],
+            },
+            content_hash: "a".repeat(64),
+            signature_key_id: Some("release-2026".into()),
+            source: "registry:test".into(),
+            trusted_at: Some("2026-01-01T00:00:00Z".into()),
+        };
+        let mut storage = SqliteStorage::open(paths.clone()).unwrap();
+        storage.save_plugin(&plugin).unwrap();
+        assert!(storage.load_plugin("missing").unwrap().is_none());
+        assert_eq!(
+            storage.load_plugin("example-plugin").unwrap(),
+            Some(plugin.clone())
+        );
+        assert_eq!(storage.list_plugins().unwrap(), vec![plugin.clone()]);
+
+        let mut updated = plugin.clone();
+        updated.content_hash = "b".repeat(64);
+        storage.save_plugin(&updated).unwrap();
+        assert_eq!(storage.list_plugins().unwrap(), vec![updated.clone()]);
+        drop(storage);
+
+        let storage = SqliteStorage::open(paths).unwrap();
+        assert_eq!(
+            storage.load_plugin("example-plugin").unwrap(),
+            Some(updated)
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }
