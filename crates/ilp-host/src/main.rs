@@ -11,6 +11,7 @@ mod http;
 mod logging;
 mod messages;
 mod plugin_manager;
+pub mod plugin_registration;
 mod replay;
 mod signing;
 mod storage;
