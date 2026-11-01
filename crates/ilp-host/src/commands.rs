@@ -5,7 +5,7 @@ use crate::engine::PluginInstance;
 use crate::exporter::{Document, DocumentChapter, Exporter, TxtExporter};
 use crate::messages;
 use crate::storage::{Book, Storage};
-use ilp_core::{CoreBuilder, CoreConfig, StoredBook};
+use ilp_core::{CoreBuilder, CoreConfig, DownloadRequest, StoredBook};
 use ilp_types::{ChapterResult, ChapterStatus};
 use std::io::IsTerminal;
 use std::sync::Once;
@@ -164,13 +164,17 @@ pub fn do_update(
 }
 
 pub fn do_get(
-    plugins: &mut [PluginInstance],
+    plugins: &mut Vec<PluginInstance>,
     config: &Config,
     kind: &str,
     id: &str,
     site_id: &str,
     force_update: bool,
 ) -> Result<()> {
+    if kind == "all" && std::env::var_os("ILP_LEGACY_DOWNLOAD").is_none() {
+        return do_get_all_core(plugins, config, id, site_id);
+    }
+
     let plugin = find_plugin(plugins, site_id)?;
     let storage = Storage::open("cache.db", config.novels_dir(), config.covers_dir())?;
     plugin.init(id, force_update)?;
@@ -192,6 +196,73 @@ pub fn do_get(
                 "无效的获取类型: {kind}（可选 chapter/cover/author/title/all）"
             ))
         }
+    }
+    Ok(())
+}
+
+fn do_get_all_core(
+    plugins: &mut Vec<PluginInstance>,
+    config: &Config,
+    book_id: &str,
+    site_id: &str,
+) -> Result<()> {
+    let index = plugins
+        .iter()
+        .position(|plugin| plugin.site_id() == site_id)
+        .ok_or_else(|| anyhow!("未找到 site_id 为 {site_id} 的已加载插件"))?;
+    let mut plugin = plugins.swap_remove(index);
+    let title = plugin.title()?;
+    let author = plugin.author()?;
+    let plugin_id = plugin.metadata.plugin_id.clone();
+    let core = CoreBuilder::new(CoreConfig::new(&config.data_folder))
+        .build()
+        .map_err(|error| anyhow!("初始化 Core 下载失败: {error}"))?;
+    let registration = ilp_core::PluginService::registered_plugin(&core, &plugin_id)
+        .map_err(|error| anyhow!("读取 Core 插件注册失败: {error}"))?
+        .ok_or_else(|| {
+            anyhow!("插件 {plugin_id} 尚未注册到 Core；请通过已验证的 `ilp plugin install` 安装")
+        })?;
+    let backend =
+        crate::download_backend::PluginDownloadBackend::new(plugin, config.effective_max_workers());
+    let workflow =
+        crate::download_backend::HostDownloadWorkflow::new(&core, registration, Box::new(backend))
+            .map_err(|error| anyhow!("建立 Core 下载工作流失败: {error}"))?;
+    let report = workflow
+        .run(DownloadRequest {
+            plugin_id,
+            book_id: book_id.to_string(),
+            title,
+            author,
+            source_type: site_id.to_string(),
+            source_id: book_id.to_string(),
+        })
+        .map_err(|error| anyhow!("Core 下载失败: {error}"))?;
+    if jsonl_enabled() {
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "download_report",
+                "task_id": report.task_id,
+                "book_id": report.book_id,
+                "completed": report.progress.completed,
+                "failed": report.progress.failed,
+                "total": report.progress.total,
+            })
+        );
+    } else {
+        println!(
+            "{}: {} 成功，{} 失败，共 {} 章",
+            messages::DOWNLOAD_DONE,
+            report.progress.completed,
+            report.progress.failed,
+            report.progress.total
+        );
+    }
+    if report.progress.failed > 0 {
+        return Err(anyhow::Error::new(crate::exit::PartialFailure(format!(
+            "有 {} 章下载失败（task {}）",
+            report.progress.failed, report.task_id
+        ))));
     }
     Ok(())
 }

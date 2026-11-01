@@ -28,6 +28,7 @@ type HttpFetcher = dyn Fn(
 
 trait PluginDownloadExecution: Send {
     fn metadata(&self) -> &PluginMetadata;
+    fn content_hash(&self) -> &str;
     fn init(&mut self, book_id: &str, force_update: bool) -> anyhow::Result<()>;
     fn catalog(&mut self, force: bool) -> anyhow::Result<Vec<ChapterEntry>>;
     fn plan_fetch(&mut self, ids: &[String]) -> anyhow::Result<Vec<engine::wit_types::FetchTask>>;
@@ -41,6 +42,10 @@ trait PluginDownloadExecution: Send {
 impl PluginDownloadExecution for PluginInstance {
     fn metadata(&self) -> &PluginMetadata {
         &self.metadata
+    }
+
+    fn content_hash(&self) -> &str {
+        PluginInstance::content_hash(self)
     }
 
     fn init(&mut self, book_id: &str, force_update: bool) -> anyhow::Result<()> {
@@ -133,6 +138,11 @@ impl PluginDownloadBackend {
         if state.plugin.metadata() != &registration.metadata {
             return Err(DownloadBackendError::Execution(
                 "已加载插件 metadata 与 Core 注册不一致，拒绝执行".into(),
+            ));
+        }
+        if state.plugin.content_hash() != registration.trust.content_hash {
+            return Err(DownloadBackendError::Execution(
+                "已加载插件内容摘要与 Core 注册不一致，拒绝执行".into(),
             ));
         }
         Ok(())
@@ -403,6 +413,10 @@ mod tests {
             &self.metadata
         }
 
+        fn content_hash(&self) -> &str {
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+
         fn init(&mut self, book_id: &str, _force_update: bool) -> anyhow::Result<()> {
             self.init_book = Some(book_id.into());
             Ok(())
@@ -465,6 +479,10 @@ mod tests {
         impl PluginDownloadExecution for ResultPlugin {
             fn metadata(&self) -> &PluginMetadata {
                 &self.metadata
+            }
+
+            fn content_hash(&self) -> &str {
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             }
 
             fn init(&mut self, _book_id: &str, _force_update: bool) -> anyhow::Result<()> {

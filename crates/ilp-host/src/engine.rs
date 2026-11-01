@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use ilp_runtime::{validate_component, validate_metadata};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1049,6 +1050,7 @@ mod security_tests {
 /// 已加载的插件。
 pub struct PluginInstance {
     pub metadata: PluginMetadata,
+    content_hash: String,
     backend: PluginBackend,
 }
 
@@ -1077,6 +1079,7 @@ impl PluginInstance {
     ) -> Result<Self> {
         let wasm =
             std::fs::read(path).map_err(|e| anyhow!("读取插件失败 {}: {e}", path.display()))?;
+        let content_hash = format!("{:x}", Sha256::digest(&wasm));
         validate_component(&wasm)
             .map_err(|e| anyhow!("插件 Component 校验失败 {}: {e}", path.display()))?;
         let engine = shared_engine();
@@ -1139,7 +1142,11 @@ impl PluginInstance {
                     .set_policy(runtime_policy(&plugin_policy));
                 validate_metadata(&metadata)
                     .map_err(|e| anyhow!("插件 metadata 校验失败 {}: {e}", path.display()))?;
-                Self::finish(metadata, PluginBackend::Current { store, bindings })
+                Self::finish(
+                    metadata,
+                    content_hash.clone(),
+                    PluginBackend::Current { store, bindings },
+                )
             }
             "0.1.0" => {
                 let mut linker = Linker::new(engine);
@@ -1181,7 +1188,11 @@ impl PluginInstance {
                 };
                 validate_metadata(&metadata)
                     .map_err(|e| anyhow!("旧版插件 metadata 校验失败 {}: {e}", path.display()))?;
-                Self::finish(metadata, PluginBackend::Legacy { store, bindings })
+                Self::finish(
+                    metadata,
+                    content_hash,
+                    PluginBackend::Legacy { store, bindings },
+                )
             }
             other => Err(anyhow!("插件 ABI 版本 {other} 不受支持")),
         }
@@ -1196,7 +1207,11 @@ impl PluginInstance {
         }
     }
 
-    fn finish(metadata: PluginMetadata, backend: PluginBackend) -> Result<Self> {
+    fn finish(
+        metadata: PluginMetadata,
+        content_hash: String,
+        backend: PluginBackend,
+    ) -> Result<Self> {
         if metadata.abi_version != "0.1.0" && metadata.abi_version != "0.2.0" {
             return Err(anyhow!(
                 "插件 {} 的 ABI 版本 {} 不受支持",
@@ -1204,7 +1219,15 @@ impl PluginInstance {
                 metadata.abi_version
             ));
         }
-        Ok(Self { metadata, backend })
+        Ok(Self {
+            metadata,
+            content_hash,
+            backend,
+        })
+    }
+
+    pub fn content_hash(&self) -> &str {
+        &self.content_hash
     }
 
     pub fn site_id(&self) -> &str {
