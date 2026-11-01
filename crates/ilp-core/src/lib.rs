@@ -649,6 +649,8 @@ impl IlpCore {
 
 /// 下载编排的最小 Core 闭环。网络、插件运行时和解析均由调用方注入，
 /// Core 只负责选择已注册插件、任务状态、结构化进度和持久化边界。
+const MAX_CHAPTER_ATTEMPTS: u32 = 3;
+
 pub struct DownloadWorkflow<'a> {
     core: &'a IlpCore,
     backend: &'a dyn DownloadBackend,
@@ -708,18 +710,7 @@ impl<'a> DownloadWorkflow<'a> {
                 return Err(CoreError::Cancelled);
             }
             progress.current_chapter_id = Some(chapter.id.clone());
-            let result = match self.backend.fetch_chapter(&plugin, &request, chapter) {
-                Ok(result) => result,
-                Err(error) => ChapterResult {
-                    id: chapter.id.clone(),
-                    title: chapter.title.clone(),
-                    status: ChapterStatus::Error,
-                    text: None,
-                    error_code: "backend_error".into(),
-                    retryable: true,
-                    message: Some(error.to_string()),
-                },
-            };
+            let result = self.fetch_chapter_with_retries(task_id, &plugin, &request, chapter)?;
             let result = normalize_chapter_result(chapter, result);
             if result.status == ChapterStatus::Ok {
                 if let Some(text) = result.text.as_deref() {
@@ -763,6 +754,42 @@ impl<'a> DownloadWorkflow<'a> {
             progress,
             chapters: results,
         })
+    }
+
+    fn fetch_chapter_with_retries(
+        &self,
+        task_id: Uuid,
+        plugin: &PluginRegistration,
+        request: &DownloadRequest,
+        chapter: &ChapterEntry,
+    ) -> Result<ChapterResult, CoreError> {
+        let mut last = None;
+        for attempt in 0..MAX_CHAPTER_ATTEMPTS {
+            if self.core.task_state(task_id)? == TaskState::Cancelled {
+                return Err(CoreError::Cancelled);
+            }
+            let result = match self.backend.fetch_chapter(plugin, request, chapter) {
+                Ok(result) => result,
+                Err(error) => ChapterResult {
+                    id: chapter.id.clone(),
+                    title: chapter.title.clone(),
+                    status: ChapterStatus::Error,
+                    text: None,
+                    error_code: "backend_error".into(),
+                    retryable: true,
+                    message: Some(error.to_string()),
+                },
+            };
+            let result = normalize_chapter_result(chapter, result);
+            if !result.retryable || result.status == ChapterStatus::Ok {
+                return Ok(result);
+            }
+            last = Some(result);
+            if attempt + 1 < MAX_CHAPTER_ATTEMPTS {
+                continue;
+            }
+        }
+        Ok(last.expect("至少尝试一次章节抓取"))
     }
 
     fn persist_chapter(
@@ -1464,6 +1491,8 @@ mod tests {
     struct FakeDownloadBackend {
         chapters: Vec<ChapterEntry>,
         bodies: std::collections::HashMap<String, String>,
+        attempts: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u32>>>,
+        fail_first_attempt: bool,
     }
 
     impl DownloadBackend for FakeDownloadBackend {
@@ -1481,6 +1510,14 @@ mod tests {
             _request: &DownloadRequest,
             chapter: &ChapterEntry,
         ) -> Result<ChapterResult, DownloadBackendError> {
+            let mut attempts = self.attempts.lock().unwrap();
+            let count = attempts.entry(chapter.id.clone()).or_default();
+            *count += 1;
+            if self.fail_first_attempt && *count == 1 {
+                return Err(DownloadBackendError::Execution(
+                    "fixture transient failure".into(),
+                ));
+            }
             self.bodies
                 .get(&chapter.id)
                 .cloned()
@@ -1522,6 +1559,8 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            attempts: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            fail_first_attempt: true,
         };
         let report = DownloadWorkflow::new(&core, &backend)
             .run(DownloadRequest {
@@ -1537,6 +1576,8 @@ mod tests {
         assert_eq!(report.progress.completed, 2);
         assert_eq!(report.progress.failed, 0);
         assert_eq!(report.progress.total, 2);
+        assert_eq!(backend.attempts.lock().unwrap().get("ch-1"), Some(&2));
+        assert_eq!(backend.attempts.lock().unwrap().get("ch-2"), Some(&2));
         assert!(report
             .chapters
             .iter()
