@@ -3,6 +3,7 @@ mod cli;
 mod commands;
 mod config;
 mod diagnostics;
+pub mod download_backend;
 mod engine;
 mod exit;
 mod exporter;
