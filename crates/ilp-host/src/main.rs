@@ -64,6 +64,7 @@ fn run() -> anyhow::Result<()> {
         }
         cli::Command::ResumeAll => commands::resume_all_downloads(&config),
         cli::Command::MigrationPreview => commands::migration_preview(&config),
+        cli::Command::MigrationApply { yes } => commands::migration_apply(&config, yes),
         cli::Command::Plugin { sub } => plugin_manager::run(&config, sub),
         cli::Command::Get {
             kind,

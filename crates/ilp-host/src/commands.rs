@@ -100,6 +100,40 @@ pub fn migration_preview(config: &Config) -> Result<()> {
     Ok(())
 }
 
+pub fn migration_apply(config: &Config, yes: bool) -> Result<()> {
+    if !yes && std::io::stdin().is_terminal() {
+        eprintln!("迁移将创建不可覆盖备份并修改 Core 数据。确认继续？输入 yes：");
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if answer.trim() != "yes" {
+            return Err(anyhow!("用户未确认迁移"));
+        }
+    } else if !yes {
+        return Err(anyhow!("非交互环境必须使用 --yes 显式确认迁移"));
+    }
+    let core = CoreBuilder::new(CoreConfig::new(&config.data_folder))
+        .build()
+        .map_err(|error| anyhow!("初始化旧数据迁移失败: {error}"))?;
+    let report = core
+        .migrate_legacy()
+        .map_err(|error| anyhow!("旧数据迁移失败: {error}"))?;
+    if jsonl_enabled() {
+        emit_event(serde_json::json!({
+            "event": "migration_applied",
+            "status": format!("{:?}", report.status),
+            "records_migrated": report.records_migrated,
+            "backup": report.backup,
+        }));
+    } else {
+        println!("旧数据迁移完成: {:?}", report.status);
+        println!("迁移记录数: {}", report.records_migrated);
+        if let Some(backup) = report.backup {
+            println!("备份位置: {}", backup.destination.display());
+        }
+    }
+    Ok(())
+}
+
 pub fn resume_all_downloads(config: &Config) -> Result<()> {
     let core = CoreBuilder::new(CoreConfig::new(&config.data_folder))
         .build()
@@ -222,6 +256,14 @@ fn validate_jsonl_event(event: &serde_json::Value) -> bool {
                 && event
                     .get("message")
                     .is_some_and(serde_json::Value::is_string)
+        }
+        "migration_applied" => {
+            event
+                .get("status")
+                .is_some_and(serde_json::Value::is_string)
+                && event
+                    .get("records_migrated")
+                    .is_some_and(serde_json::Value::is_u64)
         }
         "migration_preview" => {
             event

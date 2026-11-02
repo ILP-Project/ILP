@@ -534,6 +534,14 @@ impl IlpCore {
             .map_err(|error| CoreError::Storage(error.to_string()))
     }
 
+    pub fn migrate_legacy(&self) -> Result<ilp_storage::MigrationReport, CoreError> {
+        self.storage
+            .lock()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?
+            .migrate_legacy()
+            .map_err(|error| CoreError::Storage(error.to_string()))
+    }
+
     pub fn task_event(&self, task_id: Uuid) -> Result<CoreEvent, CoreError> {
         let id = task_id.to_string();
         let state = self

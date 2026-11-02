@@ -72,6 +72,12 @@ pub enum Command {
     ResumeAll,
     /// 只读预览旧数据迁移，不创建备份或修改数据
     MigrationPreview,
+    /// 执行旧数据迁移；必须显式确认
+    MigrationApply {
+        /// 跳过确认提示
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// 插件管理
     Plugin {
         #[command(subcommand)]
