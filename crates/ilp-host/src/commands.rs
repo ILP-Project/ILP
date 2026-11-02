@@ -83,14 +83,24 @@ pub fn resume_all_downloads(config: &Config) -> Result<()> {
     let tasks = core
         .recovery_snapshot_dto()
         .map_err(|error| anyhow!("读取恢复任务失败: {error}"))?;
-    let mut failed = 0usize;
-    for task in tasks
+    let interrupted: Vec<_> = tasks
         .into_iter()
         .filter(|task| task.state == ilp_core::TaskState::Interrupted)
-    {
+        .collect();
+    let attempted = interrupted.len();
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+    for task in interrupted {
         let mut task_plugins = crate::engine::load_plugins(config)?;
         match resume_download(&mut task_plugins, config, task.task_id) {
-            Ok(()) => {}
+            Ok(()) => succeeded += 1,
+            Err(error)
+                if error
+                    .chain()
+                    .any(|item| item.is::<crate::cancel::Cancelled>()) =>
+            {
+                return Err(error);
+            }
             Err(error) => {
                 failed += 1;
                 if jsonl_enabled() {
@@ -104,6 +114,16 @@ pub fn resume_all_downloads(config: &Config) -> Result<()> {
                 }
             }
         }
+    }
+    if jsonl_enabled() {
+        emit_event(serde_json::json!({
+            "event": "resume_summary",
+            "attempted": attempted,
+            "succeeded": succeeded,
+            "failed": failed,
+        }));
+    } else {
+        tracing::info!(attempted, succeeded, failed, "批量恢复完成");
     }
     if failed > 0 {
         return Err(anyhow::Error::new(crate::exit::PartialFailure(format!(
@@ -178,6 +198,15 @@ fn validate_jsonl_event(event: &serde_json::Value) -> bool {
                 && event
                     .get("message")
                     .is_some_and(serde_json::Value::is_string)
+        }
+        "resume_summary" => {
+            event
+                .get("attempted")
+                .is_some_and(serde_json::Value::is_u64)
+                && event
+                    .get("succeeded")
+                    .is_some_and(serde_json::Value::is_u64)
+                && event.get("failed").is_some_and(serde_json::Value::is_u64)
         }
         "download_report" => {
             event
