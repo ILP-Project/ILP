@@ -232,6 +232,13 @@ impl crate::SqliteStorage {
         self.migrate_legacy_with(&DefaultLegacyDetector, None)
     }
 
+    /// 只检测旧数据，不创建目录、备份或修改数据库。
+    pub fn inspect_legacy(&self) -> std::result::Result<LegacyDetectionReport, MigrationError> {
+        DefaultLegacyDetector
+            .detect(self.paths())
+            .map_err(|error| MigrationError::Detection(error.to_string()))
+    }
+
     /// 使用扩展检测器和迁移器执行安全迁移。备份完成后才会开启 SQLite 事务；
     /// 迁移器失败时事务自动回滚，而备份仍会保留。
     pub fn migrate_legacy_with<D: LegacyDetector>(
