@@ -341,6 +341,44 @@ fn download_error(error: ilp_core::CoreError) -> anyhow::Error {
     }
 }
 
+struct CachedBookInfo {
+    title: String,
+    author: String,
+    cover_url: String,
+    chapters: Vec<ilp_types::ChapterEntry>,
+}
+
+fn load_cached_book(
+    config: &Config,
+    storage: &Storage,
+    site_id: &str,
+    book_id: &str,
+) -> Result<Option<CachedBookInfo>> {
+    let core = CoreBuilder::new(CoreConfig::new(&config.data_folder))
+        .build()
+        .map_err(|error| anyhow!("初始化 Core 读取书籍失败: {error}"))?;
+    if let Some(core_book) = core
+        .book(book_id)
+        .map_err(|error| anyhow!("从 Core 读取书籍失败: {error}"))?
+    {
+        return Ok(Some(CachedBookInfo {
+            title: core_book.title,
+            author: core_book.author,
+            cover_url: String::new(),
+            chapters: core_book.chapters,
+        }));
+    }
+    if let Some(legacy_book) = storage.load_book(site_id, book_id)? {
+        return Ok(Some(CachedBookInfo {
+            title: legacy_book.title,
+            author: legacy_book.author,
+            cover_url: legacy_book.cover_url,
+            chapters: legacy_book.chapters,
+        }));
+    }
+    Ok(None)
+}
+
 pub fn do_update(
     plugins: &mut Vec<PluginInstance>,
     config: &Config,
@@ -351,7 +389,7 @@ pub fn do_update(
     let plugin = find_plugin(plugins, site_id)?;
     let storage = Storage::open("cache.db", config.novels_dir(), config.covers_dir())?;
     plugin.init(book_id, true)?;
-    let Some(old_book) = storage.load_book(site_id, book_id)? else {
+    let Some(old_book) = load_cached_book(config, &storage, site_id, book_id)? else {
         return Err(anyhow!(
             "没有找到已缓存的书籍，请先运行 ilp get all {book_id}"
         ));
@@ -412,8 +450,10 @@ pub fn do_update(
     }
 
     let updated = Book {
+        title: old_book.title,
+        author: old_book.author,
+        cover_url: old_book.cover_url,
         chapters: new_chapters,
-        ..old_book
     };
     core_validate_book(config, site_id, book_id, &updated)?;
     storage.save_book(site_id, book_id, &updated)?;

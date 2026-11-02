@@ -397,6 +397,14 @@ impl IlpCore {
             .map_err(|error| CoreError::Storage(error.to_string()))
     }
 
+    pub fn book(&self, id: &str) -> Result<Option<StoredBook>, CoreError> {
+        self.storage
+            .lock()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?
+            .load_book(id)
+            .map_err(|error| CoreError::Storage(error.to_string()))
+    }
+
     fn append_event_with_payload<F>(&self, kind: &str, make_payload: F) -> Result<u64, CoreError>
     where
         F: FnOnce(u64) -> anyhow::Result<String>,
@@ -1349,6 +1357,39 @@ mod tests {
         ));
         drop(core);
         let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn save_and_read_book_roundtrip() -> Result<(), CoreError> {
+        let data = std::env::temp_dir().join(format!("ilp-core-test-{}", Uuid::new_v4()));
+        let core = CoreBuilder::new(CoreConfig::new(&data)).build()?;
+        assert!(core.book("missing")?.is_none());
+        let book = StoredBook {
+            id: "b1".into(),
+            title: "书名".into(),
+            author: "作者".into(),
+            source_type: "site".into(),
+            source_id: "s1".into(),
+            authorized: true,
+            chapters: vec![ChapterEntry {
+                id: "c1".into(),
+                title: "第一章".into(),
+                url: "https://example.com/c1".into(),
+                fetch_url: "https://example.com/api/c1".into(),
+                update_time: 100,
+                order_key: "0001".into(),
+            }],
+        };
+        core.save_book(&book)?;
+        let loaded = core
+            .book("b1")?
+            .ok_or_else(|| CoreError::NotFound("b1".into()))?;
+        assert_eq!(loaded.id, "b1");
+        assert_eq!(loaded.title, "书名");
+        assert_eq!(loaded.chapters.len(), 1);
+        drop(core);
+        let _ = std::fs::remove_dir_all(data);
+        Ok(())
     }
 
     #[test]
