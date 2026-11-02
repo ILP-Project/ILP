@@ -680,6 +680,7 @@ impl IlpCore {
 /// 下载编排的最小 Core 闭环。网络、插件运行时和解析均由调用方注入，
 /// Core 只负责选择已注册插件、任务状态、结构化进度和持久化边界。
 const MAX_CHAPTER_ATTEMPTS: u32 = 3;
+const RETRY_BACKOFF_MS: u64 = 50;
 
 pub struct DownloadWorkflow<'a> {
     core: &'a IlpCore,
@@ -866,12 +867,39 @@ impl<'a> DownloadWorkflow<'a> {
             if !result.retryable || result.status == ChapterStatus::Ok {
                 return Ok(result);
             }
-            last = Some(result);
+            let mut result = result;
             if attempt + 1 < MAX_CHAPTER_ATTEMPTS {
+                if self.wait_before_retry(task_id, attempt + 1)? {
+                    return Err(CoreError::Cancelled);
+                }
+                last = Some(result);
                 continue;
             }
+            result.message = Some(format!(
+                "章节抓取在 {} 次尝试后失败{}",
+                MAX_CHAPTER_ATTEMPTS,
+                result
+                    .message
+                    .as_deref()
+                    .map(|message| format!(": {message}"))
+                    .unwrap_or_default()
+            ));
+            last = Some(result);
         }
         Ok(last.expect("至少尝试一次章节抓取"))
+    }
+
+    fn wait_before_retry(&self, task_id: Uuid, completed_attempts: u32) -> Result<bool, CoreError> {
+        let delay = RETRY_BACKOFF_MS.saturating_mul(2u64.saturating_pow(completed_attempts - 1));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(delay);
+        while std::time::Instant::now() < deadline {
+            if self.core.task_state(task_id)? == TaskState::Cancelled {
+                return Ok(true);
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            std::thread::sleep(remaining.min(std::time::Duration::from_millis(20)));
+        }
+        Ok(false)
     }
 
     fn persist_chapter(
