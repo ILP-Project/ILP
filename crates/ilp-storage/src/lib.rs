@@ -502,6 +502,13 @@ impl SqliteStorage {
             .map_err(Into::into)
     }
 
+    pub fn remove_plugin(&mut self, plugin_id: &str) -> Result<bool> {
+        let count = self
+            .db
+            .execute("DELETE FROM plugins WHERE plugin_id = ?1", [plugin_id])?;
+        Ok(count > 0)
+    }
+
     pub fn list_plugins(&self) -> Result<Vec<StoredPlugin>> {
         let mut stmt = self.db.prepare(
             "SELECT metadata, content_hash, signature_key_id, source, trusted_at
@@ -832,11 +839,15 @@ mod tests {
         assert_eq!(storage.list_plugins().unwrap(), vec![updated.clone()]);
         drop(storage);
 
-        let storage = SqliteStorage::open(paths).unwrap();
+        let mut storage = SqliteStorage::open(paths).unwrap();
         assert_eq!(
             storage.load_plugin("example-plugin").unwrap(),
             Some(updated)
         );
+        assert!(storage.remove_plugin("example-plugin").unwrap());
+        assert!(!storage.remove_plugin("example-plugin").unwrap());
+        assert!(storage.load_plugin("example-plugin").unwrap().is_none());
+        assert!(storage.list_plugins().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 }

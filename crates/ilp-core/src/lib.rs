@@ -388,6 +388,17 @@ impl IlpCore {
             .collect()
     }
 
+    pub fn unregister_plugin(&self, plugin_id: &str) -> Result<bool, CoreError> {
+        validate_plugin_identifier("插件 ID", plugin_id)?;
+        let mut storage = self
+            .storage
+            .lock()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?;
+        storage
+            .remove_plugin(plugin_id)
+            .map_err(|error| CoreError::Storage(error.to_string()))
+    }
+
     pub fn save_book(&self, book: &StoredBook) -> Result<(), CoreError> {
         self.validate_book(book)?;
         self.storage
@@ -1069,6 +1080,11 @@ pub trait PluginService {
     fn registered(&self) -> Result<Vec<PluginRegistration>, CoreError> {
         Err(CoreError::Plugin("插件注册服务未实现".into()))
     }
+
+    fn unregister(&self, plugin_id: &str) -> Result<bool, CoreError> {
+        let _ = plugin_id;
+        Err(CoreError::Plugin("插件注册服务未实现".into()))
+    }
 }
 
 impl LibraryService for IlpCore {
@@ -1135,6 +1151,10 @@ impl PluginService for IlpCore {
 
     fn registered(&self) -> Result<Vec<PluginRegistration>, CoreError> {
         self.registered_plugins()
+    }
+
+    fn unregister(&self, plugin_id: &str) -> Result<bool, CoreError> {
+        self.unregister_plugin(plugin_id)
     }
 }
 
@@ -1467,6 +1487,14 @@ mod tests {
                 .content_hash,
             "a".repeat(64)
         );
+        assert!(PluginService::unregister(&reopened, "plugin-example").unwrap());
+        assert!(!PluginService::unregister(&reopened, "plugin-example").unwrap());
+        assert!(
+            PluginService::registered_plugin(&reopened, "plugin-example")
+                .unwrap()
+                .is_none()
+        );
+        assert!(PluginService::registered(&reopened).unwrap().is_empty());
         drop(reopened);
         let _ = std::fs::remove_dir_all(data);
     }

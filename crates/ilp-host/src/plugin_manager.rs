@@ -1066,6 +1066,13 @@ fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<()> {
     }
 }
 
+fn unregister_from_core(config: &Config, name: &str) -> Result<bool> {
+    let core = CoreBuilder::new(CoreConfig::new(&config.data_folder))
+        .build()
+        .map_err(|error| anyhow!("初始化 Core 卸载插件失败: {error}"))?;
+    PluginService::unregister(&core, name).map_err(|error| anyhow!("从 Core 注销插件失败: {error}"))
+}
+
 fn uninstall(config: &Config, name: &str) -> Result<()> {
     let name = safe_plugin_name(name)?;
     let mut removed = false;
@@ -1079,6 +1086,9 @@ fn uninstall(config: &Config, name: &str) -> Result<()> {
     let data = config.plugins_data_dir().join(name);
     if data.exists() {
         fs::remove_dir_all(&data)?;
+    }
+    if let Ok(true) = unregister_from_core(config, name) {
+        removed = true;
     }
     if removed {
         println!("已卸载插件 {name}");
@@ -1198,6 +1208,50 @@ mod tests {
         let registrations = registered_plugins(&config).expect("Core 注册表应可读取");
         assert!(registrations.is_empty());
         assert!(config.plugins_dir().join("unregistered.wasm").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uninstall_removes_both_files_and_core_registration() {
+        let root = std::env::temp_dir().join(format!(
+            "ilp-plugin-uninstall-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("系统时间应有效")
+                .as_nanos()
+        ));
+        let mut config = Config::default();
+        config.data_folder = root.join("data").display().to_string();
+        config.plugins_folder = root.join("plugins").display().to_string();
+        fs::create_dir_all(config.plugins_dir()).expect("创建插件目录");
+        let wasm_path = config.plugins_dir().join("fanqie.wasm");
+        fs::write(&wasm_path, b"test wasm").expect("写入 wasm");
+
+        let core = CoreBuilder::new(CoreConfig::new(&config.data_folder))
+            .build()
+            .expect("构建 core");
+        let mut request = sample_registration();
+        request.metadata.plugin_id = "fanqie".into();
+        request.metadata.site_id = "fanqie".into();
+        let registered_request = ilp_core::PluginRegistrationRequest {
+            metadata: request.metadata,
+            trust: ilp_runtime::PluginTrust {
+                content_hash: "a".repeat(64),
+                signature_key_id: Some("release-2026".into()),
+                source: "registry:test".into(),
+                user_confirmed: true,
+            },
+        };
+        PluginService::register(&core, &registered_request).expect("注册插件");
+        assert_eq!(PluginService::registered(&core).expect("读取插件").len(), 1);
+
+        uninstall(&config, "fanqie").expect("卸载插件");
+        assert!(!wasm_path.exists());
+        assert!(PluginService::registered(&core)
+            .expect("读取插件")
+            .is_empty());
+
         let _ = fs::remove_dir_all(root);
     }
 
