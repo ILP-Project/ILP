@@ -6,6 +6,10 @@
 ilp --jsonl get all <book-id> -s <site-id>
 ilp --jsonl update <book-id> -s <site-id>
 ilp --jsonl update <book-id> -s <site-id> --apply
+ilp --jsonl resume <task-id>
+ilp --jsonl resume-all
+ilp --jsonl migration-preview
+ilp --jsonl migration-apply --yes
 ```
 
 ## 事件
@@ -36,6 +40,54 @@ ilp --jsonl update <book-id> -s <site-id> --apply
 ```
 
 `chapter_downloaded.status` 当前成功值为 `ok`。下载失败不会伪造成功事件；失败详情写入日志和最终统计。
+
+### `download_report`
+
+```json
+{"event":"download_report","task_id":"...","book_id":"book-1","completed":2,"failed":0,"total":3}
+```
+
+恢复命令在每个任务完成后输出。`completed`、`failed` 和 `total` 是持久化任务的章节统计。
+
+### `resume_error`
+
+```json
+{"event":"resume_error","task_id":"...","message":"..."}
+```
+
+`resume-all` 对单个任务恢复失败时输出，随后继续处理其他中断任务。
+
+### `resume_summary`
+
+```json
+{"event":"resume_summary","attempted":2,"succeeded":1,"failed":1}
+```
+
+`resume-all` 最后输出批量恢复汇总。
+
+### `migration_preview`
+
+```json
+{"event":"migration_preview","data_dir":"...","format":"Unknown","artifacts":[]}
+```
+
+只读检测旧数据，不创建备份、不修改数据库。
+
+### `migration_applied`
+
+```json
+{"event":"migration_applied","status":"NotNeeded","records_migrated":0,"backup":null}
+```
+
+显式迁移成功后输出。`migration-apply` 在非交互环境必须使用 `--yes`。
+
+### `migration_error`
+
+```json
+{"event":"migration_error","message":"..."}
+```
+
+迁移失败时输出；命令仍以致命错误退出，不应根据此事件推断迁移成功。
 
 ### `plugin_list`
 
