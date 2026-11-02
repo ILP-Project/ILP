@@ -87,7 +87,7 @@ pub fn migration_preview(config: &Config) -> Result<()> {
         emit_event(serde_json::json!({
             "event": "migration_preview",
             "data_dir": report.data_dir,
-            "format": format!("{:?}", report.format),
+            "format": report.format,
             "artifacts": report.artifacts,
         }));
     } else {
@@ -114,13 +114,22 @@ pub fn migration_apply(config: &Config, yes: bool) -> Result<()> {
     let core = CoreBuilder::new(CoreConfig::new(&config.data_folder))
         .build()
         .map_err(|error| anyhow!("初始化旧数据迁移失败: {error}"))?;
-    let report = core
-        .migrate_legacy()
-        .map_err(|error| anyhow!("旧数据迁移失败: {error}"))?;
+    let report = match core.migrate_legacy() {
+        Ok(report) => report,
+        Err(error) => {
+            if jsonl_enabled() {
+                emit_event(serde_json::json!({
+                    "event": "migration_error",
+                    "message": error.to_string(),
+                }));
+            }
+            return Err(anyhow!("旧数据迁移失败: {error}"));
+        }
+    };
     if jsonl_enabled() {
         emit_event(serde_json::json!({
             "event": "migration_applied",
-            "status": format!("{:?}", report.status),
+            "status": report.status,
             "records_migrated": report.records_migrated,
             "backup": report.backup,
         }));
@@ -257,6 +266,9 @@ fn validate_jsonl_event(event: &serde_json::Value) -> bool {
                     .get("message")
                     .is_some_and(serde_json::Value::is_string)
         }
+        "migration_error" => event
+            .get("message")
+            .is_some_and(serde_json::Value::is_string),
         "migration_applied" => {
             event
                 .get("status")
