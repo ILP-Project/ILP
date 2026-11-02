@@ -70,6 +70,8 @@ pub enum Command {
     },
     /// 恢复全部具有持久化请求的中断下载任务
     ResumeAll,
+    /// 只读预览旧数据迁移，不创建备份或修改数据
+    MigrationPreview,
     /// 插件管理
     Plugin {
         #[command(subcommand)]

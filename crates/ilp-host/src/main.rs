@@ -63,6 +63,7 @@ fn run() -> anyhow::Result<()> {
             commands::resume_download(&mut plugins, &config, task_id)
         }
         cli::Command::ResumeAll => commands::resume_all_downloads(&config),
+        cli::Command::MigrationPreview => commands::migration_preview(&config),
         cli::Command::Plugin { sub } => plugin_manager::run(&config, sub),
         cli::Command::Get {
             kind,

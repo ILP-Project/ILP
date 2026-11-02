@@ -76,6 +76,30 @@ pub fn resume_download(
     Ok(())
 }
 
+pub fn migration_preview(config: &Config) -> Result<()> {
+    let core = CoreBuilder::new(CoreConfig::new(&config.data_folder))
+        .build()
+        .map_err(|error| anyhow!("初始化迁移预览失败: {error}"))?;
+    let report = core
+        .inspect_legacy()
+        .map_err(|error| anyhow!("检测旧数据失败: {error}"))?;
+    if jsonl_enabled() {
+        emit_event(serde_json::json!({
+            "event": "migration_preview",
+            "data_dir": report.data_dir,
+            "format": format!("{:?}", report.format),
+            "artifacts": report.artifacts,
+        }));
+    } else {
+        println!("迁移预览: {:?}", report.format);
+        println!("数据目录: {}", report.data_dir.display());
+        for artifact in report.artifacts {
+            println!("- {:?}: {} 字节", artifact.path, artifact.bytes);
+        }
+    }
+    Ok(())
+}
+
 pub fn resume_all_downloads(config: &Config) -> Result<()> {
     let core = CoreBuilder::new(CoreConfig::new(&config.data_folder))
         .build()
@@ -198,6 +222,17 @@ fn validate_jsonl_event(event: &serde_json::Value) -> bool {
                 && event
                     .get("message")
                     .is_some_and(serde_json::Value::is_string)
+        }
+        "migration_preview" => {
+            event
+                .get("data_dir")
+                .is_some_and(serde_json::Value::is_string)
+                && event
+                    .get("format")
+                    .is_some_and(serde_json::Value::is_string)
+                && event
+                    .get("artifacts")
+                    .is_some_and(serde_json::Value::is_array)
         }
         "resume_summary" => {
             event

@@ -4,7 +4,7 @@
 //! 服务接口提交预定义用例，并订阅结构化事件。
 
 use ilp_runtime::{validate_metadata, CapabilityPolicy, PluginTrust, ResourceLimits};
-pub use ilp_storage::StoredBook;
+pub use ilp_storage::{LegacyDetectionReport, LegacyFormat, StoredBook};
 use ilp_storage::{LibraryStorage, SqliteStorage, StoragePaths, StoredPlugin};
 use ilp_types::{validate_chapter_order, ChapterEntry, ChapterResult, ChapterStatus};
 use serde::{Deserialize, Serialize};
@@ -524,6 +524,14 @@ impl IlpCore {
                 .map_err(|error| CoreError::Storage(format!("下载请求反序列化失败: {error}")))
         })
         .transpose()
+    }
+
+    pub fn inspect_legacy(&self) -> Result<LegacyDetectionReport, CoreError> {
+        self.storage
+            .lock()
+            .map_err(|_| CoreError::Storage("存储锁已中毒".into()))?
+            .inspect_legacy()
+            .map_err(|error| CoreError::Storage(error.to_string()))
     }
 
     pub fn task_event(&self, task_id: Uuid) -> Result<CoreEvent, CoreError> {
