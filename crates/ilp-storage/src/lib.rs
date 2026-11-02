@@ -415,6 +415,21 @@ impl SqliteStorage {
         Ok(path)
     }
 
+    pub fn chapter_file_record(
+        &self,
+        book_id: &str,
+        chapter_id: &str,
+    ) -> Result<Option<(String, u64, String)>> {
+        self.db
+            .query_row(
+                "SELECT path, bytes, sha256 FROM chapter_files WHERE book_id = ?1 AND chapter_id = ?2",
+                params![book_id, chapter_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64, row.get::<_, String>(2)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn read_chapter(&self, book_id: &str, chapter_id: &str) -> Result<Option<Vec<u8>>> {
         let row = self.db.query_row(
             "SELECT path, bytes, sha256 FROM chapter_files WHERE book_id = ?1 AND chapter_id = ?2",

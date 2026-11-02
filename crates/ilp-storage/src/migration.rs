@@ -5,7 +5,7 @@
 //! 的备份和事务流程。
 
 use anyhow::{anyhow, Result};
-use rusqlite::{Connection, OpenFlags, Transaction};
+use rusqlite::{params, Connection, OpenFlags, Transaction};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Read;
@@ -125,14 +125,18 @@ impl LegacyDetector for DefaultLegacyDetector {
             return Err(anyhow!("数据路径不是目录: {}", data_dir.display()));
         }
 
-        // 这是 ILP-Cpp/早期实现使用过的目录标记。这里只据此报告“未知”，
-        // 不读取 cache.db 的表名，也不把目录内容解释成新 schema。
-        let old_markers = [data_dir.join("cache.db"), data_dir.join("novels")];
-        let has_old_marker = old_markers.iter().any(|path| path.exists());
-        if has_old_marker {
+        // 这是 ILP-Cpp/早期实现使用过的目录标记。
+        let cache_db = data_dir.join("cache.db");
+        let novels_dir = data_dir.join("novels");
+        if cache_db.exists() || novels_dir.exists() {
+            let format = if is_legacy_cache_database(&cache_db) {
+                LegacyFormat::Known("cache-v1".into())
+            } else {
+                LegacyFormat::Unknown
+            };
             return Ok(LegacyDetectionReport {
                 data_dir: data_dir.clone(),
-                format: LegacyFormat::Unknown,
+                format,
                 artifacts: collect_entries(data_dir)?,
             });
         }
@@ -160,6 +164,101 @@ impl LegacyDetector for DefaultLegacyDetector {
             format: LegacyFormat::Empty,
             artifacts: Vec::new(),
         })
+    }
+}
+
+/// 用于将 `cache-v1`（包含 `cache.db` 及 `novels`）迁移至 Core SQLite 架构的迁移器。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LegacyCacheMigrator;
+
+impl LegacyMigrator for LegacyCacheMigrator {
+    fn format(&self) -> &str {
+        "cache-v1"
+    }
+
+    fn migrate(
+        &self,
+        detection: &LegacyDetectionReport,
+        transaction: &Transaction<'_>,
+    ) -> Result<u64> {
+        let cache_db_path = detection.data_dir.join("cache.db");
+        if !cache_db_path.exists() {
+            return Ok(0);
+        }
+        let legacy_conn = Connection::open_with_flags(
+            &cache_db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+
+        let mut book_stmt = legacy_conn.prepare(
+            "SELECT site_id, book_id, title, author, cover_url, chapters, updated_at FROM books",
+        )?;
+        let books = book_stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })?;
+
+        let mut count = 0_u64;
+        for book in books {
+            let (site_id, book_id, title, author, _cover_url, chapters, updated_at) = book?;
+            transaction.execute(
+                "INSERT INTO books
+                 (id, title, author, source_type, source_id, authorized, chapters, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(id) DO UPDATE SET title=excluded.title, author=excluded.author,
+                     source_type=excluded.source_type, source_id=excluded.source_id,
+                     authorized=excluded.authorized, chapters=excluded.chapters,
+                     updated_at=excluded.updated_at",
+                params![book_id, title, author, site_id, book_id, true, chapters, updated_at,],
+            )?;
+            transaction.execute(
+                "DELETE FROM search_index WHERE book_id = ?1",
+                params![book_id],
+            )?;
+            transaction.execute(
+                "INSERT INTO search_index(book_id, title, author) VALUES (?1, ?2, ?3)",
+                params![book_id, title, author],
+            )?;
+            count += 1;
+        }
+
+        let mut chapter_stmt = legacy_conn.prepare(
+            "SELECT site_id, book_id, chapter_id, path, status, bytes, sha256 FROM chapters",
+        )?;
+        let chapters = chapter_stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?;
+
+        for chapter in chapters {
+            let (_site_id, book_id, chapter_id, path, status, bytes, sha256) = chapter?;
+            if status != "ok" {
+                continue;
+            }
+            transaction.execute(
+                "INSERT INTO chapter_files (book_id, chapter_id, path, bytes, sha256)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(book_id, chapter_id) DO UPDATE SET
+                     path=excluded.path, bytes=excluded.bytes, sha256=excluded.sha256",
+                params![book_id, chapter_id, path, bytes, sha256],
+            )?;
+        }
+
+        Ok(count)
     }
 }
 
@@ -226,10 +325,10 @@ pub fn backup_legacy_data_to(
 }
 
 impl crate::SqliteStorage {
-    /// 检测并迁移旧数据。默认流程不猜测未知 schema，因此会先做完整备份，
-    /// 再返回 [`MigrationError::UnsupportedLegacyFormat`]。
+    /// 检测并迁移旧数据。支持安全迁移 `cache-v1` 格式。
+    /// 未知 schema 先做完整备份，再返回 [`MigrationError::UnsupportedLegacyFormat`]。
     pub fn migrate_legacy(&mut self) -> std::result::Result<MigrationReport, MigrationError> {
-        self.migrate_legacy_with(&DefaultLegacyDetector, None)
+        self.migrate_legacy_with(&DefaultLegacyDetector, Some(&LegacyCacheMigrator))
     }
 
     /// 只检测旧数据，不创建目录、备份或修改数据库。
@@ -318,6 +417,34 @@ fn is_current_database(path: &Path) -> bool {
             SchemaVersion::CURRENT.major,
             SchemaVersion::CURRENT.minor
         )
+}
+
+fn is_legacy_cache_database(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut header = [0_u8; SQLITE_HEADER.len()];
+    if file.read_exact(&mut header).is_err() || header != SQLITE_HEADER {
+        return false;
+    }
+    let Ok(connection) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return false;
+    };
+    let Ok(mut stmt) = connection.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('books', 'chapters')",
+    ) else {
+        return false;
+    };
+    let Ok(names) = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .and_then(|rows| rows.collect::<rusqlite::Result<std::collections::HashSet<_>>>())
+    else {
+        return false;
+    };
+    names.contains("books") && names.contains("chapters")
 }
 
 fn collect_entries(data_dir: &Path) -> Result<Vec<LegacyArtifact>> {
@@ -666,7 +793,8 @@ mod tests {
         let root = temp_dir("migrate");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("novels")).unwrap();
-        fs::write(root.join("cache.db"), b"legacy").unwrap();
+        // 写入一个非合法 SQLite 格式或表结构不符的 cache.db，作为未知 schema
+        fs::write(root.join("cache.db"), b"corrupted sqlite").unwrap();
         let paths = StoragePaths::new(&root);
         let mut storage = SqliteStorage::open(paths).unwrap();
         let error = storage.migrate_legacy().unwrap_err();
@@ -675,6 +803,117 @@ mod tests {
         };
         assert!(backup.exists());
         assert!(backup.join("cache.db").exists());
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(backup);
+    }
+
+    #[test]
+    fn cache_v1_migration_migrates_books_and_chapters_and_creates_backup() {
+        let root = temp_dir("cache-v1");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        // 构造旧版 cache.db
+        let legacy_db_path = root.join("cache.db");
+        let conn = Connection::open(&legacy_db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE books (
+                site_id TEXT NOT NULL,
+                book_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                author TEXT NOT NULL,
+                cover_url TEXT NOT NULL,
+                chapters TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (site_id, book_id)
+            );
+            CREATE TABLE chapters (
+                site_id TEXT NOT NULL,
+                book_id TEXT NOT NULL,
+                chapter_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                status TEXT NOT NULL,
+                bytes INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                mtime INTEGER NOT NULL,
+                PRIMARY KEY (site_id, book_id, chapter_id)
+            );",
+        )
+        .unwrap();
+
+        let chapters_json = serde_json::to_string(&vec![ilp_types::ChapterEntry {
+            id: "ch-1".into(),
+            title: "第一章".into(),
+            url: "https://example.com/ch-1".into(),
+            fetch_url: "https://example.com/api/ch-1".into(),
+            update_time: 100,
+            order_key: "001".into(),
+        }])
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO books VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "fanqie",
+                "12345",
+                "旧书名",
+                "旧作者",
+                "https://example.com/cover.png",
+                chapters_json,
+                1600000000_i64,
+            ],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO chapters VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                "fanqie",
+                "12345",
+                "ch-1",
+                "novels/旧书名 (12345)/0001 - 第一章.txt",
+                "ok",
+                128_i64,
+                "a".repeat(64),
+                1600000000_i64,
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let paths = StoragePaths::new(&root);
+        let mut storage = SqliteStorage::open(paths.clone()).unwrap();
+
+        let detection = storage.inspect_legacy().unwrap();
+        assert_eq!(detection.format, LegacyFormat::Known("cache-v1".into()));
+
+        let report = storage.migrate_legacy().unwrap();
+        assert_eq!(report.status, MigrationStatus::Migrated);
+        assert_eq!(report.records_migrated, 1);
+        assert!(report.backup.is_some());
+
+        let book = storage
+            .load_book("12345")
+            .unwrap()
+            .expect("应找到迁移后的书籍");
+        assert_eq!(book.title, "旧书名");
+        assert_eq!(book.author, "旧作者");
+        assert_eq!(book.source_type, "fanqie");
+        assert_eq!(book.chapters.len(), 1);
+
+        let chapter_row = storage
+            .chapter_file_record("12345", "ch-1")
+            .unwrap()
+            .expect("应找到迁移后的章节文件记录");
+        assert_eq!(chapter_row.0, "novels/旧书名 (12345)/0001 - 第一章.txt");
+        assert_eq!(chapter_row.1, 128);
+        assert_eq!(chapter_row.2, "a".repeat(64));
+        assert_eq!(storage.search("旧书名").unwrap(), vec!["12345"]);
+
+        let backup = report.backup.unwrap().destination;
+        assert!(backup.exists());
+        assert!(backup.join("cache.db").exists());
+
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(backup);
     }
