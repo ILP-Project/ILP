@@ -76,6 +76,43 @@ pub fn resume_download(
     Ok(())
 }
 
+pub fn resume_all_downloads(config: &Config) -> Result<()> {
+    let core = CoreBuilder::new(CoreConfig::new(&config.data_folder))
+        .build()
+        .map_err(|error| anyhow!("初始化 Core 批量恢复失败: {error}"))?;
+    let tasks = core
+        .recovery_snapshot_dto()
+        .map_err(|error| anyhow!("读取恢复任务失败: {error}"))?;
+    let mut failed = 0usize;
+    for task in tasks
+        .into_iter()
+        .filter(|task| task.state == ilp_core::TaskState::Interrupted)
+    {
+        let mut task_plugins = crate::engine::load_plugins(config)?;
+        match resume_download(&mut task_plugins, config, task.task_id) {
+            Ok(()) => {}
+            Err(error) => {
+                failed += 1;
+                if jsonl_enabled() {
+                    emit_event(serde_json::json!({
+                        "event": "resume_error",
+                        "task_id": task.task_id,
+                        "message": error.to_string(),
+                    }));
+                } else {
+                    eprintln!("恢复任务 {} 失败: {error:#}", task.task_id);
+                }
+            }
+        }
+    }
+    if failed > 0 {
+        return Err(anyhow::Error::new(crate::exit::PartialFailure(format!(
+            "有 {failed} 个任务恢复失败"
+        ))));
+    }
+    Ok(())
+}
+
 pub fn install_signal_handlers() -> Result<()> {
     let mut error = None;
     SIGNALS_INSTALLED.call_once(|| {
@@ -132,6 +169,14 @@ fn validate_jsonl_event(event: &serde_json::Value) -> bool {
                 && event.get("id").is_some_and(serde_json::Value::is_string)
                 && event
                     .get("status")
+                    .is_some_and(serde_json::Value::is_string)
+        }
+        "resume_error" => {
+            event
+                .get("task_id")
+                .is_some_and(serde_json::Value::is_string)
+                && event
+                    .get("message")
                     .is_some_and(serde_json::Value::is_string)
         }
         "download_report" => {

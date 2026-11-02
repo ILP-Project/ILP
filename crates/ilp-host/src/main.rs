@@ -62,6 +62,7 @@ fn run() -> anyhow::Result<()> {
             let mut plugins = engine::load_plugins(&config)?;
             commands::resume_download(&mut plugins, &config, task_id)
         }
+        cli::Command::ResumeAll => commands::resume_all_downloads(&config),
         cli::Command::Plugin { sub } => plugin_manager::run(&config, sub),
         cli::Command::Get {
             kind,

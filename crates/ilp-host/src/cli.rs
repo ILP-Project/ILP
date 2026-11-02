@@ -68,6 +68,8 @@ pub enum Command {
         #[arg(value_name = "TASK_ID")]
         task_id: uuid::Uuid,
     },
+    /// 恢复全部具有持久化请求的中断下载任务
+    ResumeAll,
     /// 插件管理
     Plugin {
         #[command(subcommand)]
