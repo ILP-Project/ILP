@@ -360,16 +360,34 @@ struct PluginListItem {
     abi_version: String,
     source: String,
     signature_key_id: Option<String>,
+    enabled: bool,
 }
 
 fn list(config: &Config) -> Result<()> {
     // 列表只读取 Core 的 registration authority；插件目录里的 WASM 可能是
     // 未注册、未验证或已被替换的文件，不能因为文件存在就出现在信任列表中。
     let registrations = registered_plugins(config)?;
+    let enabled_plugins: std::collections::HashSet<String> =
+        match fs::read_dir(config.plugins_dir()) {
+            Ok(entries) => entries
+                .flatten()
+                .filter_map(|e| {
+                    let path = e.path();
+                    if path.extension().and_then(|ext| ext.to_str()) == Some("wasm") {
+                        path.file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .map(|s| s.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            Err(_) => std::collections::HashSet::new(),
+        };
     if jsonl_enabled() {
-        println!("{}", plugin_list_json(&registrations));
+        println!("{}", plugin_list_json(&registrations, &enabled_plugins));
     } else {
-        print!("{}", plugin_list_text(&registrations));
+        print!("{}", plugin_list_text(&registrations, &enabled_plugins));
     }
     Ok(())
 }
@@ -385,7 +403,12 @@ fn jsonl_enabled() -> bool {
     std::env::var_os("ILP_JSONL").is_some() || std::env::var_os("ILP_JSON").is_some()
 }
 
-fn plugin_list_item(registration: &PluginRegistration) -> PluginListItem {
+fn plugin_list_item(
+    registration: &PluginRegistration,
+    enabled_plugins: &std::collections::HashSet<String>,
+) -> PluginListItem {
+    let is_enabled = enabled_plugins.contains(&registration.metadata.plugin_id)
+        || enabled_plugins.contains(&registration.metadata.site_id);
     PluginListItem {
         plugin_id: registration.metadata.plugin_id.clone(),
         plugin_name: registration.metadata.plugin_name.clone(),
@@ -395,18 +418,28 @@ fn plugin_list_item(registration: &PluginRegistration) -> PluginListItem {
         abi_version: registration.metadata.abi_version.clone(),
         source: registration.trust.source.clone(),
         signature_key_id: registration.trust.signature_key_id.clone(),
+        enabled: is_enabled,
     }
 }
 
-fn plugin_list_json(registrations: &[PluginRegistration]) -> serde_json::Value {
-    let plugins: Vec<PluginListItem> = registrations.iter().map(plugin_list_item).collect();
+fn plugin_list_json(
+    registrations: &[PluginRegistration],
+    enabled_plugins: &std::collections::HashSet<String>,
+) -> serde_json::Value {
+    let plugins: Vec<PluginListItem> = registrations
+        .iter()
+        .map(|r| plugin_list_item(r, enabled_plugins))
+        .collect();
     serde_json::json!({
         "event": "plugin_list",
         "plugins": plugins,
     })
 }
 
-fn plugin_list_text(registrations: &[PluginRegistration]) -> String {
+fn plugin_list_text(
+    registrations: &[PluginRegistration],
+    enabled_plugins: &std::collections::HashSet<String>,
+) -> String {
     if registrations.is_empty() {
         return "没有已注册的插件。未注册的 WASM 不会列出。\n".into();
     }
@@ -418,10 +451,18 @@ fn plugin_list_text(registrations: &[PluginRegistration]) -> String {
             .signature_key_id
             .as_deref()
             .unwrap_or("无");
+        let status = if enabled_plugins.contains(&registration.metadata.plugin_id)
+            || enabled_plugins.contains(&registration.metadata.site_id)
+        {
+            "已启用"
+        } else {
+            "已禁用"
+        };
         output.push_str(&format!(
-            "  {} {}（站点: {}，ABI: {}，来源: {}，签名: {}）\n",
+            "  {} {}（状态: {}，站点: {}，ABI: {}，来源: {}，签名: {}）\n",
             registration.metadata.plugin_id,
             registration.metadata.version,
+            status,
             registration.metadata.site_id,
             registration.metadata.abi_version,
             registration.trust.source,
@@ -1109,6 +1150,22 @@ fn enable(config: &Config, name: &str) -> Result<()> {
             anyhow!("未找到禁用插件: {name}")
         });
     }
+
+    // 启用前验证插件是否在 Core registration authority 中注册
+    let core = CoreBuilder::new(CoreConfig::new(&config.data_folder))
+        .build()
+        .map_err(|error| anyhow!("初始化 Core 校验插件失败: {error}"))?;
+    let registrations = PluginService::registered(&core)
+        .map_err(|error| anyhow!("读取 Core 插件注册表失败: {error}"))?;
+    if !registrations
+        .iter()
+        .any(|r| r.metadata.plugin_id == name || r.metadata.site_id == name)
+    {
+        return Err(anyhow!(
+            "插件 {name} 未在 Core registration authority 注册，拒绝启用"
+        ));
+    }
+
     fs::create_dir_all(config.plugins_dir())?;
     fs::rename(&disabled, &enabled)?;
     println!("已启用插件 {name}");
@@ -1169,8 +1226,11 @@ mod tests {
 
     #[test]
     fn plugin_list_text_contains_registered_metadata_and_trust_source() {
-        let output = plugin_list_text(&[sample_registration()]);
+        let mut enabled = std::collections::HashSet::new();
+        enabled.insert("plugin-example".into());
+        let output = plugin_list_text(&[sample_registration()], &enabled);
         assert!(output.contains("plugin-example 1.2.3"));
+        assert!(output.contains("状态: 已启用"));
         assert!(output.contains("站点: example"));
         assert!(output.contains("来源: registry:test"));
         assert!(output.contains("签名: release-2026"));
@@ -1178,9 +1238,12 @@ mod tests {
 
     #[test]
     fn plugin_list_json_is_structured_and_does_not_expose_wasm_paths() {
-        let value = plugin_list_json(&[sample_registration()]);
+        let mut enabled = std::collections::HashSet::new();
+        enabled.insert("plugin-example".into());
+        let value = plugin_list_json(&[sample_registration()], &enabled);
         assert_eq!(value["event"], "plugin_list");
         assert_eq!(value["plugins"][0]["plugin_id"], "plugin-example");
+        assert_eq!(value["plugins"][0]["enabled"], true);
         assert_eq!(value["plugins"][0]["source"], "registry:test");
         assert!(value["plugins"][0].get("path").is_none());
     }
@@ -1208,6 +1271,59 @@ mod tests {
         let registrations = registered_plugins(&config).expect("Core 注册表应可读取");
         assert!(registrations.is_empty());
         assert!(config.plugins_dir().join("unregistered.wasm").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn enable_rejects_unregistered_plugin_and_allows_registered_one() {
+        let root = std::env::temp_dir().join(format!(
+            "ilp-plugin-enable-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("系统时间应有效")
+                .as_nanos()
+        ));
+        let mut config = Config::default();
+        config.data_folder = root.join("data").display().to_string();
+        config.plugins_folder = root.join("plugins").display().to_string();
+        fs::create_dir_all(config.disabled_plugins_dir()).expect("创建已禁用插件目录");
+        let disabled_wasm = config.disabled_plugins_dir().join("fanqie.wasm");
+        fs::write(&disabled_wasm, b"test wasm").expect("写入 wasm");
+
+        // 未在 Core 注册时，enable 必须拒绝
+        let error = enable(&config, "fanqie").expect_err("未在 Core 注册必须拒绝启用");
+        assert!(error
+            .to_string()
+            .contains("未在 Core registration authority 注册"));
+
+        // 在 Core 注册后，enable 允许成功并移动到启用目录
+        let core = CoreBuilder::new(CoreConfig::new(&config.data_folder))
+            .build()
+            .expect("构建 core");
+        let mut request = sample_registration();
+        request.metadata.plugin_id = "fanqie".into();
+        request.metadata.site_id = "fanqie".into();
+        let registered_request = ilp_core::PluginRegistrationRequest {
+            metadata: request.metadata,
+            trust: ilp_runtime::PluginTrust {
+                content_hash: "a".repeat(64),
+                signature_key_id: Some("release-2026".into()),
+                source: "registry:test".into(),
+                user_confirmed: true,
+            },
+        };
+        PluginService::register(&core, &registered_request).expect("注册插件");
+
+        enable(&config, "fanqie").expect("已注册插件启用应成功");
+        assert!(config.plugins_dir().join("fanqie.wasm").exists());
+        assert!(!disabled_wasm.exists());
+
+        // disable 成功移回禁用目录
+        disable(&config, "fanqie").expect("禁用插件应成功");
+        assert!(!config.plugins_dir().join("fanqie.wasm").exists());
+        assert!(disabled_wasm.exists());
+
         let _ = fs::remove_dir_all(root);
     }
 
