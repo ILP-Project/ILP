@@ -358,7 +358,7 @@ mod tests {
             trust: ilp_runtime::PluginTrust {
                 content_hash: "a".repeat(64),
                 signature_key_id: None,
-                source: "test".into(),
+                source: "registry:test".into(),
                 user_confirmed: true,
             },
         }

@@ -1238,6 +1238,12 @@ fn validate_registration(
         return Err(CoreError::Plugin("插件尚未获得用户确认".into()));
     }
     validate_plugin_text("插件来源", &request.trust.source, MAX_PLUGIN_TEXT_CHARS)?;
+    let source = request.trust.source.trim();
+    if !source.starts_with("registry:") && !source.starts_with("local:") {
+        return Err(CoreError::Plugin(
+            "插件来源格式无效：必须以 'registry:' 或 'local:' 开头".into(),
+        ));
+    }
     if request
         .trust
         .signature_key_id
@@ -1602,6 +1608,13 @@ mod tests {
         assert!(matches!(
             PluginService::validate_registration(&core, &wrong_site_domain),
             Err(CoreError::Plugin(message)) if message.contains("无权访问域名")
+        ));
+
+        let mut invalid_source = plugin_request();
+        invalid_source.trust.source = "https://untrusted.com/plugin.wasm".into();
+        assert!(matches!(
+            PluginService::validate_registration(&core, &invalid_source),
+            Err(CoreError::Plugin(message)) if message.contains("插件来源格式无效")
         ));
 
         assert!(matches!(
