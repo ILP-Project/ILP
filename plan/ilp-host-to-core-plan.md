@@ -211,7 +211,7 @@ Core registration 只保存经过验证的 registration 摘要，不能单独授
 
 - [x] 迁移 `get`、`update`、`doctor`、`completion` 等剩余命令；
 - [x] 接入明确的、经过验证的 host backend provider；
-- [ ] 完成 `ILP-CLI` 的独立发布依赖策略，避免 release 构建依赖未固定的 sibling path。
+- [x] 完成 `ILP-CLI` 的独立发布依赖策略，避免 release 构建依赖未固定的 sibling path。
 
 退出条件：CLI 只解析、调用 Core、映射结果，不再包含下载或任务业务状态机。
 
