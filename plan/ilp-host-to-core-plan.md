@@ -233,9 +233,9 @@ Core registration 只保存经过验证的 registration 摘要，不能单独授
 - [x] 识别并固定所有支持的旧 storage schema；
 - [x] 为每种 schema 增加 source fixture；
 - [x] 完成 preview/backup/migrate/verify/rollback；
-- [ ] 完成插件 install/update/remove/enable/disable 的 Core-backed adapter；
-- [ ] 完成来源、哈希、签名、撤销和用户确认审计；
-- [ ] 完成网络安装前的 verified source/hash/signature contract。
+- [x] 完成插件 install/update/remove/enable/disable 的 Core-backed adapter；
+- [x] 完成来源、哈希、签名、撤销和用户确认审计；
+- [x] 完成网络安装前的 verified source/hash/signature contract。
 
 退出条件：用户数据和插件信任状态可迁移、可审计、可回滚。
 
