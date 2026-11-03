@@ -205,6 +205,9 @@ Core registration 只保存经过验证的 registration 摘要，不能单独授
 - [x] `task download` 调用 Core workflow；
 - [x] provider seam 和稳定 NoNetwork 错误；
 - [x] stdout/stderr/exit-code contract tests。
+- [x] 完成插件 install/update/remove/enable/disable 的 Core-backed adapter；
+- [x] 完成来源、哈希、签名、撤销和用户确认审计；
+- [x] 完成网络安装前的 verified source/hash/signature contract。
 
 - [ ] 接入明确的、经过验证的 host backend provider；
 - [ ] 迁移 `get`、`update`、`doctor`、`completion` 等剩余命令；
