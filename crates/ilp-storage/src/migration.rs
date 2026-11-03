@@ -917,4 +917,102 @@ mod tests {
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(backup);
     }
+
+    #[test]
+    fn cache_v1_migration_skips_failed_and_empty_chapters() {
+        let root = temp_dir("cache-v1-partial");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let legacy_db_path = root.join("cache.db");
+        let conn = Connection::open(&legacy_db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE books (
+                site_id TEXT NOT NULL,
+                book_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                author TEXT NOT NULL,
+                cover_url TEXT NOT NULL,
+                chapters TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (site_id, book_id)
+            );
+            CREATE TABLE chapters (
+                site_id TEXT NOT NULL,
+                book_id TEXT NOT NULL,
+                chapter_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                status TEXT NOT NULL,
+                bytes INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                mtime INTEGER NOT NULL,
+                PRIMARY KEY (site_id, book_id, chapter_id)
+            );",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO books VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "qidian",
+                "99999",
+                "部分失败的书",
+                "作者B",
+                "https://example.com/cover2.png",
+                "[]",
+                1600000000_i64,
+            ],
+        )
+        .unwrap();
+
+        // 插入一条 ok 和一条 failed
+        conn.execute(
+            "INSERT INTO chapters VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                "qidian",
+                "99999",
+                "ch-ok",
+                "novels/ok.txt",
+                "ok",
+                256_i64,
+                "b".repeat(64),
+                1600000000_i64,
+            ],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO chapters VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                "qidian",
+                "99999",
+                "ch-fail",
+                "novels/fail.txt",
+                "failed",
+                0_i64,
+                "",
+                1600000000_i64,
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let paths = StoragePaths::new(&root);
+        let mut storage = SqliteStorage::open(paths).unwrap();
+        let report = storage.migrate_legacy().unwrap();
+        assert_eq!(report.status, MigrationStatus::Migrated);
+
+        assert!(storage
+            .chapter_file_record("99999", "ch-ok")
+            .unwrap()
+            .is_some());
+        assert!(storage
+            .chapter_file_record("99999", "ch-fail")
+            .unwrap()
+            .is_none());
+
+        let backup = report.backup.unwrap().destination;
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(backup);
+    }
 }

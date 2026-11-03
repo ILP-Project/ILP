@@ -231,7 +231,7 @@ Core registration 只保存经过验证的 registration 摘要，不能单独授
 ### 阶段 E：迁移旧存储和插件生命周期
 
 - [x] 识别并固定所有支持的旧 storage schema；
-- [ ] 为每种 schema 增加 source fixture；
+- [x] 为每种 schema 增加 source fixture；
 - [x] 完成 preview/backup/migrate/verify/rollback；
 - [ ] 完成插件 install/update/remove/enable/disable 的 Core-backed adapter；
 - [ ] 完成来源、哈希、签名、撤销和用户确认审计；
