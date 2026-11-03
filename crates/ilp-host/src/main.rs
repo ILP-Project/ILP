@@ -57,6 +57,11 @@ fn run() -> anyhow::Result<()> {
         "配置已加载"
     );
 
+    // 阶段 F 废弃过渡：向终端输出 deprecation 警示，明确告知旧 host 即将被独立 ilp-cli 替代
+    if !parsed.quiet && !parsed.jsonl {
+        eprintln!("提示: ilp-host 已进入废弃过渡期，核心能力已迁移至 ilp-core，请考虑逐步迁移到独立 ilp-cli。");
+    }
+
     match command {
         cli::Command::Resume { task_id } => {
             let mut plugins = engine::load_plugins(&config)?;
