@@ -19,7 +19,7 @@ use wasmtime::{
     Config as WasmtimeConfig, Engine, Store, StoreContextMut, StoreLimits, StoreLimitsBuilder,
     UpdateDeadline,
 };
-use wasmtime_wasi::ResourceTable;
+use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxView, WasiView};
 
 /// Wasmtime-side bindings for the current WIT ABI. Concrete host state is kept
 /// outside these generated types so adapters can be supplied by CLI/App.
@@ -632,10 +632,49 @@ impl RegisteredPluginComponent {
     pub fn instantiate_store(&self, host: RuntimeHost) -> Result<Store<RuntimeStore>> {
         new_store_with_host(&self.policy, host)
     }
+
+    pub fn instantiate(
+        &self,
+        host: RuntimeWitHost,
+    ) -> std::result::Result<CurrentPluginInstance, RuntimeError> {
+        let mut linker = Linker::new(shared_engine());
+        wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|error| {
+            RuntimeError::ExecutionFailed(format!("注册 WASI p2 失败: {error}"))
+        })?;
+        add_host_to_linker(&mut linker)
+            .map_err(|error| RuntimeError::ExecutionFailed(error.to_string()))?;
+        let mut store = Store::new(shared_engine(), host);
+        let bindings =
+            component_bindings::NovelPlugin::instantiate(&mut store, &self.component, &linker)
+                .map_err(|error| {
+                    RuntimeError::ExecutionFailed(format!("实例化插件失败: {error}"))
+                })?;
+        Ok(CurrentPluginInstance { store, bindings })
+    }
+}
+
+pub struct CurrentPluginInstance {
+    store: Store<RuntimeWitHost>,
+    bindings: component_bindings::NovelPlugin,
+}
+
+impl CurrentPluginInstance {
+    pub fn metadata(
+        &mut self,
+    ) -> std::result::Result<component_bindings::ilp::plugin::types::PluginMetadata, RuntimeError>
+    {
+        self.bindings
+            .ilp_plugin_plugin()
+            .call_metadata(&mut self.store)
+            .map_err(|error| {
+                RuntimeError::ExecutionFailed(format!("调用插件 metadata 失败: {error}"))
+            })
+    }
 }
 
 pub struct RuntimeWitHost {
     pub runtime: RuntimeHost,
+    pub ctx: WasiCtx,
     pub table: ResourceTable,
 }
 
@@ -659,7 +698,17 @@ impl RuntimeWitHost {
     pub fn new(runtime: RuntimeHost) -> Self {
         Self {
             runtime,
+            ctx: WasiCtx::builder().build(),
             table: ResourceTable::new(),
+        }
+    }
+}
+
+impl WasiView for RuntimeWitHost {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.ctx,
+            table: &mut self.table,
         }
     }
 }
@@ -1116,6 +1165,17 @@ mod tests {
     #[test]
     fn invalid_component_is_rejected() {
         assert!(validate_component(b"not wasm").is_err());
+    }
+
+    #[test]
+    fn runtime_wit_host_has_wasi_context_and_denies_network_by_default() {
+        let mut host = RuntimeWitHost::new(RuntimeHost::new(CapabilityPolicy::deny_all()));
+        assert!(
+            <RuntimeWitHost as component_bindings::ilp::plugin::host::Host>::acquire_http(
+                &mut host
+            )
+            .is_none()
+        );
     }
 
     struct TestLog;
