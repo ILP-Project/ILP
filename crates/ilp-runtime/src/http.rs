@@ -7,6 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::blocking::{Client, ClientBuilder};
 use reqwest::{redirect::Policy, NoProxy, Proxy};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -141,11 +142,91 @@ impl HttpGateway {
         })
     }
 
+    pub fn send_batch(
+        &self,
+        requests: &[GatewayRequest],
+        max_workers: usize,
+        spacing: Duration,
+        retries: u32,
+        cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Vec<Result<GatewayResponse>> {
+        if requests.is_empty() {
+            return Vec::new();
+        }
+        let requests = Arc::new(requests.to_vec());
+        let results = Arc::new(Mutex::new(
+            (0..requests.len())
+                .map(|_| None)
+                .collect::<Vec<Option<Result<GatewayResponse>>>>(),
+        ));
+        let next = Arc::new(Mutex::new(0usize));
+        let workers = max_workers.max(1).min(requests.len());
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let requests = Arc::clone(&requests);
+            let results = Arc::clone(&results);
+            let next = Arc::clone(&next);
+            let gateway = self.clone();
+            let cancelled = Arc::clone(&cancelled);
+            handles.push(thread::spawn(move || {
+                let mut last_started: Option<Instant> = None;
+                loop {
+                    let index = {
+                        let mut next = next.lock().expect("batch index mutex poisoned");
+                        if *next >= requests.len() {
+                            break;
+                        }
+                        let index = *next;
+                        *next += 1;
+                        index
+                    };
+                    if cancelled() {
+                        results.lock().expect("batch result mutex poisoned")[index] =
+                            Some(Err(anyhow!("HTTP 请求已取消")));
+                        continue;
+                    }
+                    if let Some(last_started) = last_started {
+                        let elapsed = last_started.elapsed();
+                        if elapsed < spacing {
+                            let mut remaining = spacing - elapsed;
+                            while !remaining.is_zero() {
+                                if cancelled() {
+                                    results.lock().expect("batch result mutex poisoned")[index] =
+                                        Some(Err(anyhow!("HTTP 请求已取消")));
+                                    break;
+                                }
+                                let sleep_for = remaining.min(Duration::from_millis(25));
+                                thread::sleep(sleep_for);
+                                remaining = spacing.saturating_sub(last_started.elapsed());
+                            }
+                            if cancelled() {
+                                continue;
+                            }
+                        }
+                    }
+                    last_started = Some(Instant::now());
+                    let result = gateway.send_with_retry(&requests[index], retries, &*cancelled);
+                    results.lock().expect("batch result mutex poisoned")[index] = Some(result);
+                }
+            }));
+        }
+        for handle in handles {
+            let _ = handle.join();
+        }
+        Arc::try_unwrap(results)
+            .expect("batch workers still hold result mutex")
+            .into_inner()
+            .expect("batch result mutex poisoned")
+            .into_iter()
+            .map(|result| result.expect("batch result missing"))
+            .collect()
+    }
+
     pub fn send_with_retry(
         &self,
         request: &GatewayRequest,
         retries: u32,
-        cancelled: &dyn Fn() -> bool,
+        cancelled: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<GatewayResponse> {
         let mut last = None;
         for attempt in 0..=retries {
@@ -290,5 +371,28 @@ mod tests {
             })
             .expect_err("private address must be rejected");
         assert!(error.to_string().contains("禁止访问"));
+    }
+
+    #[test]
+    fn batch_preserves_input_order_when_cancelled() {
+        let gateway = HttpGateway::new(CapabilityPolicy::deny_all()).expect("gateway should build");
+        let requests = vec![
+            GatewayRequest {
+                method: "GET".into(),
+                url: "https://example.com/one".into(),
+                headers: Vec::new(),
+                body: None,
+            },
+            GatewayRequest {
+                method: "GET".into(),
+                url: "https://example.com/two".into(),
+                headers: Vec::new(),
+                body: None,
+            },
+        ];
+        let cancelled: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| true);
+        let results = gateway.send_batch(&requests, 2, Duration::ZERO, 0, cancelled);
+        assert_eq!(results.len(), requests.len());
+        assert!(results.iter().all(|result| result.is_err()));
     }
 }
