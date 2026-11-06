@@ -3,7 +3,10 @@
 //! Core 不读取命令行、不输出人类文本，也不直接暴露底层数据库；调用方通过
 //! 服务接口提交预定义用例，并订阅结构化事件。
 
-use ilp_runtime::{validate_metadata, CapabilityPolicy, PluginTrust, ResourceLimits};
+use ilp_runtime::{
+    validate_metadata, CapabilityPolicy, CurrentPluginInstance, HttpBackend, PluginFetchTask,
+    PluginTrust, ResourceLimits,
+};
 pub use ilp_storage::{LegacyDetectionReport, LegacyFormat, StoredBook};
 use ilp_storage::{LibraryStorage, SqliteStorage, StoragePaths, StoredPlugin};
 use ilp_types::{validate_chapter_order, ChapterEntry, ChapterResult, ChapterStatus};
@@ -142,6 +145,132 @@ impl DownloadBackend for NoNetworkDownloadBackend {
     ) -> Result<ChapterResult, DownloadBackendError> {
         Err(DownloadBackendError::Unavailable("未配置下载后端".into()))
     }
+}
+
+struct RuntimePluginState {
+    plugin: CurrentPluginInstance,
+    active_book_id: Option<String>,
+}
+
+/// 使用共享 runtime 当前 ABI 实例和显式 HTTP backend 的 Core 下载后端。
+///
+/// 实例状态在单个插件锁内串行执行，避免 `init`、`plan-fetch` 和
+/// `consume-fetch` 之间被另一个书籍上下文打断。HTTP、代理、重试和
+/// 取消策略由注入的 `HttpBackend` 管理；Core 不自行联网。
+pub struct RuntimePluginDownloadBackend {
+    state: Mutex<RuntimePluginState>,
+    http: Arc<dyn HttpBackend>,
+}
+
+impl RuntimePluginDownloadBackend {
+    pub fn new(plugin: CurrentPluginInstance, http: Arc<dyn HttpBackend>) -> Self {
+        Self {
+            state: Mutex::new(RuntimePluginState {
+                plugin,
+                active_book_id: None,
+            }),
+            http,
+        }
+    }
+
+    fn lock_state(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, RuntimePluginState>, DownloadBackendError> {
+        self.state
+            .lock()
+            .map_err(|_| DownloadBackendError::Execution("插件运行状态锁已中毒".into()))
+    }
+
+    fn runtime_error(error: ilp_runtime::RuntimeError) -> DownloadBackendError {
+        DownloadBackendError::Execution(error.to_string())
+    }
+}
+
+impl DownloadBackend for RuntimePluginDownloadBackend {
+    fn list_chapters(
+        &self,
+        _plugin: &PluginRegistration,
+        request: &DownloadRequest,
+    ) -> Result<Vec<ChapterEntry>, DownloadBackendError> {
+        let mut state = self.lock_state()?;
+        state
+            .plugin
+            .init(&request.book_id, false)
+            .map_err(Self::runtime_error)?;
+        let chapters = state.plugin.catalog(false).map_err(Self::runtime_error)?;
+        validate_chapter_order(&chapters)
+            .map_err(|error| DownloadBackendError::Execution(format!("目录顺序无效: {error}")))?;
+        state.active_book_id = Some(request.book_id.clone());
+        Ok(chapters)
+    }
+
+    fn fetch_chapter(
+        &self,
+        _plugin: &PluginRegistration,
+        request: &DownloadRequest,
+        chapter: &ChapterEntry,
+    ) -> Result<ChapterResult, DownloadBackendError> {
+        let mut state = self.lock_state()?;
+        if state.active_book_id.as_deref() != Some(request.book_id.as_str()) {
+            return Err(DownloadBackendError::Unavailable(
+                "插件尚未为该书籍建立目录上下文".into(),
+            ));
+        }
+        let tasks = state
+            .plugin
+            .plan_fetch(std::slice::from_ref(&chapter.id))
+            .map_err(Self::runtime_error)?;
+        let task = require_single_runtime_task(tasks)?;
+        let response = self
+            .http
+            .fetch_request(&task.request)
+            .map_err(|error| DownloadBackendError::Execution(error.to_string()))?;
+        let results = state
+            .plugin
+            .consume_fetch(&task.id, response)
+            .map_err(Self::runtime_error)?;
+        require_single_runtime_result(results, &chapter.id)
+    }
+}
+
+fn require_single_runtime_task(
+    tasks: Vec<PluginFetchTask>,
+) -> Result<PluginFetchTask, DownloadBackendError> {
+    match tasks.len() {
+        1 => tasks
+            .into_iter()
+            .next()
+            .ok_or_else(|| DownloadBackendError::Execution("抓取计划为空".into())),
+        0 => Err(DownloadBackendError::Execution(
+            "插件没有为章节生成抓取任务".into(),
+        )),
+        count => Err(DownloadBackendError::Execution(format!(
+            "单章抓取计划返回 {count} 个任务，无法安全确定章节归属"
+        ))),
+    }
+}
+
+fn require_single_runtime_result(
+    results: Vec<ChapterResult>,
+    chapter_id: &str,
+) -> Result<ChapterResult, DownloadBackendError> {
+    if results.len() != 1 {
+        return Err(DownloadBackendError::Execution(format!(
+            "单章抓取返回 {} 个结果，拒绝猜测正文归属",
+            results.len()
+        )));
+    }
+    let result = results
+        .into_iter()
+        .next()
+        .ok_or_else(|| DownloadBackendError::Execution("插件没有返回章节结果".into()))?;
+    if result.id != chapter_id {
+        return Err(DownloadBackendError::Execution(format!(
+            "插件返回章节 {}，预期 {}",
+            result.id, chapter_id
+        )));
+    }
+    Ok(result)
 }
 
 /// 已通过宿主完整性和信任检查后，交给 Core 注册的插件输入。
