@@ -14,11 +14,12 @@ use std::time::{Duration, Instant};
 
 pub mod http;
 
-use wasmtime::component::{Component, Linker};
+use wasmtime::component::{Component, Linker, Resource};
 use wasmtime::{
     Config as WasmtimeConfig, Engine, Store, StoreContextMut, StoreLimits, StoreLimitsBuilder,
     UpdateDeadline,
 };
+use wasmtime_wasi::ResourceTable;
 
 /// Wasmtime-side bindings for the current WIT ABI. Concrete host state is kept
 /// outside these generated types so adapters can be supplied by CLI/App.
@@ -41,6 +42,10 @@ pub mod component_bindings {
 pub trait HostAdapter: Send + Sync {
     fn log(&self, level: u8, message: &str);
     fn now_ms(&self) -> u64;
+}
+
+pub trait RuntimeHostAccess {
+    fn runtime_host(&mut self) -> &mut RuntimeHost;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -629,6 +634,203 @@ impl RegisteredPluginComponent {
     }
 }
 
+pub struct RuntimeWitHost {
+    pub runtime: RuntimeHost,
+    pub table: ResourceTable,
+}
+
+impl RuntimeWitHost {
+    pub fn storage_delete(&mut self, key: &str) -> std::result::Result<(), RuntimeError> {
+        if !self.runtime.capabilities.can_use("storage-write") {
+            return Err(RuntimeError::PermissionDenied(
+                "插件未获存储写入权限".into(),
+            ));
+        }
+        self.runtime
+            .storage
+            .as_ref()
+            .ok_or_else(|| RuntimeError::ExecutionFailed("storage backend 未配置".into()))?
+            .delete(key)
+            .map_err(|error| RuntimeError::ExecutionFailed(error.to_string()))
+    }
+}
+
+impl RuntimeWitHost {
+    pub fn new(runtime: RuntimeHost) -> Self {
+        Self {
+            runtime,
+            table: ResourceTable::new(),
+        }
+    }
+}
+
+impl component_bindings::ilp::plugin::host::Host for RuntimeWitHost {
+    fn acquire_http(&mut self) -> Option<Resource<HttpCapability>> {
+        self.runtime
+            .capabilities
+            .can_use("http")
+            .then(|| self.table.push(HttpCapability).ok())
+            .flatten()
+    }
+
+    fn http_fetch(
+        &mut self,
+        request: component_bindings::ilp::plugin::types::HttpRequest,
+    ) -> std::result::Result<component_bindings::ilp::plugin::types::HttpResponse, String> {
+        let request = HttpRequest {
+            method: request.method,
+            url: request.url,
+            headers: request
+                .headers
+                .into_iter()
+                .map(|header| (header.name, header.value))
+                .collect(),
+            body: request.body,
+        };
+        let response = self
+            .runtime
+            .fetch_request(&request)
+            .map_err(|error| error.to_string())?;
+        Ok(component_bindings::ilp::plugin::types::HttpResponse {
+            status: response.status,
+            headers: response
+                .headers
+                .into_iter()
+                .map(
+                    |(name, value)| component_bindings::ilp::plugin::types::HttpHeader {
+                        name,
+                        value,
+                    },
+                )
+                .collect(),
+            body: response.body,
+        })
+    }
+
+    fn acquire_storage(&mut self) -> Option<Resource<StorageCapability>> {
+        (self.runtime.capabilities.can_use("storage-read")
+            || self.runtime.capabilities.can_use("storage-write"))
+        .then(|| self.table.push(StorageCapability).ok())
+        .flatten()
+    }
+
+    fn storage_get(&mut self, key: String) -> Option<Vec<u8>> {
+        self.runtime.storage_get(&key).ok().flatten()
+    }
+
+    fn storage_set(&mut self, key: String, value: Vec<u8>) -> std::result::Result<(), String> {
+        self.runtime
+            .storage_set(&key, &value)
+            .map_err(|error| error.to_string())
+    }
+
+    fn storage_delete(&mut self, key: String) -> std::result::Result<(), String> {
+        self.runtime
+            .storage
+            .as_ref()
+            .ok_or_else(|| "storage backend 未配置".to_string())?
+            .delete(&key)
+            .map_err(|error| error.to_string())
+    }
+
+    fn acquire_secret(&mut self) -> Option<Resource<SecretCapability>> {
+        (self.runtime.capabilities.can_use("secret-read")
+            || self.runtime.capabilities.can_use("secret-write"))
+        .then(|| self.table.push(SecretCapability).ok())
+        .flatten()
+    }
+
+    fn log(&mut self, level: u8, message: String) {
+        if let Some(adapter) = self.runtime.adapter.as_ref() {
+            adapter.log(level, &message);
+        }
+    }
+
+    fn now_ms(&mut self) -> u64 {
+        self.runtime
+            .adapter
+            .as_ref()
+            .map_or(0, |adapter| adapter.now_ms())
+    }
+}
+
+impl component_bindings::ilp::plugin::types::Host for RuntimeWitHost {}
+
+impl component_bindings::ilp::plugin::host::HostHttpHandle for RuntimeWitHost {
+    fn fetch(
+        &mut self,
+        _handle: Resource<HttpCapability>,
+        request: component_bindings::ilp::plugin::types::HttpRequest,
+    ) -> std::result::Result<component_bindings::ilp::plugin::types::HttpResponse, String> {
+        <Self as component_bindings::ilp::plugin::host::Host>::http_fetch(self, request)
+    }
+
+    fn drop(&mut self, handle: Resource<HttpCapability>) -> wasmtime::Result<()> {
+        self.table.delete(handle)?;
+        Ok(())
+    }
+}
+
+impl component_bindings::ilp::plugin::host::HostStorageHandle for RuntimeWitHost {
+    fn get(&mut self, _handle: Resource<StorageCapability>, key: String) -> Option<Vec<u8>> {
+        <Self as component_bindings::ilp::plugin::host::Host>::storage_get(self, key)
+    }
+
+    fn set(
+        &mut self,
+        _handle: Resource<StorageCapability>,
+        key: String,
+        value: Vec<u8>,
+    ) -> std::result::Result<(), String> {
+        <Self as component_bindings::ilp::plugin::host::Host>::storage_set(self, key, value)
+    }
+
+    fn delete(
+        &mut self,
+        _handle: Resource<StorageCapability>,
+        key: String,
+    ) -> std::result::Result<(), String> {
+        <Self as component_bindings::ilp::plugin::host::Host>::storage_delete(self, key)
+    }
+
+    fn drop(&mut self, handle: Resource<StorageCapability>) -> wasmtime::Result<()> {
+        self.table.delete(handle)?;
+        Ok(())
+    }
+}
+
+impl component_bindings::ilp::plugin::host::HostSecretHandle for RuntimeWitHost {
+    fn get(&mut self, _handle: Resource<SecretCapability>, key: String) -> Option<Vec<u8>> {
+        self.runtime.secret_get(&key).ok().flatten()
+    }
+
+    fn set(
+        &mut self,
+        _handle: Resource<SecretCapability>,
+        key: String,
+        value: Vec<u8>,
+    ) -> std::result::Result<(), String> {
+        self.runtime
+            .secret_set(&key, &value)
+            .map_err(|error| error.to_string())
+    }
+
+    fn delete(
+        &mut self,
+        _handle: Resource<SecretCapability>,
+        key: String,
+    ) -> std::result::Result<(), String> {
+        self.runtime
+            .secret_delete(&key)
+            .map_err(|error| error.to_string())
+    }
+
+    fn drop(&mut self, handle: Resource<SecretCapability>) -> wasmtime::Result<()> {
+        self.table.delete(handle)?;
+        Ok(())
+    }
+}
+
 /// 将当前 ABI 的 host world 注册到 linker。
 ///
 /// 具体状态实现必须显式实现生成的 WIT host traits；runtime 不提供默认
@@ -914,6 +1116,32 @@ mod tests {
     #[test]
     fn invalid_component_is_rejected() {
         assert!(validate_component(b"not wasm").is_err());
+    }
+
+    struct TestLog;
+
+    impl HostAdapter for TestLog {
+        fn log(&self, _level: u8, _message: &str) {}
+        fn now_ms(&self) -> u64 {
+            42
+        }
+    }
+
+    #[test]
+    fn wit_host_preserves_deny_all_and_clock_adapter() {
+        let mut host = RuntimeWitHost::new(
+            RuntimeHost::new(CapabilityPolicy::deny_all()).with_adapter(Box::new(TestLog)),
+        );
+        assert!(
+            <RuntimeWitHost as component_bindings::ilp::plugin::host::Host>::acquire_http(
+                &mut host
+            )
+            .is_none()
+        );
+        assert_eq!(
+            <RuntimeWitHost as component_bindings::ilp::plugin::host::Host>::now_ms(&mut host),
+            42
+        );
     }
 
     #[test]
