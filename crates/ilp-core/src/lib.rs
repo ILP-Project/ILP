@@ -159,16 +159,22 @@ struct RuntimePluginState {
 /// 取消策略由注入的 `HttpBackend` 管理；Core 不自行联网。
 pub struct RuntimePluginDownloadBackend {
     state: Mutex<RuntimePluginState>,
+    registration: PluginRegistration,
     http: Arc<dyn HttpBackend>,
 }
 
 impl RuntimePluginDownloadBackend {
-    pub fn new(plugin: CurrentPluginInstance, http: Arc<dyn HttpBackend>) -> Self {
+    pub fn new(
+        plugin: CurrentPluginInstance,
+        registration: PluginRegistration,
+        http: Arc<dyn HttpBackend>,
+    ) -> Self {
         Self {
             state: Mutex::new(RuntimePluginState {
                 plugin,
                 active_book_id: None,
             }),
+            registration,
             http,
         }
     }
@@ -184,14 +190,33 @@ impl RuntimePluginDownloadBackend {
     fn runtime_error(error: ilp_runtime::RuntimeError) -> DownloadBackendError {
         DownloadBackendError::Execution(error.to_string())
     }
+
+    fn validate_request(
+        &self,
+        plugin: &PluginRegistration,
+        request: &DownloadRequest,
+    ) -> Result<(), DownloadBackendError> {
+        if plugin != &self.registration {
+            return Err(DownloadBackendError::Execution(
+                "下载 backend registration 与 Core 注册不一致".into(),
+            ));
+        }
+        if request.plugin_id != self.registration.metadata.plugin_id {
+            return Err(DownloadBackendError::Execution(
+                "下载请求插件 ID 与 registration 不一致".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl DownloadBackend for RuntimePluginDownloadBackend {
     fn list_chapters(
         &self,
-        _plugin: &PluginRegistration,
+        plugin: &PluginRegistration,
         request: &DownloadRequest,
     ) -> Result<Vec<ChapterEntry>, DownloadBackendError> {
+        self.validate_request(plugin, request)?;
         let mut state = self.lock_state()?;
         state
             .plugin
@@ -206,10 +231,11 @@ impl DownloadBackend for RuntimePluginDownloadBackend {
 
     fn fetch_chapter(
         &self,
-        _plugin: &PluginRegistration,
+        plugin: &PluginRegistration,
         request: &DownloadRequest,
         chapter: &ChapterEntry,
     ) -> Result<ChapterResult, DownloadBackendError> {
+        self.validate_request(plugin, request)?;
         let mut state = self.lock_state()?;
         if state.active_book_id.as_deref() != Some(request.book_id.as_str()) {
             return Err(DownloadBackendError::Unavailable(
@@ -1948,6 +1974,29 @@ mod tests {
         assert_eq!(backend.attempts.lock().unwrap().get("ch-2"), Some(&2));
         drop(core);
         let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn runtime_backend_rejects_ambiguous_tasks_and_results() {
+        let task = PluginFetchTask {
+            id: "task-1".into(),
+            request: ilp_runtime::HttpRequest {
+                method: "GET".into(),
+                url: "https://example.com/chapter-1".into(),
+                headers: Vec::new(),
+                body: None,
+            },
+        };
+        assert!(require_single_runtime_task(vec![task.clone(), task]).is_err());
+        assert!(require_single_runtime_task(Vec::new()).is_err());
+
+        let result = ChapterResult::ok("chapter-1".into(), "第一章".into(), "正文".into());
+        assert!(require_single_runtime_result(Vec::new(), "chapter-1").is_err());
+        assert!(
+            require_single_runtime_result(vec![result.clone(), result.clone()], "chapter-1")
+                .is_err()
+        );
+        assert!(require_single_runtime_result(vec![result], "other").is_err());
     }
 
     #[test]
