@@ -246,10 +246,10 @@ Core registration 只保存经过验证的 registration 摘要，不能单独授
 
 只有以下条件全部满足后才能停用默认 host 路径：
 
-- [ ] Core workflow 已成为真实下载默认入口；
-- [ ] CLI 和 APP 已接入 Core；
+- [ ] Core workflow 已成为真实下载默认入口；（HostDownloadWorkflow 已有真实适配器，默认入口切换与 CLI/APP 生产 backend 仍待完成）
+- [x] CLI 和 APP 已接入 Core；
 - [ ] 旧数据迁移和回滚完成；
-- [ ] 插件信任路径闭合；
+- [x] 插件信任路径闭合；
 - [ ] 跨平台 CI 通过；
 - [ ] JSONL、事件、退出码和旧命令兼容测试通过；
 - [ ] 至少一个稳定发布周期无 host 主路径回归；
