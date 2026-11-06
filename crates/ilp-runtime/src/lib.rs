@@ -9,6 +9,9 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+
+pub mod http;
+
 use wasmtime::component::Component;
 use wasmtime::{
     Config as WasmtimeConfig, Engine, Store, StoreContextMut, StoreLimits, StoreLimitsBuilder,

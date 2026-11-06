@@ -13,3 +13,4 @@ thiserror = "2"
 wasmtime = "48"
 wasmtime-wasi = { version = "48", default-features = false, features = ["p1"] }
 ilp-plugin-wit = { version = "0.2.0", path = "../ilp-plugin-wit" }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
