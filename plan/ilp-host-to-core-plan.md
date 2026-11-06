@@ -227,7 +227,7 @@ Core registration 只保存经过验证的 registration 摘要，不能单独授
 - [x] 生成并 review bindings；
 - [x] 接入 native library 和 Core runtime 生命周期；
 - [x] 增加 Flutter ↔ Rust end-to-end 测试；
-- [ ] APP 不再依赖临时 host bridge。
+- [x] APP 不再依赖临时 host bridge。
 
 退出条件：APP 可通过 reviewed bindings 调用 Core，并能从事件 retention/resync 中恢复状态。
 
