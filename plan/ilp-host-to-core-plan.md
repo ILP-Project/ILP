@@ -225,7 +225,7 @@ Core registration 只保存经过验证的 registration 摘要，不能单独授
 
 - [x] 安装并审查锁定版本 `flutter_rust_bridge_codegen 2.13.0`；
 - [x] 生成并 review bindings；
-- [ ] 接入 native library 和 Core runtime 生命周期；
+- [x] 接入 native library 和 Core runtime 生命周期；
 - [x] 增加 Flutter ↔ Rust end-to-end 测试；
 - [ ] APP 不再依赖临时 host bridge。
 
