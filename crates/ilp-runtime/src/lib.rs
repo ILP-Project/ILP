@@ -658,6 +658,57 @@ pub struct CurrentPluginInstance {
     bindings: component_bindings::NovelPlugin,
 }
 
+impl CurrentPluginInstance {
+    pub fn validate_metadata(
+        &mut self,
+        expected: &ilp_types::PluginMetadata,
+    ) -> std::result::Result<(), RuntimeError> {
+        let actual = self.metadata()?;
+        if &actual != expected {
+            return Err(RuntimeError::SignatureRejected(
+                "插件运行时 metadata 与 registration 不一致".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn convert_plugin_metadata(
+    metadata: component_bindings::ilp::plugin::types::PluginMetadata,
+) -> ilp_types::PluginMetadata {
+    ilp_types::PluginMetadata {
+        abi_version: metadata.abi_version,
+        site_name: metadata.site_name,
+        site_id: metadata.site_id,
+        site_domain: metadata.site_domain,
+        plugin_name: metadata.plugin_name,
+        plugin_id: metadata.plugin_id,
+        version: metadata.version,
+        permissions: metadata
+            .permissions
+            .into_iter()
+            .map(|permission| {
+                match permission {
+                    component_bindings::ilp::plugin::types::Permission::Http => "http",
+                    component_bindings::ilp::plugin::types::Permission::Clock => "clock",
+                    component_bindings::ilp::plugin::types::Permission::StorageRead => {
+                        "storage-read"
+                    }
+                    component_bindings::ilp::plugin::types::Permission::StorageWrite => {
+                        "storage-write"
+                    }
+                    component_bindings::ilp::plugin::types::Permission::SecretRead => "secret-read",
+                    component_bindings::ilp::plugin::types::Permission::SecretWrite => {
+                        "secret-write"
+                    }
+                }
+                .into()
+            })
+            .collect(),
+        allowed_domains: metadata.allowed_domains,
+    }
+}
+
 pub fn convert_chapter_entry(
     entry: component_bindings::ilp::plugin::types::ChapterEntry,
 ) -> ilp_types::ChapterEntry {
@@ -779,13 +830,11 @@ impl CurrentPluginInstance {
         })
     }
 
-    pub fn metadata(
-        &mut self,
-    ) -> std::result::Result<component_bindings::ilp::plugin::types::PluginMetadata, RuntimeError>
-    {
-        self.call("metadata", |bindings, store| {
+    pub fn metadata(&mut self) -> std::result::Result<ilp_types::PluginMetadata, RuntimeError> {
+        let metadata = self.call("metadata", |bindings, store| {
             bindings.ilp_plugin_plugin().call_metadata(store)
-        })
+        })?;
+        Ok(convert_plugin_metadata(metadata))
     }
 
     pub fn title(&mut self) -> std::result::Result<String, RuntimeError> {

@@ -5,7 +5,7 @@
 
 use ilp_runtime::{
     validate_metadata, CapabilityPolicy, CurrentPluginInstance, HttpBackend, PluginFetchTask,
-    PluginTrust, ResourceLimits,
+    PluginTrust, RegisteredPluginComponent, ResourceLimits, RuntimeWitHost,
 };
 pub use ilp_storage::{LegacyDetectionReport, LegacyFormat, StoredBook};
 use ilp_storage::{LibraryStorage, SqliteStorage, StoragePaths, StoredPlugin};
@@ -177,6 +177,33 @@ impl RuntimePluginDownloadBackend {
             registration,
             http,
         }
+    }
+
+    pub fn from_registered_component(
+        component: RegisteredPluginComponent,
+        host: RuntimeWitHost,
+        registration: PluginRegistration,
+        http: Arc<dyn HttpBackend>,
+    ) -> Result<Self, CoreError> {
+        if component.metadata() != &registration.metadata
+            || component.trust() != &registration.trust
+        {
+            return Err(CoreError::Conflict(
+                "组件 registration 与 Core registration 不一致".into(),
+            ));
+        }
+        if host.runtime.policy != *component.policy() {
+            return Err(CoreError::Conflict(
+                "运行时 capability policy 与注册 policy 不一致".into(),
+            ));
+        }
+        let mut plugin = component
+            .instantiate(host)
+            .map_err(|error| CoreError::Plugin(error.to_string()))?;
+        plugin
+            .validate_metadata(&registration.metadata)
+            .map_err(|error| CoreError::Plugin(error.to_string()))?;
+        Ok(Self::new(plugin, registration, http))
     }
 
     fn lock_state(
