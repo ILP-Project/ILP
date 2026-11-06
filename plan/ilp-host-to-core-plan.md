@@ -275,7 +275,7 @@ Core registration 只保存经过验证的 registration 摘要，不能单独授
 | 章节目录校验 | Core API 已提供，host get/update 已接入（外部基线摘要） | 新旧入口均使用同一校验，测试可审计 |
 | 书库与搜索 | CLI 已通过 Core | library mutation 统一经过 Core service |
 | 插件 inspection/registration | Core 与 host seam 已接入，共享 runtime 已提供内容摘要、来源、deny-all registration 校验、受限组件加载器、RuntimeHost WIT adapter 和当前 ABI 实例化 API | install/load/execute 共享可信门禁，并由真实执行器完成端到端验证 |
-| 旧宿主下载编排 | adapter 已完成，共享 HTTP gateway/provider 已提炼 | 真实 get/update 不再旁路 Core，runtime/provider 通过完整验证 |
+| 旧宿主下载编排 | adapter 已完成，共享 HTTP gateway/provider 和当前 ABI 插件调用面已提炼 | 真实 get/update 不再旁路 Core，runtime/provider 通过完整验证 |
 | CLI | 查询、task、plugin 部分已迁移 | 剩余命令完成 Core adapter 或正式废弃 |
 | APP | contract/fake 已完成 | FRB bindings、native library 和生命周期已接通 |
 | 同步 | 本地事件协议部分存在 | 网络认证、加密、增量、冲突和 resync 完成 |
