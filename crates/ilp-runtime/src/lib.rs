@@ -570,6 +570,56 @@ pub fn load_component(wasm: &[u8]) -> std::result::Result<Component, RuntimeErro
         .map_err(|error| RuntimeError::InvalidFormat(format!("WASM component 加载失败: {error}")))
 }
 
+/// 已通过 Core registration contract 的插件组件。
+///
+/// 该句柄只保存经过校验的组件和执行策略，不提供绕过 registration 的构造器。
+/// WIT host bindings 与具体业务调用由上层 adapter 注入；runtime 不会自行联网、
+/// 注册插件或猜测书籍上下文。
+pub struct RegisteredPluginComponent {
+    component: Component,
+    metadata: ilp_types::PluginMetadata,
+    trust: PluginTrust,
+    policy: CapabilityPolicy,
+}
+
+impl RegisteredPluginComponent {
+    pub fn load(
+        wasm: &[u8],
+        metadata: ilp_types::PluginMetadata,
+        trust: PluginTrust,
+        policy: CapabilityPolicy,
+    ) -> std::result::Result<Self, RuntimeError> {
+        validate_registration(&metadata, &trust, &policy, wasm)?;
+        let component = load_component(wasm)?;
+        Ok(Self {
+            component,
+            metadata,
+            trust,
+            policy,
+        })
+    }
+
+    pub fn component(&self) -> &Component {
+        &self.component
+    }
+
+    pub fn metadata(&self) -> &ilp_types::PluginMetadata {
+        &self.metadata
+    }
+
+    pub fn trust(&self) -> &PluginTrust {
+        &self.trust
+    }
+
+    pub fn policy(&self) -> &CapabilityPolicy {
+        &self.policy
+    }
+
+    pub fn instantiate_store(&self, host: RuntimeHost) -> Result<Store<RuntimeStore>> {
+        new_store_with_host(&self.policy, host)
+    }
+}
+
 pub fn validate_component(wasm: &[u8]) -> std::result::Result<(), RuntimeError> {
     if wasm.len() < 8 || &wasm[0..4] != b"\0asm" {
         return Err(RuntimeError::InvalidFormat(
@@ -874,6 +924,32 @@ mod tests {
         assert!(matches!(
             validate_registration(&metadata, &trust, &policy, wasm),
             Err(RuntimeError::SignatureRejected(_))
+        ));
+    }
+
+    #[test]
+    fn registered_component_rejects_non_component_bytes() {
+        let wasm = b"fixture wasm bytes";
+        let metadata = ilp_types::PluginMetadata {
+            abi_version: CURRENT_ABI.into(),
+            site_name: "示例站".into(),
+            site_id: "example".into(),
+            site_domain: "example.com".into(),
+            plugin_name: "示例插件".into(),
+            plugin_id: "example-plugin".into(),
+            version: "1.0.0".into(),
+            permissions: Vec::new(),
+            allowed_domains: Vec::new(),
+        };
+        let trust = PluginTrust {
+            content_hash: content_hash(wasm),
+            signature_key_id: None,
+            source: "local:test".into(),
+            user_confirmed: true,
+        };
+        assert!(matches!(
+            RegisteredPluginComponent::load(wasm, metadata, trust, CapabilityPolicy::deny_all()),
+            Err(RuntimeError::InvalidFormat(_))
         ));
     }
 
