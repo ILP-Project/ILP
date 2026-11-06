@@ -659,16 +659,101 @@ pub struct CurrentPluginInstance {
 }
 
 impl CurrentPluginInstance {
+    fn call<T>(
+        &mut self,
+        operation: &str,
+        call: impl FnOnce(
+            &mut component_bindings::NovelPlugin,
+            &mut Store<RuntimeWitHost>,
+        ) -> wasmtime::Result<T>,
+    ) -> std::result::Result<T, RuntimeError> {
+        let policy = self.store.data().runtime.policy.clone();
+        self.store
+            .set_epoch_deadline((policy.limits.timeout_ms / EPOCH_TICK.as_millis() as u64).max(1));
+        self.store.set_fuel(policy.limits.fuel).map_err(|error| {
+            RuntimeError::ExecutionFailed(format!("重置插件 fuel 失败: {error}"))
+        })?;
+        call(&mut self.bindings, &mut self.store).map_err(|error| {
+            RuntimeError::ExecutionFailed(format!("调用插件 {operation} 失败: {error}"))
+        })
+    }
+
     pub fn metadata(
         &mut self,
     ) -> std::result::Result<component_bindings::ilp::plugin::types::PluginMetadata, RuntimeError>
     {
-        self.bindings
-            .ilp_plugin_plugin()
-            .call_metadata(&mut self.store)
-            .map_err(|error| {
-                RuntimeError::ExecutionFailed(format!("调用插件 metadata 失败: {error}"))
-            })
+        self.call("metadata", |bindings, store| {
+            bindings.ilp_plugin_plugin().call_metadata(store)
+        })
+    }
+
+    pub fn init(
+        &mut self,
+        book_id: &str,
+        force_update: bool,
+    ) -> std::result::Result<(), RuntimeError> {
+        self.call("init", |bindings, store| {
+            bindings
+                .ilp_plugin_plugin()
+                .call_init(store, book_id, force_update)
+        })?
+        .map_err(|error| RuntimeError::ExecutionFailed(format!("插件 init 失败: {error}")))
+    }
+
+    pub fn catalog(
+        &mut self,
+        force_update: bool,
+    ) -> std::result::Result<Vec<component_bindings::ilp::plugin::types::ChapterEntry>, RuntimeError>
+    {
+        self.call("catalog", |bindings, store| {
+            bindings
+                .ilp_plugin_plugin()
+                .call_catalog(store, force_update)
+        })?
+        .map_err(|error| RuntimeError::ExecutionFailed(format!("插件 catalog 失败: {error}")))
+    }
+
+    pub fn search(
+        &mut self,
+        keyword: &str,
+        cursor: &str,
+    ) -> std::result::Result<component_bindings::ilp::plugin::types::SearchPage, RuntimeError> {
+        self.call("search", |bindings, store| {
+            bindings
+                .ilp_plugin_plugin()
+                .call_search(store, keyword, cursor)
+        })?
+        .map_err(|error| RuntimeError::ExecutionFailed(format!("插件 search 失败: {error}")))
+    }
+
+    pub fn plan_fetch(
+        &mut self,
+        chapter_ids: &[String],
+    ) -> std::result::Result<Vec<component_bindings::ilp::plugin::types::FetchTask>, RuntimeError>
+    {
+        if chapter_ids.len() > 128 {
+            return Err(RuntimeError::ResourceLimit("抓取任务过多".into()));
+        }
+        self.call("plan-fetch", |bindings, store| {
+            bindings
+                .ilp_plugin_plugin()
+                .call_plan_fetch(store, chapter_ids)
+        })?
+        .map_err(|error| RuntimeError::ExecutionFailed(format!("插件 plan-fetch 失败: {error}")))
+    }
+
+    pub fn consume_fetch(
+        &mut self,
+        task_id: &str,
+        response: component_bindings::ilp::plugin::types::HttpResponse,
+    ) -> std::result::Result<Vec<component_bindings::ilp::plugin::types::ChapterResult>, RuntimeError>
+    {
+        self.call("consume-fetch", |bindings, store| {
+            bindings
+                .ilp_plugin_plugin()
+                .call_consume_fetch(store, task_id, &response)
+        })?
+        .map_err(|error| RuntimeError::ExecutionFailed(format!("插件 consume-fetch 失败: {error}")))
     }
 }
 
