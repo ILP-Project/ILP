@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 pub mod http;
 
-use wasmtime::component::Component;
+use wasmtime::component::{Component, Linker};
 use wasmtime::{
     Config as WasmtimeConfig, Engine, Store, StoreContextMut, StoreLimits, StoreLimitsBuilder,
     UpdateDeadline,
@@ -22,10 +22,19 @@ use wasmtime::{
 
 /// Wasmtime-side bindings for the current WIT ABI. Concrete host state is kept
 /// outside these generated types so adapters can be supplied by CLI/App.
+pub struct HttpCapability;
+pub struct StorageCapability;
+pub struct SecretCapability;
+
 pub mod component_bindings {
     wasmtime::component::bindgen!({
         world: "novel-plugin",
         path: "../ilp-plugin-wit/wit/v2",
+        with: {
+            "ilp:plugin/host.http-handle": super::HttpCapability,
+            "ilp:plugin/host.storage-handle": super::StorageCapability,
+            "ilp:plugin/host.secret-handle": super::SecretCapability,
+        },
     });
 }
 
@@ -618,6 +627,21 @@ impl RegisteredPluginComponent {
     pub fn instantiate_store(&self, host: RuntimeHost) -> Result<Store<RuntimeStore>> {
         new_store_with_host(&self.policy, host)
     }
+}
+
+/// 将当前 ABI 的 host world 注册到 linker。
+///
+/// 具体状态实现必须显式实现生成的 WIT host traits；runtime 不提供默认
+/// 全开放实现，避免调用方在没有能力策略时意外获得网络、存储或 secret。
+pub fn add_host_to_linker<T>(linker: &mut Linker<T>) -> anyhow::Result<()>
+where
+    T: component_bindings::ilp::plugin::host::Host + 'static,
+{
+    component_bindings::ilp::plugin::host::add_to_linker::<T, wasmtime::component::HasSelf<T>>(
+        linker,
+        |state| state,
+    )
+    .map_err(|error| anyhow!("注册共享插件 host 能力失败: {error}"))
 }
 
 pub fn validate_component(wasm: &[u8]) -> std::result::Result<(), RuntimeError> {
