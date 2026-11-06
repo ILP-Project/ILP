@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
+
+use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 
 pub mod http;
@@ -627,6 +629,76 @@ pub fn validate_abi(abi: &str) -> std::result::Result<(), RuntimeError> {
     }
 }
 
+pub fn content_hash(wasm: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(wasm))
+}
+
+pub fn validate_content_hash(wasm: &[u8], expected: &str) -> std::result::Result<(), RuntimeError> {
+    let expected = expected.trim().to_ascii_lowercase();
+    if expected.len() != 64
+        || !expected
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err(RuntimeError::SignatureRejected(
+            "插件内容 SHA-256 无效".into(),
+        ));
+    }
+    if content_hash(wasm) != expected {
+        return Err(RuntimeError::SignatureRejected("插件内容摘要不匹配".into()));
+    }
+    Ok(())
+}
+
+pub fn validate_trust_source(source: &str) -> std::result::Result<(), RuntimeError> {
+    if !(source.starts_with("registry:") || source.starts_with("local:")) {
+        return Err(RuntimeError::SignatureRejected(
+            "插件来源必须使用 registry: 或 local: 受信前缀".into(),
+        ));
+    }
+    if source.len() <= source.find(':').unwrap_or(source.len()) + 1 {
+        return Err(RuntimeError::SignatureRejected(
+            "插件来源标识不能为空".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_registration(
+    metadata: &ilp_types::PluginMetadata,
+    trust: &PluginTrust,
+    policy: &CapabilityPolicy,
+    wasm: &[u8],
+) -> std::result::Result<(), RuntimeError> {
+    validate_metadata(metadata)?;
+    validate_trust_source(&trust.source)?;
+    if !trust.user_confirmed {
+        return Err(RuntimeError::SignatureRejected(
+            "插件尚未获得用户确认".into(),
+        ));
+    }
+    validate_content_hash(wasm, &trust.content_hash)?;
+    let granted = metadata
+        .permissions
+        .iter()
+        .filter(|permission| match permission.as_str() {
+            "http" => !policy.allowed_domains.is_empty(),
+            "storage-read" | "storage-write" => policy.allow_storage,
+            "secret-read" | "secret-write" => policy.allow_secrets,
+            "clock" => true,
+            _ => false,
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    validate_permissions(&metadata.permissions, &granted)?;
+    for domain in &metadata.allowed_domains {
+        policy
+            .check_domain(domain)
+            .map_err(|error| RuntimeError::PermissionDenied(error.to_string()))?;
+    }
+    Ok(())
+}
+
 pub fn validate_metadata(
     metadata: &ilp_types::PluginMetadata,
 ) -> std::result::Result<(), RuntimeError> {
@@ -768,6 +840,67 @@ mod tests {
     #[test]
     fn invalid_component_is_rejected() {
         assert!(validate_component(b"not wasm").is_err());
+    }
+
+    #[test]
+    fn registration_validation_rejects_hash_drift_and_untrusted_source() {
+        let wasm = b"fixture wasm bytes";
+        let metadata = ilp_types::PluginMetadata {
+            abi_version: CURRENT_ABI.into(),
+            site_name: "示例站".into(),
+            site_id: "example".into(),
+            site_domain: "example.com".into(),
+            plugin_name: "示例插件".into(),
+            plugin_id: "example-plugin".into(),
+            version: "1.0.0".into(),
+            permissions: Vec::new(),
+            allowed_domains: Vec::new(),
+        };
+        let mut trust = PluginTrust {
+            content_hash: content_hash(wasm),
+            signature_key_id: None,
+            source: "registry:test".into(),
+            user_confirmed: true,
+        };
+        let policy = CapabilityPolicy::deny_all();
+        assert!(validate_registration(&metadata, &trust, &policy, wasm).is_ok());
+        trust.content_hash = "0".repeat(64);
+        assert!(matches!(
+            validate_registration(&metadata, &trust, &policy, wasm),
+            Err(RuntimeError::SignatureRejected(_))
+        ));
+        trust.content_hash = content_hash(wasm);
+        trust.source = "https://untrusted.example/plugin".into();
+        assert!(matches!(
+            validate_registration(&metadata, &trust, &policy, wasm),
+            Err(RuntimeError::SignatureRejected(_))
+        ));
+    }
+
+    #[test]
+    fn deny_all_registration_rejects_http_permission() {
+        let wasm = b"fixture wasm bytes";
+        let metadata = ilp_types::PluginMetadata {
+            abi_version: CURRENT_ABI.into(),
+            site_name: "示例站".into(),
+            site_id: "example".into(),
+            site_domain: "example.com".into(),
+            plugin_name: "示例插件".into(),
+            plugin_id: "example-plugin".into(),
+            version: "1.0.0".into(),
+            permissions: vec!["http".into()],
+            allowed_domains: vec!["example.com".into()],
+        };
+        let trust = PluginTrust {
+            content_hash: content_hash(wasm),
+            signature_key_id: None,
+            source: "local:test".into(),
+            user_confirmed: true,
+        };
+        assert!(matches!(
+            validate_registration(&metadata, &trust, &CapabilityPolicy::deny_all(), wasm),
+            Err(RuntimeError::PermissionDenied(_))
+        ));
     }
 
     #[test]
