@@ -658,6 +658,107 @@ pub struct CurrentPluginInstance {
     bindings: component_bindings::NovelPlugin,
 }
 
+pub fn convert_chapter_entry(
+    entry: component_bindings::ilp::plugin::types::ChapterEntry,
+) -> ilp_types::ChapterEntry {
+    ilp_types::ChapterEntry {
+        id: entry.id,
+        title: entry.title,
+        url: entry.url,
+        fetch_url: entry.fetch_url,
+        update_time: entry.update_time,
+        order_key: entry.order_key,
+    }
+}
+
+pub fn convert_search_page(
+    page: component_bindings::ilp::plugin::types::SearchPage,
+) -> ilp_types::SearchPage {
+    ilp_types::SearchPage {
+        results: page
+            .results
+            .into_iter()
+            .map(|result| ilp_types::SearchResult {
+                id: result.id,
+                title: result.title,
+                author: result.author,
+                cover_url: result.cover_url,
+                description: result.description,
+            })
+            .collect(),
+        cursor: page.cursor,
+        has_more: page.has_more,
+    }
+}
+
+pub fn convert_chapter_result(
+    result: component_bindings::ilp::plugin::types::ChapterResult,
+) -> std::result::Result<ilp_types::ChapterResult, RuntimeError> {
+    let status = match result.status {
+        component_bindings::ilp::plugin::types::ChapterStatus::Ok => ilp_types::ChapterStatus::Ok,
+        component_bindings::ilp::plugin::types::ChapterStatus::Locked => {
+            ilp_types::ChapterStatus::Locked
+        }
+        component_bindings::ilp::plugin::types::ChapterStatus::Captcha => {
+            ilp_types::ChapterStatus::Captcha
+        }
+        component_bindings::ilp::plugin::types::ChapterStatus::AuthRequired => {
+            ilp_types::ChapterStatus::AuthRequired
+        }
+        component_bindings::ilp::plugin::types::ChapterStatus::NotFound => {
+            ilp_types::ChapterStatus::NotFound
+        }
+        component_bindings::ilp::plugin::types::ChapterStatus::Invalid => {
+            ilp_types::ChapterStatus::Invalid
+        }
+        component_bindings::ilp::plugin::types::ChapterStatus::Error => {
+            ilp_types::ChapterStatus::Error
+        }
+    };
+    if status == ilp_types::ChapterStatus::Ok && result.text.is_none() {
+        return Err(RuntimeError::ExecutionFailed("插件成功章节缺少正文".into()));
+    }
+    if status != ilp_types::ChapterStatus::Ok && result.text.is_some() {
+        return Err(RuntimeError::ExecutionFailed(
+            "插件失败章节不应包含正文".into(),
+        ));
+    }
+    Ok(ilp_types::ChapterResult {
+        id: result.id,
+        title: result.title,
+        status,
+        text: result.text,
+        error_code: result.error_code,
+        retryable: result.retryable,
+        message: result.message,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct PluginFetchTask {
+    pub id: String,
+    pub request: HttpRequest,
+}
+
+pub fn convert_fetch_task(
+    task: component_bindings::ilp::plugin::types::FetchTask,
+) -> PluginFetchTask {
+    PluginFetchTask {
+        id: task.id,
+        request: HttpRequest {
+            method: task.request.method,
+            url: task.request.url,
+            headers: task
+                .request
+                .headers
+                .into_iter()
+                .map(|header| (header.name, header.value))
+                .collect(),
+            body: task.request.body,
+        },
+    }
+}
+
 impl CurrentPluginInstance {
     fn call<T>(
         &mut self,
@@ -687,6 +788,34 @@ impl CurrentPluginInstance {
         })
     }
 
+    pub fn title(&mut self) -> std::result::Result<String, RuntimeError> {
+        self.call("title", |bindings, store| {
+            bindings.ilp_plugin_plugin().call_title(store)
+        })?
+        .map_err(|error| RuntimeError::ExecutionFailed(format!("插件 title 失败: {error}")))
+    }
+
+    pub fn author(&mut self) -> std::result::Result<String, RuntimeError> {
+        self.call("author", |bindings, store| {
+            bindings.ilp_plugin_plugin().call_author(store)
+        })?
+        .map_err(|error| RuntimeError::ExecutionFailed(format!("插件 author 失败: {error}")))
+    }
+
+    pub fn cover_url(&mut self) -> std::result::Result<String, RuntimeError> {
+        self.call("cover-url", |bindings, store| {
+            bindings.ilp_plugin_plugin().call_cover_url(store)
+        })?
+        .map_err(|error| RuntimeError::ExecutionFailed(format!("插件 cover-url 失败: {error}")))
+    }
+
+    pub fn description(&mut self) -> std::result::Result<String, RuntimeError> {
+        self.call("description", |bindings, store| {
+            bindings.ilp_plugin_plugin().call_description(store)
+        })?
+        .map_err(|error| RuntimeError::ExecutionFailed(format!("插件 description 失败: {error}")))
+    }
+
     pub fn init(
         &mut self,
         book_id: &str,
@@ -703,57 +832,85 @@ impl CurrentPluginInstance {
     pub fn catalog(
         &mut self,
         force_update: bool,
-    ) -> std::result::Result<Vec<component_bindings::ilp::plugin::types::ChapterEntry>, RuntimeError>
-    {
-        self.call("catalog", |bindings, store| {
+    ) -> std::result::Result<Vec<ilp_types::ChapterEntry>, RuntimeError> {
+        let entries = self.call("catalog", |bindings, store| {
             bindings
                 .ilp_plugin_plugin()
                 .call_catalog(store, force_update)
-        })?
-        .map_err(|error| RuntimeError::ExecutionFailed(format!("插件 catalog 失败: {error}")))
+        })?;
+        let entries = entries
+            .into_iter()
+            .flatten()
+            .map(convert_chapter_entry)
+            .collect::<Vec<_>>();
+        ilp_types::validate_chapter_order(&entries)
+            .map_err(|error| RuntimeError::ExecutionFailed(format!("目录顺序无效: {error}")))?;
+        Ok(entries)
     }
 
     pub fn search(
         &mut self,
         keyword: &str,
         cursor: &str,
-    ) -> std::result::Result<component_bindings::ilp::plugin::types::SearchPage, RuntimeError> {
-        self.call("search", |bindings, store| {
-            bindings
-                .ilp_plugin_plugin()
-                .call_search(store, keyword, cursor)
-        })?
-        .map_err(|error| RuntimeError::ExecutionFailed(format!("插件 search 失败: {error}")))
+    ) -> std::result::Result<ilp_types::SearchPage, RuntimeError> {
+        let page = self
+            .call("search", |bindings, store| {
+                bindings
+                    .ilp_plugin_plugin()
+                    .call_search(store, keyword, cursor)
+            })?
+            .map_err(|error| RuntimeError::ExecutionFailed(format!("插件 search 失败: {error}")))?;
+        Ok(convert_search_page(page))
     }
 
     pub fn plan_fetch(
         &mut self,
         chapter_ids: &[String],
-    ) -> std::result::Result<Vec<component_bindings::ilp::plugin::types::FetchTask>, RuntimeError>
-    {
+    ) -> std::result::Result<Vec<PluginFetchTask>, RuntimeError> {
         if chapter_ids.len() > 128 {
             return Err(RuntimeError::ResourceLimit("抓取任务过多".into()));
         }
-        self.call("plan-fetch", |bindings, store| {
+        let tasks = self.call("plan-fetch", |bindings, store| {
             bindings
                 .ilp_plugin_plugin()
                 .call_plan_fetch(store, chapter_ids)
-        })?
-        .map_err(|error| RuntimeError::ExecutionFailed(format!("插件 plan-fetch 失败: {error}")))
+        })?;
+        Ok(tasks
+            .into_iter()
+            .flatten()
+            .map(convert_fetch_task)
+            .collect())
     }
 
     pub fn consume_fetch(
         &mut self,
         task_id: &str,
-        response: component_bindings::ilp::plugin::types::HttpResponse,
-    ) -> std::result::Result<Vec<component_bindings::ilp::plugin::types::ChapterResult>, RuntimeError>
-    {
-        self.call("consume-fetch", |bindings, store| {
+        response: HttpResponse,
+    ) -> std::result::Result<Vec<ilp_types::ChapterResult>, RuntimeError> {
+        let response = component_bindings::ilp::plugin::types::HttpResponse {
+            status: response.status,
+            headers: response
+                .headers
+                .into_iter()
+                .map(
+                    |(name, value)| component_bindings::ilp::plugin::types::HttpHeader {
+                        name,
+                        value,
+                    },
+                )
+                .collect(),
+            body: response.body,
+        };
+        let results = self.call("consume-fetch", |bindings, store| {
             bindings
                 .ilp_plugin_plugin()
                 .call_consume_fetch(store, task_id, &response)
-        })?
-        .map_err(|error| RuntimeError::ExecutionFailed(format!("插件 consume-fetch 失败: {error}")))
+        })?;
+        results
+            .into_iter()
+            .flatten()
+            .map(convert_chapter_result)
+            .collect()
     }
 }
 
@@ -1250,6 +1407,34 @@ mod tests {
     #[test]
     fn invalid_component_is_rejected() {
         assert!(validate_component(b"not wasm").is_err());
+    }
+
+    #[test]
+    fn conversion_rejects_success_without_text() {
+        let result = component_bindings::ilp::plugin::types::ChapterResult {
+            id: "chapter-1".into(),
+            title: "第一章".into(),
+            status: component_bindings::ilp::plugin::types::ChapterStatus::Ok,
+            text: None,
+            error_code: String::new(),
+            retryable: false,
+            message: None,
+        };
+        assert!(convert_chapter_result(result).is_err());
+    }
+
+    #[test]
+    fn conversion_rejects_failed_result_with_text() {
+        let result = component_bindings::ilp::plugin::types::ChapterResult {
+            id: "chapter-1".into(),
+            title: "第一章".into(),
+            status: component_bindings::ilp::plugin::types::ChapterStatus::NotFound,
+            text: Some("不应存在".into()),
+            error_code: "not-found".into(),
+            retryable: false,
+            message: Some("不存在".into()),
+        };
+        assert!(convert_chapter_result(result).is_err());
     }
 
     #[test]
