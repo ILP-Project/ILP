@@ -5,14 +5,37 @@
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::blocking::{Client, ClientBuilder};
-use reqwest::redirect::Policy;
+use reqwest::{redirect::Policy, NoProxy, Proxy};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::CapabilityPolicy;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const RETRY_BASE: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Clone)]
+pub struct HttpGatewayConfig {
+    pub proxy: Option<String>,
+    pub no_proxy: Vec<String>,
+    pub user_agent: Option<String>,
+    pub timeout: Duration,
+    pub max_response_bytes: usize,
+}
+
+impl Default for HttpGatewayConfig {
+    fn default() -> Self {
+        Self {
+            proxy: None,
+            no_proxy: Vec::new(),
+            user_agent: None,
+            timeout: DEFAULT_TIMEOUT,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct GatewayRequest {
@@ -32,14 +55,13 @@ pub struct GatewayResponse {
 /// 显式注入到宿主、CLI 或其他前端的安全 HTTP 网关。
 #[derive(Debug, Clone)]
 pub struct HttpGateway {
-    client: Client,
+    config: HttpGatewayConfig,
     policy: CapabilityPolicy,
-    max_response_bytes: usize,
 }
 
 impl HttpGateway {
     pub fn new(policy: CapabilityPolicy) -> Result<Self> {
-        Self::with_limits(policy, DEFAULT_TIMEOUT, DEFAULT_MAX_RESPONSE_BYTES)
+        Self::with_config(policy, HttpGatewayConfig::default())
     }
 
     pub fn with_limits(
@@ -47,46 +69,47 @@ impl HttpGateway {
         timeout: Duration,
         max_response_bytes: usize,
     ) -> Result<Self> {
-        let client = ClientBuilder::new()
-            .timeout(timeout)
-            .redirect(Policy::none())
-            .build()
-            .context("构建共享 HTTP 网关失败")?;
-        Ok(Self {
-            client,
+        Self::with_config(
             policy,
-            max_response_bytes,
-        })
+            HttpGatewayConfig {
+                timeout,
+                max_response_bytes,
+                ..HttpGatewayConfig::default()
+            },
+        )
+    }
+
+    pub fn with_config(policy: CapabilityPolicy, config: HttpGatewayConfig) -> Result<Self> {
+        build_client(&config, None)?;
+        Ok(Self { config, policy })
     }
 
     pub fn send(&self, request: &GatewayRequest) -> Result<GatewayResponse> {
+        self.send_cancelable(request, &|| false)
+    }
+
+    pub fn send_cancelable(
+        &self,
+        request: &GatewayRequest,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<GatewayResponse> {
         validate_request(&self.policy, request)?;
         let parsed = reqwest::Url::parse(&request.url)
             .with_context(|| format!("无效 URL: {}", request.url))?;
         let host = parsed.host_str().ok_or_else(|| anyhow!("URL 缺少 host"))?;
         let port = parsed.port_or_known_default().unwrap_or(443);
         let addresses = resolve_checked(host, port)?;
-        let client = self.client.clone();
+        if cancelled() {
+            return Err(anyhow!("HTTP 请求已取消"));
+        }
+        // 对所有已解析地址执行检查，并将同一组地址固定给 reqwest，避免
+        // URL 校验与实际连接之间出现可利用的 DNS 重新绑定窗口。
+        let client = build_client(&self.config, Some((host, &addresses)))?;
         let mut builder = client.request(
             reqwest::Method::from_bytes(request.method.as_bytes())
                 .map_err(|_| anyhow!("非法 HTTP 方法: {}", request.method))?,
             &request.url,
         );
-        // 对所有已解析地址执行检查，并将同一组地址固定给 reqwest，避免
-        // URL 校验与实际连接之间出现可利用的 DNS 重新绑定窗口。
-        if host.parse::<IpAddr>().is_err() {
-            builder = ClientBuilder::new()
-                .timeout(DEFAULT_TIMEOUT)
-                .redirect(Policy::none())
-                .resolve_to_addrs(host, &addresses)
-                .build()
-                .context("构建固定解析地址的 HTTP 客户端失败")?
-                .request(
-                    reqwest::Method::from_bytes(request.method.as_bytes())
-                        .map_err(|_| anyhow!("非法 HTTP 方法: {}", request.method))?,
-                    &request.url,
-                );
-        }
         for (name, value) in &request.headers {
             builder = builder.header(name, value);
         }
@@ -108,7 +131,7 @@ impl HttpGateway {
             })
             .collect();
         let body = response.bytes().context("读取 HTTP 响应失败")?.to_vec();
-        if body.len() > self.max_response_bytes {
+        if body.len() > self.config.max_response_bytes {
             return Err(anyhow!("HTTP 响应超过大小限制"));
         }
         Ok(GatewayResponse {
@@ -117,6 +140,69 @@ impl HttpGateway {
             body,
         })
     }
+
+    pub fn send_with_retry(
+        &self,
+        request: &GatewayRequest,
+        retries: u32,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<GatewayResponse> {
+        let mut last = None;
+        for attempt in 0..=retries {
+            if cancelled() {
+                return Err(anyhow!("HTTP 请求已取消"));
+            }
+            if attempt > 0 {
+                let delay = RETRY_BASE.saturating_mul(1u32 << (attempt - 1));
+                let started = Instant::now();
+                while started.elapsed() < delay {
+                    if cancelled() {
+                        return Err(anyhow!("HTTP 请求已取消"));
+                    }
+                    thread::sleep(Duration::from_millis(25).min(delay - started.elapsed()));
+                }
+            }
+            match self.send_cancelable(request, cancelled) {
+                Ok(response) if response.status < 400 => return Ok(response),
+                Ok(response) => {
+                    let error = anyhow!("HTTP 状态码 {}: {}", response.status, request.url);
+                    if !retryable_status(response.status) {
+                        return Err(error);
+                    }
+                    last = Some(error);
+                }
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow!("HTTP 请求失败: {}", request.url)))
+    }
+}
+
+fn build_client(config: &HttpGatewayConfig, pin: Option<(&str, &[SocketAddr])>) -> Result<Client> {
+    let mut builder = ClientBuilder::new()
+        .timeout(config.timeout)
+        .redirect(Policy::none());
+    if let Some(user_agent) = &config.user_agent {
+        builder = builder.user_agent(user_agent);
+    }
+    if let Some(proxy) = &config.proxy {
+        let no_proxy = if config.no_proxy.is_empty() {
+            None
+        } else {
+            NoProxy::from_string(&config.no_proxy.join(","))
+        };
+        builder = builder.proxy(Proxy::all(proxy)?.no_proxy(no_proxy));
+    } else {
+        builder = builder.no_proxy();
+    }
+    if let Some((host, addresses)) = pin {
+        builder = builder.resolve_to_addrs(host, addresses);
+    }
+    builder.build().context("构建共享 HTTP 网关失败")
+}
+
+fn retryable_status(status: u16) -> bool {
+    status >= 500 || status == 408 || status == 429
 }
 
 fn validate_request(policy: &CapabilityPolicy, request: &GatewayRequest) -> Result<()> {
